@@ -74,7 +74,6 @@ struct rgw_http_req_data : public RefCountedObject {
     if (done) {
       return ret;
     }
-#ifdef HAVE_BOOST_CONTEXT
     if (y) {
       auto& context = y.get_io_context();
       auto& yield = y.get_yield_context();
@@ -86,7 +85,6 @@ struct rgw_http_req_data : public RefCountedObject {
     if (is_asio_thread) {
       dout(20) << "WARNING: blocking http request" << dendl;
     }
-#endif
     std::unique_lock l{lock};
     cond.wait(l, [this]{return done==true;});
     return ret;
@@ -293,6 +291,51 @@ void RGWIOProvider::assign_io(RGWIOIDProvider& io_id_provider, int io_type)
 {
   if (id == 0) {
     id = io_id_provider.get_next();
+  }
+}
+
+RGWHTTPClient::RGWHTTPClient(CephContext *cct,
+                             const string& _method,
+                             const string& _url)
+    : NoDoutPrefix(cct, dout_subsys),
+      has_send_len(false),
+      http_status(HTTP_STATUS_NOSTATUS),
+      req_data(nullptr),
+      verify_ssl(cct->_conf->rgw_verify_ssl),
+      cct(cct),
+      method(_method),
+      url(_url) {
+  init();
+}
+
+std::ostream& RGWHTTPClient::gen_prefix(std::ostream& out) const
+{
+  out << "http_client[" << method << "/" << url << "]";
+  return out;
+}
+
+void RGWHTTPClient::init()
+{
+  auto pos = url.find("://");
+  if (pos == string::npos) {
+    host = url;
+    return;
+  }
+
+  protocol = url.substr(0, pos);
+
+  pos += 3;
+
+  auto host_end_pos = url.find("/", pos);
+  if (host_end_pos == string::npos) {
+    host = url.substr(pos);
+    return;
+  }
+
+  host = url.substr(pos, host_end_pos - pos);
+  resource_prefix = url.substr(host_end_pos + 1);
+  if (resource_prefix.size() > 0 && resource_prefix[resource_prefix.size() - 1] != '/') {
+    resource_prefix.append("/");
   }
 }
 
@@ -543,6 +586,7 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
   curl_easy_setopt(easy_handle, CURLOPT_LOW_SPEED_LIMIT, cct->_conf->rgw_curl_low_speed_limit);
   curl_easy_setopt(easy_handle, CURLOPT_READFUNCTION, send_http_data);
   curl_easy_setopt(easy_handle, CURLOPT_READDATA, (void *)req_data);
+  curl_easy_setopt(easy_handle, CURLOPT_BUFFERSIZE, cct->_conf->rgw_curl_buffersize);
   if (send_data_hint || is_upload_request(method)) {
     curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L);
   }
@@ -558,6 +602,11 @@ int RGWHTTPClient::init_request(rgw_http_req_data *_req_data)
       h = curl_slist_append(h, "Expect:");
     }
   }
+
+  if (method == "HEAD") {
+    curl_easy_setopt(easy_handle, CURLOPT_NOBODY, 1L);
+  }
+
   if (h) {
     curl_easy_setopt(easy_handle, CURLOPT_HTTPHEADER, (void *)h);
   }
@@ -657,7 +706,7 @@ static int clear_signal(int fd)
   // since we're in non-blocking mode, we can try to read a lot more than
   // one signal from signal_thread() to avoid later wakeups. non-blocking reads
   // are also required to support the curl_multi_wait bug workaround
-  std::array<char, 256> buf;
+  std::array<char, 256> buf{};
   int ret = ::read(fd, (void *)buf.data(), buf.size());
   if (ret < 0) {
     ret = -errno;

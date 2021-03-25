@@ -3,12 +3,11 @@ from __future__ import absolute_import
 
 import cherrypy
 
-from . import ApiController, RESTController, ControllerDoc, EndpointDoc
 from .. import mgr
+from ..exceptions import DashboardException
 from ..security import Scope
 from ..services.ceph_service import CephService
-from ..exceptions import DashboardException
-
+from . import ApiController, ControllerDoc, EndpointDoc, RESTController
 
 FILTER_SCHEMA = [{
     "name": (str, 'Name of the config option'),
@@ -40,6 +39,9 @@ class ClusterConfiguration(RESTController):
         :return: list of config options extended by their current values
         """
         config_dump = CephService.send_command('mon', 'config dump')
+        mgr_config = mgr.get('config')
+        config_dump.append({'name': 'fsid', 'section': 'mgr', 'value': mgr_config['fsid']})
+
         for config_dump_entry in config_dump:
             for i, elem in enumerate(options):
                 if config_dump_entry['name'] == elem['name']:

@@ -1,12 +1,9 @@
-import { HttpClient, HttpParams } from '@angular/common/http';
+import { HttpClient } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 
 import _ from 'lodash';
-import { Observable, of as observableOf } from 'rxjs';
-import { mergeMap } from 'rxjs/operators';
+import { Observable } from 'rxjs';
 
-import { InventoryDevice } from '../../ceph/cluster/inventory/inventory-devices/inventory-device.model';
-import { InventoryHost } from '../../ceph/cluster/inventory/inventory-host.model';
 import { OrchestratorFeature } from '../models/orchestrator.enum';
 import { OrchestratorStatus } from '../models/orchestrator.interface';
 
@@ -45,33 +42,5 @@ export class OrchestratorService {
       return this.disableMessages.missingFeature;
     }
     return false;
-  }
-
-  identifyDevice(hostname: string, device: string, duration: number) {
-    return this.http.post(`${this.url}/identify_device`, {
-      hostname,
-      device,
-      duration
-    });
-  }
-
-  inventoryList(hostname?: string): Observable<InventoryHost[]> {
-    const options = hostname ? { params: new HttpParams().set('hostname', hostname) } : {};
-    return this.http.get<InventoryHost[]>(`${this.url}/inventory`, options);
-  }
-
-  inventoryDeviceList(hostname?: string): Observable<InventoryDevice[]> {
-    return this.inventoryList(hostname).pipe(
-      mergeMap((hosts: InventoryHost[]) => {
-        const devices = _.flatMap(hosts, (host) => {
-          return host.devices.map((device) => {
-            device.hostname = host.name;
-            device.uid = device.device_id ? device.device_id : `${device.hostname}-${device.path}`;
-            return device;
-          });
-        });
-        return observableOf(devices);
-      })
-    );
   }
 }

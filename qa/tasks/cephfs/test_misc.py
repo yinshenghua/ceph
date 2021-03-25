@@ -1,7 +1,7 @@
 
 from tasks.cephfs.fuse_mount import FuseMount
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
-from teuthology.orchestra.run import CommandFailedError, ConnectionLostError
+from teuthology.orchestra.run import CommandFailedError
 import errno
 import time
 import json
@@ -165,13 +165,9 @@ class TestMisc(CephFSTestCase):
                                 cap_waited, session_timeout
                             ))
 
-            self.assertTrue(self.mount_a.is_blocklisted())
-            cap_holder.stdin.close()
-            try:
-                cap_holder.wait()
-            except (CommandFailedError, ConnectionLostError):
-                # We killed it (and possibly its node), so it raises an error
-                pass
+            self.assertTrue(self.mds_cluster.is_addr_blocklisted(
+                self.mount_a.get_global_addr()))
+            self.mount_a._kill_background(cap_holder)
         finally:
             self.mount_a.resume_netns()
 

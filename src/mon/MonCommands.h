@@ -437,6 +437,7 @@ COMMAND("fs mirror disable "
 	"disable mirroring for a ceph filesystem", "mds", "rw")
 COMMAND("fs mirror peer_add "
 	"name=fs_name,type=CephString "
+	"name=uuid,type=CephString "
 	"name=remote_cluster_spec,type=CephString "
 	"name=remote_fs_name,type=CephString",
 	"add a mirror peer for a ceph filesystem", "mds", "rw")
@@ -458,8 +459,9 @@ COMMAND("mon getmap "
 	"get monmap", "mon", "r")
 COMMAND("mon add "
 	"name=name,type=CephString "
-	"name=addr,type=CephIPAddr",
-	"add new monitor named <name> at <addr>", "mon", "rw")
+	"name=addr,type=CephIPAddr "
+	"name=location,type=CephString,n=N,goodchars=[A-Za-z0-9-_.=],req=false",
+	"add new monitor named <name> at <addr>, possibly with CRUSH location <location>", "mon", "rw")
 COMMAND("mon rm "
 	"name=name,type=CephString",
 	"remove monitor named <name>", "mon", "rw")
@@ -493,6 +495,32 @@ COMMAND("mon set-weight "
         "mon", "rw")
 COMMAND("mon enable-msgr2",
 	"enable the msgr2 protocol on port 3300",
+	"mon", "rw")
+COMMAND("mon set election_strategy " \
+	"name=strategy,type=CephString", \
+	"set the election strategy to use; choices classic, disallow, connectivity", \
+	"mon", "rw")
+COMMAND("mon add disallowed_leader " \
+	"name=name,type=CephString", \
+	"prevent the named mon from being a leader", \
+	"mon", "rw")
+COMMAND("mon rm disallowed_leader " \
+	"name=name,type=CephString", \
+	"allow the named mon to be a leader again", \
+	"mon", "rw")
+COMMAND("mon set_location " \
+	"name=name,type=CephString "
+	"name=args,type=CephString,n=N,goodchars=[A-Za-z0-9-_.=]",
+	"specify location <args> for the monitor <name>, using CRUSH bucket names", \
+	"mon", "rw")
+COMMAND("mon enable_stretch_mode " \
+	"name=tiebreaker_mon,type=CephString, "
+	"name=new_crush_rule,type=CephString, "
+	"name=dividing_bucket,type=CephString, ",
+	"enable stretch mode, changing the peering rules and "
+	"failure handling on all pools with <tiebreaker_mon> "
+	"as the tiebreaker and setting <dividing_bucket> locations "
+	"as the units for stretching across",
 	"mon", "rw")
 
 /*
@@ -820,7 +848,7 @@ COMMAND("osd unset "
 	"notieragent|nosnaptrim",
 	"unset <key>", "osd", "rw")
 COMMAND("osd require-osd-release "\
-	"name=release,type=CephChoices,strings=luminous|mimic|nautilus|octopus|pacific "
+	"name=release,type=CephChoices,strings=octopus|pacific|quincy "
         "name=yes_i_really_mean_it,type=CephBool,req=false",
 	"set the minimum allowed OSD release to participate in the cluster",
 	"osd", "rw")
@@ -1063,11 +1091,11 @@ COMMAND("osd pool rename "
 	"rename <srcpool> to <destpool>", "osd", "rw")
 COMMAND("osd pool get "
 	"name=pool,type=CephPoolname "
-	"name=var,type=CephChoices,strings=size|min_size|pg_num|pgp_num|crush_rule|hashpspool|nodelete|nopgchange|nosizechange|write_fadvise_dontneed|noscrub|nodeep-scrub|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|target_max_objects|target_max_bytes|cache_target_dirty_ratio|cache_target_dirty_high_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|erasure_code_profile|min_read_recency_for_promote|all|min_write_recency_for_promote|fast_read|hit_set_grade_decay_rate|hit_set_search_last_n|scrub_min_interval|scrub_max_interval|deep_scrub_interval|recovery_priority|recovery_op_priority|scrub_priority|compression_mode|compression_algorithm|compression_required_ratio|compression_max_blob_size|compression_min_blob_size|csum_type|csum_min_block|csum_max_block|allow_ec_overwrites|fingerprint_algorithm|pg_autoscale_mode|pg_autoscale_bias|pg_num_min|target_size_bytes|target_size_ratio",
+	"name=var,type=CephChoices,strings=size|min_size|pg_num|pgp_num|crush_rule|hashpspool|nodelete|nopgchange|nosizechange|write_fadvise_dontneed|noscrub|nodeep-scrub|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|target_max_objects|target_max_bytes|cache_target_dirty_ratio|cache_target_dirty_high_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|erasure_code_profile|min_read_recency_for_promote|all|min_write_recency_for_promote|fast_read|hit_set_grade_decay_rate|hit_set_search_last_n|scrub_min_interval|scrub_max_interval|deep_scrub_interval|recovery_priority|recovery_op_priority|scrub_priority|compression_mode|compression_algorithm|compression_required_ratio|compression_max_blob_size|compression_min_blob_size|csum_type|csum_min_block|csum_max_block|allow_ec_overwrites|fingerprint_algorithm|pg_autoscale_mode|pg_autoscale_bias|pg_num_min|target_size_bytes|target_size_ratio|dedup_tier|dedup_chunk_algorithm|dedup_cdc_chunk_size",
 	"get pool parameter <var>", "osd", "r")
 COMMAND("osd pool set "
 	"name=pool,type=CephPoolname "
-	"name=var,type=CephChoices,strings=size|min_size|pg_num|pgp_num|pgp_num_actual|crush_rule|hashpspool|nodelete|nopgchange|nosizechange|write_fadvise_dontneed|noscrub|nodeep-scrub|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|target_max_bytes|target_max_objects|cache_target_dirty_ratio|cache_target_dirty_high_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|min_read_recency_for_promote|min_write_recency_for_promote|fast_read|hit_set_grade_decay_rate|hit_set_search_last_n|scrub_min_interval|scrub_max_interval|deep_scrub_interval|recovery_priority|recovery_op_priority|scrub_priority|compression_mode|compression_algorithm|compression_required_ratio|compression_max_blob_size|compression_min_blob_size|csum_type|csum_min_block|csum_max_block|allow_ec_overwrites|fingerprint_algorithm|pg_autoscale_mode|pg_autoscale_bias|pg_num_min|target_size_bytes|target_size_ratio "
+	"name=var,type=CephChoices,strings=size|min_size|pg_num|pgp_num|pgp_num_actual|crush_rule|hashpspool|nodelete|nopgchange|nosizechange|write_fadvise_dontneed|noscrub|nodeep-scrub|hit_set_type|hit_set_period|hit_set_count|hit_set_fpp|use_gmt_hitset|target_max_bytes|target_max_objects|cache_target_dirty_ratio|cache_target_dirty_high_ratio|cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|min_read_recency_for_promote|min_write_recency_for_promote|fast_read|hit_set_grade_decay_rate|hit_set_search_last_n|scrub_min_interval|scrub_max_interval|deep_scrub_interval|recovery_priority|recovery_op_priority|scrub_priority|compression_mode|compression_algorithm|compression_required_ratio|compression_max_blob_size|compression_min_blob_size|csum_type|csum_min_block|csum_max_block|allow_ec_overwrites|fingerprint_algorithm|pg_autoscale_mode|pg_autoscale_bias|pg_num_min|target_size_bytes|target_size_ratio|dedup_tier|dedup_chunk_algorithm|dedup_cdc_chunk_size "
 	"name=val,type=CephString "
 	"name=yes_i_really_mean_it,type=CephBool,req=false",
 	"set pool parameter <var> to <val>", "osd", "rw")
@@ -1117,6 +1145,18 @@ COMMAND("osd pool application get "
 COMMAND("osd utilization",
 	"get basic pg distribution stats",
 	"osd", "r")
+COMMAND("osd force_healthy_stretch_mode " \
+	"name=yes_i_really_mean_it,type=CephBool,req=false",
+	"force a healthy stretch mode, requiring the full number of CRUSH buckets "
+	"to peer and letting all non-tiebreaker monitors be elected leader ",
+	"osd", "rw")
+COMMAND("osd force_recovery_stretch_mode " \
+	"name=yes_i_really_mean_it,type=CephBool,req=false",
+	"try and force a recovery stretch mode, increasing the "
+	"pool size to its non-failure value if currently degraded and "
+	"all monitor buckets are up",
+	"osd", "rw")
+
 
 // tiering
 COMMAND("osd tier add "
@@ -1161,7 +1201,7 @@ COMMAND("osd tier add-cache "
 	"osd", "rw")
 
 /*
- * mon/ConfigKeyService.cc
+ * mon/KVMonitor.cc
  */
 
 COMMAND("config-key get "
@@ -1196,6 +1236,9 @@ COMMAND("config-key dump "
 /*
  * mon/MgrMonitor.cc
  */
+COMMAND("mgr stat",
+	"dump basic info about the mgr cluster state",
+	"mgr", "r")
 COMMAND("mgr dump "
 	"name=epoch,type=CephInt,range=0,req=false",
 	"dump the latest MgrMap",
@@ -1296,6 +1339,14 @@ COMMAND_WITH_FLAG("heap "
             "show heap usage info (available only if compiled with tcmalloc)",
 	    "mon", "rw",
             FLAG(TELL))
+COMMAND_WITH_FLAG("connection scores dump",
+		  "show the scores used in connectivity-based elections",
+		  "mon", "rwx",
+		  FLAG(TELL))
+COMMAND_WITH_FLAG("connection scores reset",
+		  "reset the scores used in connectivity-based elections",
+		  "mon", "rwx",
+		  FLAG(TELL))
 COMMAND_WITH_FLAG("sync_force "
             "name=validate,type=CephChoices,strings=--yes-i-really-mean-it,req=false",
             "force sync of and clear monitor store",

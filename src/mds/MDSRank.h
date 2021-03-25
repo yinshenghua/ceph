@@ -84,6 +84,14 @@ enum {
   l_mds_root_rfiles,
   l_mds_root_rbytes,
   l_mds_root_rsnaps,
+  l_mds_scrub_backtrace_fetch,
+  l_mds_scrub_set_tag,
+  l_mds_scrub_backtrace_repaired,
+  l_mds_scrub_inotable_repaired,
+  l_mds_scrub_dir_inodes,
+  l_mds_scrub_dir_base_inodes,
+  l_mds_scrub_dirfrag_rstats,
+  l_mds_scrub_file_inodes,
   l_mdss_handle_inode_file_caps,
   l_mdss_ceph_cap_op_revoke,
   l_mdss_ceph_cap_op_grant,
@@ -156,6 +164,7 @@ class MDSRank {
 
     MDSRank(
         mds_rank_t whoami_,
+	std::string fs_name_,
         ceph::mutex &mds_lock_,
         LogChannelRef &clog_,
         SafeTimer &timer_,
@@ -169,6 +178,7 @@ class MDSRank {
 	boost::asio::io_context& ioc);
 
     mds_rank_t get_nodeid() const { return whoami; }
+    std::string_view get_fs_name() const { return fs_name; }
     int64_t get_metadata_pool();
 
     mono_time get_starttime() const {
@@ -213,6 +223,7 @@ class MDSRank {
     }
 
     void handle_write_error(int err);
+    void handle_write_error_with_lock(int err);
 
     void update_mlogger();
 
@@ -352,8 +363,6 @@ class MDSRank {
 		      const std::string& option, const std::string& value,
 		      std::ostream& ss);
 
-    void mark_base_recursively_scrubbed(inodeno_t ino);
-
     // Reference to global MDS::mds_lock, so that users of MDSRank don't
     // carry around references to the outer MDS, and we can substitute
     // a separate lock here in future potentially.
@@ -431,6 +440,7 @@ class MDSRank {
     friend class C_MDS_MonCommand;
 
     const mds_rank_t whoami;
+    std::string fs_name;
 
     ~MDSRank();
 
@@ -451,7 +461,6 @@ class MDSRank {
      /**
      * Share MDSMap with clients
      */
-    void bcast_mds_map();  // to mounted clients
     void create_logger();
 
     void dump_clientreplay_status(Formatter *f) const;
@@ -579,8 +588,6 @@ class MDSRank {
 
     int mds_slow_req_count = 0;
 
-    epoch_t last_client_mdsmap_bcast = 0;
-
     map<mds_rank_t,DecayCounter> export_targets; /* targets this MDS is exporting to or wants/tries to */
 
     Messenger *messenger;
@@ -646,6 +653,7 @@ class MDSRankDispatcher : public MDSRank, public md_config_obs_t
 public:
   MDSRankDispatcher(
       mds_rank_t whoami_,
+      std::string fs_name,
       ceph::mutex &mds_lock_,
       LogChannelRef &clog_,
       SafeTimer &timer_,

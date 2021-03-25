@@ -2,22 +2,24 @@
 from __future__ import absolute_import
 
 from enum import Enum
+from typing import List, Optional
+
 import cherrypy
 from mgr_module import CLICommand, Option
+
+from ..controllers.cephfs import CephFS
+from ..controllers.iscsi import Iscsi, IscsiTarget
+from ..controllers.nfsganesha import NFSGanesha, NFSGaneshaExports, NFSGaneshaService
+from ..controllers.rbd import Rbd, RbdSnapshot, RbdTrash
+from ..controllers.rbd_mirroring import RbdMirroringPoolMode, \
+    RbdMirroringPoolPeer, RbdMirroringSummary
+from ..controllers.rgw import Rgw, RgwBucket, RgwDaemon, RgwUser
 from . import PLUGIN_MANAGER as PM
 from . import interfaces as I  # noqa: E741,N812
 from .ttl_cache import ttl_cache
 
-from ..controllers.rbd import Rbd, RbdSnapshot, RbdTrash
-from ..controllers.rbd_mirroring import (
-    RbdMirroringSummary, RbdMirroringPoolMode, RbdMirroringPoolPeer)
-from ..controllers.iscsi import Iscsi, IscsiTarget
-from ..controllers.cephfs import CephFS
-from ..controllers.rgw import Rgw, RgwDaemon, RgwBucket, RgwUser
-from ..controllers.nfsganesha import NFSGanesha, NFSGaneshaService, NFSGaneshaExports
-
 try:
-    from typing import no_type_check, Set
+    from typing import Set, no_type_check
 except ImportError:
     no_type_check = object()  # Just for type checking
 
@@ -76,14 +78,13 @@ class FeatureToggles(I.CanMgr, I.Setupable, I.HasOptions,
 
     @PM.add_hook
     def register_commands(self):
-        @CLICommand(
-            "dashboard feature",
-            "name=action,type=CephChoices,strings={} ".format(
-                "|".join(a.value for a in Actions))
-            + "name=features,type=CephChoices,strings={},req=false,n=N".format(
-                "|".join(f.value for f in Features)),
-            "Enable or disable features in Ceph-Mgr Dashboard")
-        def cmd(mgr, action, features=None):
+        @CLICommand("dashboard feature")
+        def cmd(mgr,
+                action: Actions,
+                features: Optional[List[Features]] = None):
+            '''
+            Enable or disable features in Ceph-Mgr Dashboard
+            '''
             ret = 0
             msg = []
             if action in [Actions.ENABLE.value, Actions.DISABLE.value]:
@@ -132,12 +133,12 @@ class FeatureToggles(I.CanMgr, I.Setupable, I.HasOptions,
                 404, "Feature='{}' disabled by option '{}'".format(
                     feature.value,
                     self.OPTION_FMT.format(feature.value),
-                    )
                 )
+            )
 
     @PM.add_hook
     def get_controllers(self):
-        from ..controllers import ApiController, RESTController, ControllerDoc, EndpointDoc
+        from ..controllers import ApiController, ControllerDoc, EndpointDoc, RESTController
 
         FEATURES_SCHEMA = {
             "rbd": (bool, ''),

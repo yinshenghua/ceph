@@ -244,6 +244,27 @@ public:
 
   const CompatSet &get_compat() const {return compat;}
 
+  void filter(const std::vector<string>& allowed)
+  {
+    if (allowed.empty()) {
+      return;
+    }
+
+    for (auto &f : filesystems) {
+      string_view fs_name = f.second->mds_map.get_fs_name();
+      if (std::find(allowed.begin(), allowed.end(), fs_name) == allowed.end()) {
+	filesystems.erase(f.first);
+      }
+    }
+
+    for (auto r : mds_roles) {
+      string_view fs_name = fs_name_from_gid(r.first);
+      if (std::find(allowed.begin(), allowed.end(), fs_name) == allowed.end()) {
+	mds_roles.erase(r.first);
+      }
+    }
+  }
+
   void set_enable_multiple(const bool v)
   {
     enable_multiple = v;
@@ -294,9 +315,15 @@ public:
   /**
    * Does a daemon exist with this GID?
    */
-  bool gid_exists(mds_gid_t gid) const
+  bool gid_exists(mds_gid_t gid,
+		  const std::vector<string>& in = {}) const
   {
-    return mds_roles.count(gid) > 0;
+    try {
+      string_view m = fs_name_from_gid(gid);
+      return in.empty() || std::find(in.begin(), in.end(), m) != in.end();
+    } catch (const std::out_of_range&) {
+      return false;
+    }
   }
 
   /**
@@ -307,15 +334,20 @@ public:
     return gid_exists(gid) && mds_roles.at(gid) != FS_CLUSTER_ID_NONE;
   }
 
-  fs_cluster_id_t gid_fscid(mds_gid_t gid) const
-  {
+  /**
+   * Which filesystem owns this GID?
+   */
+  fs_cluster_id_t fscid_from_gid(mds_gid_t gid) const {
+    if (!gid_exists(gid)) {
+      return FS_CLUSTER_ID_NONE;
+    }
     return mds_roles.at(gid);
   }
 
   /**
    * Insert a new MDS daemon, as a standby
    */
-  void insert(const mds_info_t& new_info);
+  void insert(const MDSMap::mds_info_t &new_info);
 
   /**
    * Assign an MDS cluster standby replay rank to a standby daemon
@@ -430,6 +462,16 @@ public:
     }
   }
 
+  std::string_view fs_name_from_gid(mds_gid_t gid) const
+  {
+    auto fscid = mds_roles.at(gid);
+    if (fscid == FS_CLUSTER_ID_NONE or !filesystem_exists(fscid)) {
+      return std::string_view();
+    } else {
+      return get_filesystem(fscid)->mds_map.get_fs_name();
+    }
+  }
+
   bool is_standby_replay(mds_gid_t who) const
   {
     return filesystems.at(mds_roles.at(who))->is_standby_replay(who);
@@ -487,6 +529,12 @@ public:
   int parse_role(
       std::string_view role_str,
       mds_role_t *role,
+      std::ostream &ss,
+      const std::vector<string> &filter) const;
+
+  int parse_role(
+      std::string_view role_str,
+      mds_role_t *role,
       std::ostream &ss) const;
 
   /**
@@ -519,6 +567,8 @@ public:
 
   void print(std::ostream& out) const;
   void print_summary(ceph::Formatter *f, std::ostream *out) const;
+  void print_daemon_summary(std::ostream& out) const;
+  void print_fs_summary(std::ostream& out) const;
 
   void dump(ceph::Formatter *f) const;
   static void generate_test_instances(std::list<FSMap*>& ls);
@@ -528,8 +578,8 @@ protected:
   uint64_t next_filesystem_id = FS_CLUSTER_ID_ANONYMOUS + 1;
   fs_cluster_id_t legacy_client_fscid = FS_CLUSTER_ID_NONE;
   CompatSet compat;
-  bool enable_multiple = false;
-  bool ever_enabled_multiple = false; // < the cluster had multiple MDSes enabled once
+  bool enable_multiple = true;
+  bool ever_enabled_multiple = true; // < the cluster had multiple FS enabled once
 
   std::map<fs_cluster_id_t, Filesystem::ref> filesystems;
 

@@ -1,9 +1,21 @@
-add_library(rbd_types STATIC
+set(librbd_types_srcs
   journal/Types.cc
   mirroring_watcher/Types.cc
   trash_watcher/Types.cc
   watcher/Types.cc
   WatchNotifyTypes.cc)
+
+if(WITH_RBD_RWL OR WITH_RBD_SSD_CACHE)
+ list(APPEND librbd_types_srcs cache/pwl/Types.cc)
+endif()
+
+add_library(rbd_types STATIC
+  ${librbd_types_srcs})
+
+if (WITH_RBD_RWL)
+  target_link_libraries(rbd_types
+    PUBLIC pmem::pmemobj)
+endif()
 
 set(librbd_internal_srcs
   AsioEngine.cc
@@ -38,15 +50,21 @@ set(librbd_internal_srcs
   api/PoolMetadata.cc
   api/Snapshot.cc
   api/Trash.cc
+  api/Utils.cc
   asio/ContextWQ.cc
   cache/ImageWriteback.cc
   cache/ObjectCacherObjectDispatch.cc
   cache/ObjectCacherWriteback.cc
-  cache/PassthroughImageCache.cc
-  cache/rwl/InitRequest.cc
-  cache/rwl/ShutdownRequest.cc
   cache/WriteAroundObjectDispatch.cc
+  crypto/BlockCrypto.cc
+  crypto/CryptoContextPool.cc
+  crypto/CryptoImageDispatch.cc
   crypto/CryptoObjectDispatch.cc
+  crypto/FormatRequest.cc
+  crypto/LoadRequest.cc
+  crypto/ShutDownCryptoRequest.cc
+  crypto/Utils.cc
+  crypto/openssl/DataCryptor.cc
   deep_copy/ImageCopyRequest.cc
   deep_copy/MetadataCopyRequest.cc
   deep_copy/ObjectCopyRequest.cc
@@ -95,8 +113,10 @@ set(librbd_internal_srcs
   io/ReadResult.cc
   io/RefreshImageDispatch.cc
   io/SimpleSchedulerObjectDispatch.cc
+  io/Types.cc
   io/Utils.cc
   io/WriteBlockImageDispatch.cc
+  io/IoOperations.cc
   journal/CreateRequest.cc
   journal/DemoteRequest.cc
   journal/ObjectDispatch.cc
@@ -113,6 +133,18 @@ set(librbd_internal_srcs
   managed_lock/ReacquireRequest.cc
   managed_lock/ReleaseRequest.cc
   managed_lock/Utils.cc
+  migration/FileStream.cc
+  migration/HttpClient.cc
+  migration/HttpStream.cc
+  migration/ImageDispatch.cc
+  migration/NativeFormat.cc
+  migration/OpenSourceImageRequest.cc
+  migration/QCOWFormat.cc
+  migration/RawFormat.cc
+  migration/RawSnapshot.cc
+  migration/S3Stream.cc
+  migration/SourceSpecBuilder.cc
+  migration/Utils.cc
   mirror/DemoteRequest.cc
   mirror/DisableRequest.cc
   mirror/EnableRequest.cc
@@ -178,18 +210,12 @@ if(WITH_EVENTTRACE)
   list(APPEND librbd_internal_srcs ../common/EventTrace.cc)
 endif()
 
-if(WITH_RBD_RWL)
-  set(librbd_internal_srcs
-    ${librbd_internal_srcs}
-    cache/rwl/ImageCacheState.cc
-    cache/rwl/LogEntry.cc
-    cache/rwl/LogMap.cc
-    cache/rwl/LogOperation.cc
-    cache/rwl/ReadRequest.cc
-    cache/rwl/Request.cc
-    cache/rwl/SyncPoint.cc
-    cache/rwl/Types.cc
-    cache/ReplicatedWriteLog.cc)
+if(LINUX AND HAVE_LIBCRYPTSETUP)
+  list(APPEND librbd_internal_srcs
+          crypto/luks/EncryptionFormat.cc
+          crypto/luks/Header.cc
+          crypto/luks/FormatRequest.cc
+          crypto/luks/LoadRequest.cc)
 endif()
 
 add_library(rbd_api STATIC librbd.cc)
@@ -206,11 +232,12 @@ if(WITH_EVENTTRACE)
   add_dependencies(rbd_internal eventtrace_tp)
 endif()
 target_link_libraries(rbd_internal PRIVATE
-  osdc rbd_types)
-
-if(WITH_RBD_RWL)
-  target_link_libraries(rbd_internal
-    PUBLIC blk)
+  osdc rbd_types
+  OpenSSL::SSL)
+target_include_directories(rbd_internal PRIVATE ${OPENSSL_INCLUDE_DIR})
+if(LINUX AND HAVE_LIBCRYPTSETUP)
+  target_include_directories(rbd_internal PRIVATE ${LIBCRYPTSETUP_INCLUDE_DIR})
+  target_link_libraries(rbd_internal PRIVATE ${LIBCRYPTSETUP_LIBRARIES})
 endif()
 
 add_custom_target(librbd_plugins)
@@ -223,6 +250,7 @@ add_library(librbd_plugin_parent_cache SHARED
   ${rbd_plugin_parent_cache_srcs})
 target_link_libraries(librbd_plugin_parent_cache PRIVATE
   ceph_immutable_object_cache_lib ceph-common librbd
+  libneorados
   librados)
 set_target_properties(librbd_plugin_parent_cache PROPERTIES
   OUTPUT_NAME ceph_librbd_parent_cache
@@ -230,6 +258,65 @@ set_target_properties(librbd_plugin_parent_cache PROPERTIES
   SOVERSION 1)
 install(TARGETS librbd_plugin_parent_cache DESTINATION ${librbd_plugins_dir})
 add_dependencies(librbd_plugins librbd_plugin_parent_cache)
+
+if(WITH_RBD_RWL OR WITH_RBD_SSD_CACHE)
+  set(rbd_plugin_pwl_srcs
+    cache/WriteLogImageDispatch.cc
+    cache/pwl/AbstractWriteLog.cc
+    cache/pwl/DiscardRequest.cc
+    cache/pwl/ImageCacheState.cc
+    cache/pwl/InitRequest.cc
+    cache/pwl/LogEntry.cc
+    cache/pwl/LogMap.cc
+    cache/pwl/LogOperation.cc
+    cache/pwl/Request.cc
+    cache/pwl/ShutdownRequest.cc
+    cache/pwl/SyncPoint.cc
+    cache/pwl/Types.cc
+    plugin/WriteLogImageCache.cc)
+
+    if(WITH_RBD_SSD_CACHE)
+      set(rbd_plugin_pwl_srcs
+        ${rbd_plugin_pwl_srcs}
+        cache/pwl/ssd/LogEntry.cc
+        cache/pwl/ssd/LogOperation.cc
+        cache/pwl/ssd/ReadRequest.cc
+        cache/pwl/ssd/Request.cc
+        cache/pwl/ssd/WriteLog.cc)
+    endif()
+    if(WITH_RBD_RWL)
+      set(rbd_plugin_pwl_srcs
+        ${rbd_plugin_pwl_srcs}
+        cache/pwl/rwl/WriteLog.cc
+        cache/pwl/rwl/LogEntry.cc
+        cache/pwl/rwl/LogOperation.cc
+        cache/pwl/rwl/ReadRequest.cc
+        cache/pwl/rwl/Request.cc)
+    endif()
+
+  add_library(librbd_plugin_pwl_cache SHARED
+    ${rbd_plugin_pwl_srcs})
+  target_link_libraries(librbd_plugin_pwl_cache PRIVATE
+    blk
+    ceph-common
+    cls_rbd_client
+    libneorados
+    librados
+    StdFilesystem::filesystem)
+
+  if(WITH_RBD_RWL)
+    target_link_libraries(librbd_plugin_pwl_cache
+      PUBLIC pmem::pmemobj
+      PRIVATE pmem::pmem)
+  endif()
+
+  set_target_properties(librbd_plugin_pwl_cache PROPERTIES
+    OUTPUT_NAME ceph_librbd_pwl_cache
+    VERSION 1.0.0
+    SOVERSION 1)
+  install(TARGETS librbd_plugin_pwl_cache DESTINATION ${librbd_plugins_dir})
+  add_dependencies(librbd_plugins librbd_plugin_pwl_cache)
+endif()
 
 add_library(librbd ${CEPH_SHARED}
   librbd.cc)
@@ -241,11 +328,11 @@ target_link_libraries(librbd PRIVATE
   rbd_internal
   rbd_types
   journal
-  libneorados
-  librados
   cls_rbd_client
   cls_lock_client
   cls_journal_client
+  libneorados
+  librados
   ceph-common
   pthread
   ${CMAKE_DL_LIBS}
@@ -257,7 +344,7 @@ endif()
 if(ENABLE_SHARED)
   set_target_properties(librbd PROPERTIES
     OUTPUT_NAME rbd
-    VERSION 1.12.0
+    VERSION 1.17.0
     SOVERSION 1
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)

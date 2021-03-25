@@ -31,11 +31,6 @@
 #include "mgr/MgrClient.h"
 
 #include "os/ObjectStore.h"
-#include "OSDCap.h"
-
-#include "auth/KeyRing.h"
-
-#include "osd/ClassHandler.h"
 
 #include "include/CompatSet.h"
 #include "include/common_fwd.h"
@@ -54,9 +49,6 @@
 
 #include "common/shared_cache.hpp"
 #include "common/simple_cache.hpp"
-#include "common/sharedptr_registry.hpp"
-#include "common/WeightedPriorityQueue.h"
-#include "common/PrioritizedQueue.h"
 #include "messages/MOSDOp.h"
 #include "common/EventTrace.h"
 #include "osd/osd_perf_counters.h"
@@ -93,9 +85,7 @@ struct C_OpenPGs;
 class LogChannel;
 
 class MOSDPGCreate2;
-class MOSDPGQuery;
 class MOSDPGNotify;
-class MOSDPGInfo;
 class MOSDPGRemove;
 class MOSDForceRecovery;
 class MMonGetPurgedSnapsReply;
@@ -207,8 +197,6 @@ public:
   /// gets ref to next_osdmap and registers the epoch as reserved
   OSDMapRef get_nextmap_reserved() {
     std::lock_guard l(pre_publish_lock);
-    if (!next_osdmap)
-      return OSDMapRef();
     epoch_t e = next_osdmap->get_epoch();
     std::map<epoch_t, unsigned>::iterator i =
       map_reservations.insert(std::make_pair(e, 0)).first;
@@ -243,8 +231,6 @@ public:
   }
   OSDMapRef get_next_osdmap() {
     std::lock_guard l(pre_publish_lock);
-    if (!next_osdmap)
-      return OSDMapRef();
     return next_osdmap;
   }
 
@@ -262,8 +248,8 @@ public:
   std::pair<ConnectionRef,ConnectionRef> get_con_osd_hb(int peer, epoch_t from_epoch);  // (back, front)
   void send_message_osd_cluster(int peer, Message *m, epoch_t from_epoch);
   void send_message_osd_cluster(std::vector<std::pair<int, Message*>>& messages, epoch_t from_epoch);
-  void send_message_osd_cluster(Message *m, Connection *con) {
-    con->send_message(m);
+  void send_message_osd_cluster(MessageRef m, Connection *con) {
+    con->send_message2(std::move(m));
   }
   void send_message_osd_cluster(Message *m, const ConnectionRef& con) {
     con->send_message(m);
@@ -299,20 +285,25 @@ public:
   };
   std::set<ScrubJob> sched_scrub_pg;
 
-  /// @returns the scrub_reg_stamp used for unregister the scrub job
-  utime_t reg_pg_scrub(spg_t pgid, utime_t t, double pool_scrub_min_interval,
-		       double pool_scrub_max_interval, bool must) {
-    ScrubJob scrub(cct, pgid, t, pool_scrub_min_interval, pool_scrub_max_interval,
-		   must);
-    std::lock_guard l(sched_scrub_lock);
-    sched_scrub_pg.insert(scrub);
-    return scrub.sched_time;
+  /// @returns the scrub_reg_stamp used for unregistering the scrub job
+  utime_t reg_pg_scrub(spg_t pgid,
+		       utime_t t,
+		       double pool_scrub_min_interval,
+		       double pool_scrub_max_interval,
+		       bool must) {
+    ScrubJob scrub_job(cct, pgid, t, pool_scrub_min_interval, pool_scrub_max_interval,
+		       must);
+    std::lock_guard l(OSDService::sched_scrub_lock);
+    sched_scrub_pg.insert(scrub_job);
+    return scrub_job.sched_time;
   }
+
   void unreg_pg_scrub(spg_t pgid, utime_t t) {
     std::lock_guard l(sched_scrub_lock);
     size_t removed = sched_scrub_pg.erase(ScrubJob(cct, pgid, t));
     ceph_assert(removed);
   }
+
   bool first_scrub_stamp(ScrubJob *out) {
     std::lock_guard l(sched_scrub_lock);
     if (sched_scrub_pg.empty())
@@ -326,31 +317,14 @@ public:
     std::lock_guard l(sched_scrub_lock);
     if (sched_scrub_pg.empty())
       return false;
-    std::set<ScrubJob>::const_iterator iter = sched_scrub_pg.lower_bound(next);
-    if (iter == sched_scrub_pg.cend())
-      return false;
-    ++iter;
+    std::set<ScrubJob>::const_iterator iter = sched_scrub_pg.upper_bound(next);
     if (iter == sched_scrub_pg.cend())
       return false;
     *out = *iter;
     return true;
   }
 
-  void dumps_scrub(ceph::Formatter *f) {
-    ceph_assert(f != nullptr);
-    std::lock_guard l(sched_scrub_lock);
-
-    f->open_array_section("scrubs");
-    for (const auto &i: sched_scrub_pg) {
-      f->open_object_section("scrub");
-      f->dump_stream("pgid") << i.pgid;
-      f->dump_stream("sched_time") << i.sched_time;
-      f->dump_stream("deadline") << i.deadline;
-      f->dump_bool("forced", i.sched_time == PG::Scrubber::scrub_must_stamp());
-      f->close_section();
-    }
-    f->close_section();
-  }
+  void dumps_scrub(ceph::Formatter* f);
 
   bool can_inc_scrubs();
   bool inc_scrubs_local();
@@ -610,7 +584,45 @@ public:
   AsyncReserver<spg_t, Finisher> snap_reserver;
   void queue_recovery_context(PG *pg, GenContext<ThreadPool::TPHandle&> *c);
   void queue_for_snap_trim(PG *pg);
-  void queue_for_scrub(PG *pg, bool with_high_priority);
+  void queue_for_scrub(PG* pg, Scrub::scrub_prio_t with_priority);
+  void queue_scrub_after_repair(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// queue the message (-> event) that all replicas reserved scrub resources for us
+  void queue_for_scrub_granted(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// queue the message (-> event) that some replicas denied our scrub resources request
+  void queue_for_scrub_denied(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// Signals either (a) the end of a sleep period, or (b) a recheck of the availability
+  /// of the primary map being created by the backend.
+  void queue_for_scrub_resched(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// Signals a change in the number of in-flight recovery writes
+  void queue_scrub_pushes_update(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// Signals that all pending updates were applied
+  void queue_scrub_applied_update(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// The block-range that was locked and prevented the scrubbing - is freed
+  void queue_scrub_unblocking(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// Signals that all write OPs are done
+  void queue_scrub_digest_update(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  /// Signals that we (the Primary) got all waited-for scrub-maps from our replicas
+  void queue_scrub_got_repl_maps(PG* pg, Scrub::scrub_prio_t with_priority);
+
+  void queue_for_rep_scrub(PG* pg,
+			   Scrub::scrub_prio_t with_high_priority,
+			   unsigned int qu_priority);
+
+  /// Signals a change in the number of in-flight recovery writes
+  void queue_scrub_replica_pushes(PG *pg, Scrub::scrub_prio_t with_priority);
+
+  void queue_for_rep_scrub_resched(PG* pg,
+				   Scrub::scrub_prio_t with_high_priority,
+				   unsigned int qu_priority);
+
   void queue_for_pg_delete(spg_t pgid, epoch_t e);
   bool try_finish_pg_delete(PG *pg, unsigned old_pg_num);
 
@@ -618,6 +630,17 @@ private:
   // -- pg recovery and associated throttling --
   ceph::mutex recovery_lock = ceph::make_mutex("OSDService::recovery_lock");
   std::list<std::pair<epoch_t, PGRef> > awaiting_throttle;
+
+  /// queue a scrub-related message for a PG
+  template <class MSG_TYPE>
+  void queue_scrub_event_msg(PG* pg,
+			     Scrub::scrub_prio_t with_priority,
+			     unsigned int qu_priority);
+
+  /// An alternative version of queue_scrub_event_msg(), in which the queuing priority is
+  /// provided by the executing scrub (i.e. taken from PgScrubber::m_flags)
+  template <class MSG_TYPE>
+  void queue_scrub_event_msg(PG* pg, Scrub::scrub_prio_t with_priority);
 
   utime_t defer_recovery_until;
   uint64_t recovery_ops_active;
@@ -665,7 +688,7 @@ public:
   }
 
   unsigned get_target_pg_log_entries() const;
-  
+
   // delayed pg activation
   void queue_for_recovery(PG *pg) {
     std::lock_guard l(recovery_lock);
@@ -725,7 +748,7 @@ public:
   void need_heartbeat_peer_update();
 
   void init();
-  void final_init();  
+  void final_init();
   void start_shutdown();
   void shutdown_reserver();
   void shutdown();
@@ -984,6 +1007,7 @@ struct OSDShard {
   std::string sdata_wait_lock_name;
   ceph::mutex sdata_wait_lock;
   ceph::condition_variable sdata_cond;
+  int waiting_threads = 0;
 
   ceph::mutex osdmap_lock;  ///< protect shard_osdmap updates vs users w/o shard_lock
   OSDMapRef shard_osdmap;
@@ -1135,7 +1159,7 @@ protected:
 
 public:
   int get_nodeid() { return whoami; }
-  
+
   static ghobject_t get_osdmap_pobject_name(epoch_t epoch) {
     char foo[20];
     snprintf(foo, sizeof(foo), "osdmap.%d", epoch);
@@ -1167,7 +1191,7 @@ public:
     getline(ss, s);
     return ghobject_t(hobject_t(sobject_t(object_t(s.c_str()), 0)));
   }
-  
+
   static ghobject_t make_pg_biginfo_oid(spg_t pg) {
     std::stringstream ss;
     ss << "pginfo_" << pg;
@@ -1215,7 +1239,7 @@ public:
    * Return value: CompatSet of all supported features
    */
   static CompatSet get_osd_compat_set();
-  
+
 
 private:
   class C_Tick;
@@ -1393,7 +1417,7 @@ private:
     std::vector<uint32_t> hb_front_min;
     std::vector<uint32_t> hb_front_max;
 
-    bool is_stale(utime_t stale) {
+    bool is_stale(utime_t stale) const {
       if (ping_history.empty()) {
         return false;
       }
@@ -1401,7 +1425,7 @@ private:
       return oldest_deadline <= stale;
     }
 
-    bool is_unhealthy(utime_t now) {
+    bool is_unhealthy(utime_t now) const {
       if (ping_history.empty()) {
         /// we haven't sent a ping yet or we have got all replies,
         /// in either way we are safe and healthy for now
@@ -1412,7 +1436,7 @@ private:
       return now > oldest_deadline;
     }
 
-    bool is_healthy(utime_t now) {
+    bool is_healthy(utime_t now) const {
       if (last_rx_front == utime_t() || last_rx_back == utime_t()) {
         // only declare to be healthy until we have received the first
         // replies from both front/back connections
@@ -1439,7 +1463,7 @@ private:
   std::map<int, int> debug_heartbeat_drops_remaining;
   ceph::condition_variable heartbeat_cond;
   bool heartbeat_stop;
-  std::atomic<bool> heartbeat_need_update;   
+  std::atomic<bool> heartbeat_need_update;
   std::map<int,HeartbeatInfo> heartbeat_peers;  ///< map of osd id to HeartbeatInfo
   utime_t last_mon_heartbeat;
   Messenger *hb_front_client_messenger;
@@ -1525,13 +1549,13 @@ public:
 private:
   // -- waiters --
   std::list<OpRequestRef> finished;
-  
+
   void take_waiters(std::list<OpRequestRef>& ls) {
     ceph_assert(ceph_mutex_is_locked(osd_lock));
     finished.splice(finished.end(), ls);
   }
   void do_waiters();
-  
+
   // -- op tracking --
   OpTracker op_tracker;
   void test_ops(std::string command, std::string args, std::ostream& ss);
@@ -1565,6 +1589,7 @@ protected:
   friend class ceph::osd::scheduler::PGOpItem;
   friend class ceph::osd::scheduler::PGPeeringItem;
   friend class ceph::osd::scheduler::PGRecovery;
+  friend class ceph::osd::scheduler::PGRecoveryMsg;
   friend class ceph::osd::scheduler::PGDelete;
 
   class ShardedOpWQ
@@ -1672,6 +1697,7 @@ protected:
   friend class PG;
   friend struct OSDShard;
   friend class PrimaryLogPG;
+  friend class PgScrubber;
 
 
  protected:
@@ -1819,7 +1845,7 @@ protected:
   bool _is_healthy();
 
   void send_full_update();
-  
+
   friend struct CB_OSD_GetVersion;
 
   // -- alive --
@@ -1864,7 +1890,6 @@ protected:
   double scrub_sleep_time(bool must_scrub);
 
   // -- generic pg peering --
-  PeeringCtx create_context();
   void dispatch_context(PeeringCtx &ctx, PG *pg, OSDMapRef curmap,
                         ThreadPool::TPHandle *handle = NULL);
 
@@ -1888,11 +1913,9 @@ protected:
 				 bool is_fast_dispatch);
 
   void handle_fast_pg_create(MOSDPGCreate2 *m);
-  void handle_fast_pg_query(MOSDPGQuery *m);
   void handle_pg_query_nopg(const MQuery& q);
   void handle_fast_pg_notify(MOSDPGNotify *m);
   void handle_pg_notify_nopg(const MNotifyRec& q);
-  void handle_fast_pg_info(MOSDPGInfo *m);
   void handle_fast_pg_remove(MOSDPGRemove *m);
 
 public:
@@ -2045,7 +2068,7 @@ public:
 		       uuid_d *osd_fsid,
 		       int *whoami,
 		       ceph_release_t *min_osd_release);
-  
+
 
   // startup/shutdown
   int pre_init();

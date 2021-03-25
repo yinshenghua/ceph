@@ -174,15 +174,8 @@ int rgw_put_system_obj(RGWSysObjectCtx& obj_ctx, const rgw_pool& pool, const str
   return ret;
 }
 
-int rgw_put_system_obj(RGWSysObjectCtx& obj_ctx, const rgw_pool& pool, const string& oid, bufferlist& data, bool exclusive,
-                       RGWObjVersionTracker *objv_tracker, real_time set_mtime, map<string, bufferlist> *pattrs)
-{
-  return rgw_put_system_obj(obj_ctx, pool, oid, data, exclusive,
-                            objv_tracker, set_mtime, null_yield, pattrs);
-}
-
 int rgw_get_system_obj(RGWSysObjectCtx& obj_ctx, const rgw_pool& pool, const string& key, bufferlist& bl,
-                       RGWObjVersionTracker *objv_tracker, real_time *pmtime, optional_yield y, map<string, bufferlist> *pattrs,
+                       RGWObjVersionTracker *objv_tracker, real_time *pmtime, optional_yield y, const DoutPrefixProvider *dpp, map<string, bufferlist> *pattrs,
                        rgw_cache_entry_info *cache_info,
 		       boost::optional<obj_version> refresh_version)
 {
@@ -202,7 +195,7 @@ int rgw_get_system_obj(RGWSysObjectCtx& obj_ctx, const rgw_pool& pool, const str
     int ret = rop.set_attrs(pattrs)
                  .set_last_mod(pmtime)
                  .set_objv_tracker(objv_tracker)
-                 .stat(y);
+                 .stat(y, dpp);
     if (ret < 0)
       return ret;
 
@@ -234,14 +227,14 @@ int rgw_get_system_obj(RGWSysObjectCtx& obj_ctx, const rgw_pool& pool, const str
 }
 
 int rgw_delete_system_obj(RGWSI_SysObj *sysobj_svc, const rgw_pool& pool, const string& oid,
-                          RGWObjVersionTracker *objv_tracker)
+                          RGWObjVersionTracker *objv_tracker, optional_yield y)
 {
   auto obj_ctx = sysobj_svc->init_obj_ctx();
   auto sysobj = obj_ctx.get_obj(rgw_raw_obj{pool, oid});
   rgw_raw_obj obj(pool, oid);
   return sysobj.wop()
                .set_objv_tracker(objv_tracker)
-               .remove(null_yield);
+               .remove(y);
 }
 
 thread_local bool is_asio_thread = false;
@@ -250,7 +243,6 @@ int rgw_rados_operate(librados::IoCtx& ioctx, const std::string& oid,
                       librados::ObjectReadOperation *op, bufferlist* pbl,
                       optional_yield y, int flags)
 {
-#ifdef HAVE_BOOST_CONTEXT
   // given a yield_context, call async_operate() to yield the coroutine instead
   // of blocking
   if (y) {
@@ -268,7 +260,6 @@ int rgw_rados_operate(librados::IoCtx& ioctx, const std::string& oid,
   if (is_asio_thread) {
     dout(20) << "WARNING: blocking librados call" << dendl;
   }
-#endif
   return ioctx.operate(oid, op, nullptr, flags);
 }
 
@@ -276,7 +267,6 @@ int rgw_rados_operate(librados::IoCtx& ioctx, const std::string& oid,
                       librados::ObjectWriteOperation *op, optional_yield y,
 		      int flags)
 {
-#ifdef HAVE_BOOST_CONTEXT
   if (y) {
     auto& context = y.get_io_context();
     auto& yield = y.get_yield_context();
@@ -287,7 +277,6 @@ int rgw_rados_operate(librados::IoCtx& ioctx, const std::string& oid,
   if (is_asio_thread) {
     dout(20) << "WARNING: blocking librados call" << dendl;
   }
-#endif
   return ioctx.operate(oid, op, flags);
 }
 
@@ -295,7 +284,6 @@ int rgw_rados_notify(librados::IoCtx& ioctx, const std::string& oid,
                      bufferlist& bl, uint64_t timeout_ms, bufferlist* pbl,
                      optional_yield y)
 {
-#ifdef HAVE_BOOST_CONTEXT
   if (y) {
     auto& context = y.get_io_context();
     auto& yield = y.get_yield_context();
@@ -310,7 +298,6 @@ int rgw_rados_notify(librados::IoCtx& ioctx, const std::string& oid,
   if (is_asio_thread) {
     dout(20) << "WARNING: blocking librados call" << dendl;
   }
-#endif
   return ioctx.notify2(oid, bl, timeout_ms, pbl);
 }
 
@@ -420,9 +407,8 @@ void rgw_filter_attrset(map<string, bufferlist>& unfiltered_attrset, const strin
   }
 }
 
-RGWDataAccess::RGWDataAccess(rgw::sal::RGWRadosStore *_store) : store(_store)
+RGWDataAccess::RGWDataAccess(rgw::sal::RGWStore *_store) : store(_store)
 {
-  sysobj_ctx = std::make_unique<RGWSysObjectCtx>(store->svc()->sysobj->init_obj_ctx());
 }
 
 
@@ -443,17 +429,17 @@ int RGWDataAccess::Bucket::finish_init()
   return 0;
 }
 
-int RGWDataAccess::Bucket::init()
+int RGWDataAccess::Bucket::init(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  int ret = sd->store->getRados()->get_bucket_info(sd->store->svc(),
-				       tenant, name,
-				       bucket_info,
-				       &mtime,
-                                       null_yield,
-				       &attrs);
+  std::unique_ptr<rgw::sal::RGWBucket> bucket;
+  int ret = sd->store->get_bucket(dpp, nullptr, tenant, name, &bucket, y);
   if (ret < 0) {
     return ret;
   }
+
+  bucket_info = bucket->get_info();
+  mtime = bucket->get_modification_time();
+  attrs = bucket->get_attrs();
 
   return finish_init();
 }
@@ -478,7 +464,7 @@ int RGWDataAccess::Object::put(bufferlist& data,
                                const DoutPrefixProvider *dpp,
                                optional_yield y)
 {
-  rgw::sal::RGWRadosStore *store = sd->store;
+  rgw::sal::RGWStore *store = sd->store;
   CephContext *cct = store->ctx();
 
   string tag;
@@ -495,11 +481,11 @@ int RGWDataAccess::Object::put(bufferlist& data,
 
   auto& owner = bucket->policy.get_owner();
 
-  string req_id = store->svc()->zone_utils->unique_id(store->getRados()->get_new_req_id());
+  string req_id = store->zone_unique_id(store->get_new_req_id());
 
   using namespace rgw::putobj;
   AtomicObjectProcessor processor(&aio, store, b.get(), nullptr,
-                                  owner.get_id(), obj_ctx, obj->get_obj(), olh_epoch,
+                                  owner.get_id(), obj_ctx, std::move(obj), olh_epoch,
                                   req_id, dpp, y);
 
   int ret = processor.prepare(y);
@@ -511,7 +497,7 @@ int RGWDataAccess::Object::put(bufferlist& data,
   CompressorRef plugin;
   boost::optional<RGWPutObj_Compress> compressor;
 
-  const auto& compression_type = store->svc()->zone->get_zone_params().get_compression_type(bucket_info.placement_rule);
+  const auto& compression_type = store->get_zone()->get_params().get_compression_type(bucket_info.placement_rule);
   if (compression_type != "none") {
     plugin = Compressor::create(store->ctx(), compression_type);
     if (!plugin) {

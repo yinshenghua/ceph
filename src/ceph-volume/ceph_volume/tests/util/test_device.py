@@ -203,6 +203,18 @@ class TestDevice(object):
         disk = device.Device("/dev/sdb")
         assert not disk.available
 
+    def test_reject_device_with_gpt_headers(self, device_info):
+        data = {"/dev/sdb": {"removable": 0, "size": 5368709120}}
+        lsblk = {"TYPE": "disk"}
+        blkid= {"PTTYPE": "gpt"}
+        device_info(
+            devices=data,
+            blkid=blkid,
+            lsblk=lsblk,
+        )
+        disk = device.Device("/dev/sdb")
+        assert not disk.available
+
     def test_accept_non_removable_device(self, device_info):
         data = {"/dev/sdb": {"removable": 0, "size": 5368709120}}
         lsblk = {"TYPE": "disk"}
@@ -253,8 +265,8 @@ class TestDevice(object):
         assert disk.is_ceph_disk_member is False
 
     def test_existing_vg_available(self, monkeypatch, device_info):
-        vg = api.VolumeGroup(vg_name='foo/bar', vg_free_count=6,
-                             vg_extent_size=1073741824)
+        vg = api.VolumeGroup(vg_name='foo/bar', vg_free_count=1536,
+                             vg_extent_size=4194304)
         monkeypatch.setattr(api, 'get_device_vgs', lambda x: [vg])
         lsblk = {"TYPE": "disk"}
         data = {"/dev/nvme0n1": {"size": "6442450944"}}
@@ -277,10 +289,10 @@ class TestDevice(object):
         assert not disk.available_raw
 
     def test_multiple_existing_vgs(self, monkeypatch, device_info):
-        vg1 = api.VolumeGroup(vg_name='foo/bar', vg_free_count=4,
-                             vg_extent_size=1073741824)
-        vg2 = api.VolumeGroup(vg_name='foo/bar', vg_free_count=6,
-                             vg_extent_size=1073741824)
+        vg1 = api.VolumeGroup(vg_name='foo/bar', vg_free_count=1000,
+                             vg_extent_size=4194304)
+        vg2 = api.VolumeGroup(vg_name='foo/bar', vg_free_count=536,
+                             vg_extent_size=4194304)
         monkeypatch.setattr(api, 'get_device_vgs', lambda x: [vg1, vg2])
         lsblk = {"TYPE": "disk"}
         data = {"/dev/nvme0n1": {"size": "6442450944"}}

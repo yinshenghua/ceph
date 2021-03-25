@@ -32,13 +32,13 @@
 
 #define dout_subsys ceph_subsys_rgw
 
-static rgw::sal::RGWRadosStore *store = NULL;
+static rgw::sal::RGWStore *store = NULL;
 
 class StoreDestructor {
-  rgw::sal::RGWRadosStore *store;
+  rgw::sal::RGWStore *store;
 
 public:
-  explicit StoreDestructor(rgw::sal::RGWRadosStore *_s) : store(_s) {}
+  explicit StoreDestructor(rgw::sal::RGWStore *_s) : store(_s) {}
   ~StoreDestructor() {
     if (store) {
       RGWStoreManager::close_storage(store);
@@ -66,7 +66,7 @@ int main(const int argc, const char **argv)
 
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
 			 CODE_ENVIRONMENT_DAEMON,
-			 CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS, "rgw_data");
+			 CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
 
   for (std::vector<const char *>::iterator i = args.begin(); i != args.end(); ) {
     if (ceph_argparse_double_dash(args, i)) {
@@ -80,7 +80,8 @@ int main(const int argc, const char **argv)
 
   common_init_finish(g_ceph_context);
 
-  store = RGWStoreManager::get_storage(g_ceph_context, false, false, false, false, false);
+  const DoutPrefix dp(cct.get(), dout_subsys, "rgw object expirer: ");
+  store = RGWStoreManager::get_storage(&dp, g_ceph_context, "rados", false, false, false, false, false);
   if (!store) {
     std::cerr << "couldn't init storage provider" << std::endl;
     return EIO;

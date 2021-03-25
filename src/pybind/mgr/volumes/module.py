@@ -1,9 +1,9 @@
 import errno
-import json
 import logging
 import traceback
+import threading
 
-from mgr_module import MgrModule
+from mgr_module import MgrModule, Option
 import orchestrator
 
 from .fs.volume import VolumeClient
@@ -116,6 +116,44 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             'desc': "Delete a CephFS subvolume in a volume, and optionally, "
                     "in a specific subvolume group, force deleting a cancelled or failed "
                     "clone, and retaining existing subvolume snapshots",
+            'perm': 'rw'
+        },
+        {
+            'cmd': 'fs subvolume authorize '
+                   'name=vol_name,type=CephString '
+                   'name=sub_name,type=CephString '
+                   'name=auth_id,type=CephString '
+                   'name=group_name,type=CephString,req=false '
+                   'name=access_level,type=CephString,req=false '
+                   'name=tenant_id,type=CephString,req=false '
+                   'name=allow_existing_id,type=CephBool,req=false ',
+            'desc': "Allow a cephx auth ID access to a subvolume",
+            'perm': 'rw'
+        },
+        {
+            'cmd': 'fs subvolume deauthorize '
+                   'name=vol_name,type=CephString '
+                   'name=sub_name,type=CephString '
+                   'name=auth_id,type=CephString '
+                   'name=group_name,type=CephString,req=false ',
+            'desc': "Deny a cephx auth ID access to a subvolume",
+            'perm': 'rw'
+        },
+        {
+            'cmd': 'fs subvolume authorized_list '
+                   'name=vol_name,type=CephString '
+                   'name=sub_name,type=CephString '
+                   'name=group_name,type=CephString,req=false ',
+            'desc': "List auth IDs that have access to a subvolume",
+            'perm': 'r'
+        },
+        {
+            'cmd': 'fs subvolume evict '
+                   'name=vol_name,type=CephString '
+                   'name=sub_name,type=CephString '
+                   'name=auth_id,type=CephString '
+                   'name=group_name,type=CephString,req=false ',
+            'desc': "Evict clients based on auth IDs and subvolume mounted",
             'perm': 'rw'
         },
         {
@@ -315,6 +353,11 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
             'perm': 'r'
         },
         {
+            'cmd': 'nfs export update ',
+            'desc': "Update an export of a NFS cluster by `-i <json_file>`",
+            'perm': 'rw'
+        },
+        {
             'cmd': 'nfs cluster create '
                    'name=type,type=CephString '
                    f'name=clusterid,type=CephString,goodchars={goodchars} '
@@ -375,17 +418,49 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
         # volume in the lifetime of this module instance.
     ]
 
+    MODULE_OPTIONS = [
+        Option(
+            'max_concurrent_clones',
+            type='int',
+            default=4,
+            desc='Number of asynchronous cloner threads',
+        )
+    ]
+
     def __init__(self, *args, **kwargs):
+        self.inited = False
+        # for mypy
+        self.max_concurrent_clones = None
+        self.lock = threading.Lock()
         super(Module, self).__init__(*args, **kwargs)
-        self.vc = VolumeClient(self)
-        self.fs_export = FSExport(self)
-        self.nfs = NFSCluster(self)
+        # Initialize config option members
+        self.config_notify()
+        with self.lock:
+            self.vc = VolumeClient(self)
+            self.fs_export = FSExport(self)
+            self.nfs = NFSCluster(self)
+            self.inited = True
 
     def __del__(self):
         self.vc.shutdown()
 
     def shutdown(self):
         self.vc.shutdown()
+
+    def config_notify(self):
+        """
+        This method is called whenever one of our config options is changed.
+        """
+        with self.lock:
+            for opt in self.MODULE_OPTIONS:
+                setattr(self,
+                        opt['name'],  # type: ignore
+                        self.get_module_option(opt['name']))  # type: ignore
+                self.log.debug(' mgr option %s = %s',
+                               opt['name'], getattr(self, opt['name']))  # type: ignore
+                if self.inited:
+                    if opt['name'] == "max_concurrent_clones":
+                        self.vc.cloner.reconfigure_max_concurrent_clones(self.max_concurrent_clones)
 
     def handle_command(self, inbuf, cmd):
         handler_name = "_cmd_" + cmd['prefix'].replace(" ", "_")
@@ -460,6 +535,48 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
                                         group_name=cmd.get('group_name', None),
                                         force=cmd.get('force', False),
                                         retain_snapshots=cmd.get('retain_snapshots', False))
+
+    @mgr_cmd_wrap
+    def _cmd_fs_subvolume_authorize(self, inbuf, cmd):
+        """
+        :return: a 3-tuple of return code(int), secret key(str), error message (str)
+        """
+        return self.vc.authorize_subvolume(vol_name=cmd['vol_name'],
+                                           sub_name=cmd['sub_name'],
+                                           auth_id=cmd['auth_id'],
+                                           group_name=cmd.get('group_name', None),
+                                           access_level=cmd.get('access_level', 'rw'),
+                                           tenant_id=cmd.get('tenant_id', None),
+                                           allow_existing_id=cmd.get('allow_existing_id', False))
+
+    @mgr_cmd_wrap
+    def _cmd_fs_subvolume_deauthorize(self, inbuf, cmd):
+        """
+        :return: a 3-tuple of return code(int), empty string(str), error message (str)
+        """
+        return self.vc.deauthorize_subvolume(vol_name=cmd['vol_name'],
+                                             sub_name=cmd['sub_name'],
+                                             auth_id=cmd['auth_id'],
+                                             group_name=cmd.get('group_name', None))
+
+    @mgr_cmd_wrap
+    def _cmd_fs_subvolume_authorized_list(self, inbuf, cmd):
+        """
+        :return: a 3-tuple of return code(int), list of authids(json), error message (str)
+        """
+        return self.vc.authorized_list(vol_name=cmd['vol_name'],
+                                       sub_name=cmd['sub_name'],
+                                       group_name=cmd.get('group_name', None))
+
+    @mgr_cmd_wrap
+    def _cmd_fs_subvolume_evict(self, inbuf, cmd):
+        """
+        :return: a 3-tuple of return code(int), empyt string(str), error message (str)
+        """
+        return self.vc.evict(vol_name=cmd['vol_name'],
+                             sub_name=cmd['sub_name'],
+                             auth_id=cmd['auth_id'],
+                             group_name=cmd.get('group_name', None))
 
     @mgr_cmd_wrap
     def _cmd_fs_subvolume_ls(self, inbuf, cmd):
@@ -592,6 +709,11 @@ class Module(orchestrator.OrchestratorClientMixin, MgrModule):
     @mgr_cmd_wrap
     def _cmd_nfs_export_get(self, inbuf, cmd):
         return self.fs_export.get_export(cluster_id=cmd['clusterid'], pseudo_path=cmd['binding'])
+
+    @mgr_cmd_wrap
+    def _cmd_nfs_export_update(self, inbuf, cmd):
+        # The export <json_file> is passed to -i and it's processing is handled by the Ceph CLI.
+        return self.fs_export.update_export(export_config=inbuf)
 
     @mgr_cmd_wrap
     def _cmd_nfs_cluster_create(self, inbuf, cmd):

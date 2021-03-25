@@ -2453,8 +2453,8 @@ void Locker::revoke_stale_cap(CInode *in, client_t client)
     return;
 
   if (cap->revoking() & CEPH_CAP_ANY_WR) {
-    std::stringstream ss;
-    mds->evict_client(client.v, false, g_conf()->mds_session_blocklist_on_timeout, ss, nullptr);
+    CachedStackStringStream css;
+    mds->evict_client(client.v, false, g_conf()->mds_session_blocklist_on_timeout, *css, nullptr);
     return;
   }
 
@@ -3162,13 +3162,13 @@ void Locker::handle_client_caps(const cref_t<MClientCaps> &m)
       if (session->get_num_completed_flushes() >=
 	  (g_conf()->mds_max_completed_flushes << session->get_num_trim_flushes_warnings())) {
 	session->inc_num_trim_flushes_warnings();
-	stringstream ss;
-	ss << "client." << session->get_client() << " does not advance its oldest_flush_tid ("
-	   << m->get_oldest_flush_tid() << "), "
-	   << session->get_num_completed_flushes()
-	   << " completed flushes recorded in session";
-	mds->clog->warn() << ss.str();
-	dout(20) << __func__ << " " << ss.str() << dendl;
+	CachedStackStringStream css;
+	*css << "client." << session->get_client() << " does not advance its oldest_flush_tid ("
+	     << m->get_oldest_flush_tid() << "), "
+	     << session->get_num_completed_flushes()
+	     << " completed flushes recorded in session";
+	mds->clog->warn() << css->strv();
+	dout(20) << __func__ << " " << css->strv() << dendl;
       }
     }
   }
@@ -4145,12 +4145,12 @@ void Locker::caps_tick()
     // exponential backoff of warning intervals
     if (age > mds->mdsmap->get_session_timeout() * (1 << cap->get_num_revoke_warnings())) {
       cap->inc_num_revoke_warnings();
-      stringstream ss;
-      ss << "client." << cap->get_client() << " isn't responding to mclientcaps(revoke), ino "
-	 << cap->get_inode()->ino() << " pending " << ccap_string(cap->pending())
-	 << " issued " << ccap_string(cap->issued()) << ", sent " << age << " seconds ago";
-      mds->clog->warn() << ss.str();
-      dout(20) << __func__ << " " << ss.str() << dendl;
+      CachedStackStringStream css;
+      *css << "client." << cap->get_client() << " isn't responding to mclientcaps(revoke), ino "
+	   << cap->get_inode()->ino() << " pending " << ccap_string(cap->pending())
+	   << " issued " << ccap_string(cap->issued()) << ", sent " << age << " seconds ago";
+      mds->clog->warn() << css->strv();
+      dout(20) << __func__ << " " << css->strv() << dendl;
     } else {
       dout(20) << __func__ << " silencing log message (backoff) for " << "client." << cap->get_client() << "." << cap->get_inode()->ino() << dendl;
     }
@@ -4252,6 +4252,7 @@ void Locker::issue_client_lease(CDentry *dn, MDRequestRef &mdr, int mask,
     lstat.mask = CEPH_LEASE_VALID | mask;
     lstat.duration_ms = (uint32_t)(1000 * mdcache->client_lease_durations[pool]);
     lstat.seq = ++l->seq;
+    lstat.alternate_name = std::string(dn->alternate_name);
     encode_lease(bl, session->info, lstat);
     dout(20) << "issue_client_lease seq " << lstat.seq << " dur " << lstat.duration_ms << "ms "
 	     << " on " << *dn << dendl;
@@ -4259,6 +4260,7 @@ void Locker::issue_client_lease(CDentry *dn, MDRequestRef &mdr, int mask,
     // null lease
     LeaseStat lstat;
     lstat.mask = mask;
+    lstat.alternate_name = std::string(dn->alternate_name);
     encode_lease(bl, session->info, lstat);
     dout(20) << "issue_client_lease no/null lease on " << *dn << dendl;
   }
@@ -4291,10 +4293,11 @@ void Locker::encode_lease(bufferlist& bl, const session_info_t& info,
 			  const LeaseStat& ls)
 {
   if (info.has_feature(CEPHFS_FEATURE_REPLY_ENCODING)) {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(ls.mask, bl);
     encode(ls.duration_ms, bl);
     encode(ls.seq, bl);
+    encode(ls.alternate_name, bl);
     ENCODE_FINISH(bl);
   }
   else {

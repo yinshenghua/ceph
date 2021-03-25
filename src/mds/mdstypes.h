@@ -5,7 +5,6 @@
 
 #include "include/int_types.h"
 
-#include <math.h>
 #include <ostream>
 #include <set>
 #include <map>
@@ -14,8 +13,10 @@
 #include "common/config.h"
 #include "common/Clock.h"
 #include "common/DecayCounter.h"
+#include "common/StackStringStream.h"
 #include "common/entity_name.h"
 
+#include "include/compat.h"
 #include "include/Context.h"
 #include "include/frag.h"
 #include "include/xlist.h"
@@ -70,13 +71,16 @@
 #define MDS_INO_STRAY_INDEX(i) (((unsigned (i)) - MDS_INO_STRAY_OFFSET) % NUM_STRAY)
 
 typedef int32_t mds_rank_t;
-constexpr mds_rank_t MDS_RANK_NONE = -1;
+constexpr mds_rank_t MDS_RANK_NONE		= -1;
+constexpr mds_rank_t MDS_RANK_EPHEMERAL_DIST	= -2;
+constexpr mds_rank_t MDS_RANK_EPHEMERAL_RAND	= -3;
 
 BOOST_STRONG_TYPEDEF(uint64_t, mds_gid_t)
 extern const mds_gid_t MDS_GID_NONE;
 
 typedef int32_t fs_cluster_id_t;
 constexpr fs_cluster_id_t FS_CLUSTER_ID_NONE = -1;
+
 // The namespace ID of the anonymous default filesystem from legacy systems
 constexpr fs_cluster_id_t FS_CLUSTER_ID_ANONYMOUS = 0;
 
@@ -623,6 +627,8 @@ struct inode_t {
 
   std::basic_string<char,std::char_traits<char>,Allocator<char>> stray_prior_path; //stores path before unlink
 
+  bool fscrypt = false; // fscrypt enabled ?
+
 private:
   bool older_is_consistent(const inode_t &other) const;
 };
@@ -631,7 +637,7 @@ private:
 template<template<typename> class Allocator>
 void inode_t<Allocator>::encode(ceph::buffer::list &bl, uint64_t features) const
 {
-  ENCODE_START(16, 6, bl);
+  ENCODE_START(17, 6, bl);
 
   encode(ino, bl);
   encode(rdev, bl);
@@ -686,13 +692,15 @@ void inode_t<Allocator>::encode(ceph::buffer::list &bl, uint64_t features) const
   encode(export_ephemeral_random_pin, bl);
   encode(export_ephemeral_distributed_pin, bl);
 
+  encode(fscrypt, bl);
+
   ENCODE_FINISH(bl);
 }
 
 template<template<typename> class Allocator>
 void inode_t<Allocator>::decode(ceph::buffer::list::const_iterator &p)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(16, 6, 6, p);
+  DECODE_START_LEGACY_COMPAT_LEN(17, 6, 6, p);
 
   decode(ino, p);
   decode(rdev, p);
@@ -788,6 +796,12 @@ void inode_t<Allocator>::decode(ceph::buffer::list::const_iterator &p)
   } else {
     export_ephemeral_random_pin = 0;
     export_ephemeral_distributed_pin = false;
+  }
+
+  if (struct_v >= 17) {
+    decode(fscrypt, p);
+  } else {
+    fscrypt = 0;
   }
 
   DECODE_FINISH(p);
@@ -1319,7 +1333,6 @@ struct session_info_t {
 
   void clear_meta() {
     prealloc_inos.clear();
-    used_inos.clear();
     completed_requests.clear();
     completed_flushes.clear();
     client_metadata.clear();
@@ -1333,7 +1346,6 @@ struct session_info_t {
   entity_inst_t inst;
   std::map<ceph_tid_t,inodeno_t> completed_requests;
   interval_set<inodeno_t> prealloc_inos;   // preallocated, ready to use.
-  interval_set<inodeno_t> used_inos;       // journaling use
   client_metadata_t client_metadata;
   std::set<ceph_tid_t> completed_flushes;
   EntityName auth_name;
@@ -1364,9 +1376,9 @@ struct dentry_key_t {
     } else {
       snprintf(b, sizeof(b), "%s", "head");
     }
-    std::ostringstream oss;
-    oss << name << "_" << b;
-    key = oss.str();
+    CachedStackStringStream css;
+    *css << name << "_" << b;
+    key = css->strv();
   }
   static void decode_helper(ceph::buffer::list::const_iterator& bl, std::string& nm,
 			    snapid_t& sn) {
@@ -1781,8 +1793,8 @@ inline void decode(dirfrag_load_vec_t& c, ceph::buffer::list::const_iterator &p)
 
 inline std::ostream& operator<<(std::ostream& out, const dirfrag_load_vec_t& dl)
 {
-  std::ostringstream ss;
-  ss << std::setprecision(1) << std::fixed
+  CachedStackStringStream css;
+  *css << std::setprecision(1) << std::fixed
      << "[pop"
         " IRD:" << dl.vec[0]
      << " IWR:" << dl.vec[1]
@@ -1790,7 +1802,7 @@ inline std::ostream& operator<<(std::ostream& out, const dirfrag_load_vec_t& dl)
      << " FET:" << dl.vec[3]
      << " STR:" << dl.vec[4]
      << " *LOAD:" << dl.meta_load() << "]";
-  return out << ss.str() << std::endl;
+  return out << css->strv() << std::endl;
 }
 
 struct mds_load_t {

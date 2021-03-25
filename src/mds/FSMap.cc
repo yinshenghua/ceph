@@ -12,12 +12,12 @@
  * 
  */
 
+#include <ostream>
 
 #include "FSMap.h"
 
 #include "common/StackStringStream.h"
 
-#include <sstream>
 #ifdef WITH_SEASTAR
 #include "crimson/common/config_proxy.h"
 #else
@@ -29,9 +29,7 @@
 using std::list;
 using std::pair;
 using std::ostream;
-using std::ostringstream;
 using std::string;
-using std::stringstream;
 
 using ceph::bufferlist;
 using ceph::Formatter;
@@ -223,6 +221,68 @@ void FSMap::print(ostream& out) const
 
   for (const auto& p : standby_daemons) {
     out << p.second << std::endl;
+  }
+}
+
+void FSMap::print_daemon_summary(ostream& out) const
+{
+  // this appears in the "services:" section of "ceph status"
+  int num_up = 0, num_in = 0, num_failed = 0;
+  int num_standby_replay = 0;
+  for (auto& [fscid, fs] : filesystems) {
+    num_up += fs->mds_map.get_num_up_mds();
+    num_in += fs->mds_map.get_num_in_mds();
+    num_failed += fs->mds_map.get_num_failed_mds();
+    num_standby_replay += fs->mds_map.get_num_standby_replay_mds();
+  }
+  int num_standby = standby_daemons.size();
+  out << num_up << "/" << num_in << " daemons up";
+  if (num_failed) {
+    out << " (" << num_failed << " failed)";
+  }
+  if (num_standby) {
+    out << ", " << num_standby << " standby";
+  }
+  if (num_standby_replay) {
+    out << ", " << num_standby_replay << " hot standby";
+  }
+}
+
+void FSMap::print_fs_summary(ostream& out) const
+{
+  // this appears in the "data:" section of "ceph status"
+  if (!filesystems.empty()) {
+    int num_failed = 0, num_recovering = 0, num_stopped = 0, num_healthy = 0;
+    int num_damaged = 0;
+    for (auto& [fscid, fs] : filesystems) {
+      if (fs->mds_map.is_any_damaged()) {
+	++num_damaged;
+      }
+      if (fs->mds_map.is_any_failed()) {
+	++num_failed;
+      } else if (fs->mds_map.is_degraded()) {
+	++num_recovering;
+      } else if (fs->mds_map.get_max_mds() == 0) {
+	++num_stopped;
+      } else {
+	++num_healthy;
+      }
+    }
+    out << "    volumes: "
+	<< num_healthy << "/" << filesystems.size() << " healthy";
+    if (num_recovering) {
+      out << ", " << num_recovering << " recovering";
+    }
+    if (num_failed) {
+      out << ", " << num_failed << " failed";
+    }
+    if (num_stopped) {
+      out << ", " << num_stopped << " stopped";
+    }
+    if (num_damaged) {
+      out << "; " << num_damaged << " damaged";
+    }
+    out << "\n";
   }
 }
 
@@ -483,9 +543,9 @@ void FSMap::get_health(list<pair<health_status_t,string> >& summary,
   }
 
   if (standby_count_wanted) {
-    std::ostringstream oss;
-    oss << "insufficient standby daemons available: have " << standby_daemons.size() << "; want " << standby_count_wanted << " more";
-    summary.push_back(make_pair(HEALTH_WARN, oss.str()));
+    CachedStackStringStream css;
+    *css << "insufficient standby daemons available: have " << standby_daemons.size() << "; want " << standby_count_wanted << " more";
+    summary.push_back(make_pair(HEALTH_WARN, css->str()));
   }
 }
 
@@ -524,10 +584,10 @@ void FSMap::get_health_checks(health_check_map_t *checks) const
       health_check_t& fscheck = checks->get_or_add(
         "FS_WITH_FAILED_MDS", HEALTH_WARN,
         "%num% filesystem%plurals% %hasorhave% a failed mds daemon", 1);
-      ostringstream ss;
-      ss << "fs " << fs->mds_map.fs_name << " has " << stuck_failed.size()
+      CachedStackStringStream css;
+      *css << "fs " << fs->mds_map.fs_name << " has " << stuck_failed.size()
          << " failed mds" << (stuck_failed.size() > 1 ? "s" : "");
-      fscheck.detail.push_back(ss.str()); }
+      fscheck.detail.push_back(css->str()); }
 
     checks->merge(fschecks);
     standby_count_wanted = std::max(
@@ -537,12 +597,12 @@ void FSMap::get_health_checks(health_check_map_t *checks) const
 
   // MDS_INSUFFICIENT_STANDBY
   if (standby_count_wanted) {
-    std::ostringstream oss, dss;
-    oss << "insufficient standby MDS daemons available";
-    auto& d = checks->get_or_add("MDS_INSUFFICIENT_STANDBY", HEALTH_WARN, oss.str(), 1);
-    dss << "have " << standby_daemons.size() << "; want " << standby_count_wanted
-	<< " more";
-    d.detail.push_back(dss.str());
+    CachedStackStringStream css1, css2;
+    *css1 << "insufficient standby MDS daemons available";
+    auto& d = checks->get_or_add("MDS_INSUFFICIENT_STANDBY", HEALTH_WARN, css1->str(), 1);
+    *css2 << "have " << standby_daemons.size() << "; want " << standby_count_wanted
+	  << " more";
+    d.detail.push_back(css2->str());
   }
 }
 
@@ -656,7 +716,7 @@ int FSMap::parse_filesystem(
         return 0;
       }
     }
-    return -ENOENT;
+    return -CEPHFS_ENOENT;
   } else {
     *result = get_filesystem(fscid);
     return 0;
@@ -1014,6 +1074,29 @@ std::vector<mds_gid_t> FSMap::stop(mds_gid_t who)
  * Parse into a mds_role_t.  The rank-only form is only valid
  * if legacy_client_ns is set.
  */
+
+int FSMap::parse_role(
+    std::string_view role_str,
+    mds_role_t *role,
+    std::ostream &ss,
+    const std::vector<string> &filter) const
+{
+  int r = parse_role(role_str, role, ss);
+  if (r < 0) return r;
+
+  string_view fs_name = get_filesystem(role->fscid)->mds_map.get_fs_name();
+
+  if (!filter.empty() &&
+      std::find(filter.begin(), filter.end(), fs_name) == filter.end()) {
+    if (r >= 0) {
+      ss << "Invalid file system";
+    }
+    return -CEPHFS_ENOENT;
+  }
+
+  return r;
+}
+
 int FSMap::parse_role(
     std::string_view role_str,
     mds_role_t *role,
@@ -1025,14 +1108,14 @@ int FSMap::parse_role(
   if (colon_pos == std::string::npos) {
     if (legacy_client_fscid == FS_CLUSTER_ID_NONE) {
       ss << "No filesystem selected";
-      return -ENOENT;
+      return -CEPHFS_ENOENT;
     }
     fs = get_filesystem(legacy_client_fscid);
     rank_pos = 0;
   } else {
     if (parse_filesystem(role_str.substr(0, colon_pos), &fs) < 0) {
       ss << "Invalid filesystem";
-      return -ENOENT;
+      return -CEPHFS_ENOENT;
     }
     rank_pos = colon_pos+1;
   }
@@ -1043,14 +1126,14 @@ int FSMap::parse_role(
   long rank_i = strict_strtol(rank_str.c_str(), 10, &err);
   if (rank_i < 0 || !err.empty()) {
     ss << "Invalid rank '" << rank_str << "'";
-    return -EINVAL;
+    return -CEPHFS_EINVAL;
   } else {
     rank = rank_i;
   }
 
   if (fs->mds_map.in.count(rank) == 0) {
     ss << "Rank '" << rank << "' not found";
-    return -ENOENT;
+    return -CEPHFS_ENOENT;
   }
 
   *role = {fs->fscid, rank};

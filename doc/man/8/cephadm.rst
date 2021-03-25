@@ -12,7 +12,7 @@ Synopsis
 | **cephadm**** [-h] [--image IMAGE] [--docker] [--data-dir DATA_DIR]
 |               [--log-dir LOG_DIR] [--logrotate-dir LOGROTATE_DIR]
 |               [--unit-dir UNIT_DIR] [--verbose] [--timeout TIMEOUT]
-|               [--retry RETRY]
+|               [--retry RETRY] [--no-container-init]
 |               {version,pull,inspect-image,ls,list-networks,adopt,rm-daemon,rm-cluster,run,shell,enter,ceph-volume,unit,logs,bootstrap,deploy,check-host,prepare-host,add-repo,rm-repo,install}
 |               ...
 
@@ -37,7 +37,7 @@ Synopsis
 | **cephadm** **run** [-h] --name NAME --fsid FSID
 
 | **cephadm** **shell** [-h] [--fsid FSID] [--name NAME] [--config CONFIG]
-                        [--keyring KEYRING] [--mount MOUNT] [--env ENV]
+                        [--keyring KEYRING] --mount [MOUNT [MOUNT ...]] [--env ENV]
                         [--] [command [command ...]]
 
 | **cephadm** **enter** [-h] [--fsid FSID] --name NAME [command [command ...]]
@@ -154,6 +154,10 @@ Options
 
    max number of retries (default: 10)
 
+.. option:: --no-container-init
+
+   do not run podman/docker with `--init` (default: False)
+
 
 Commands
 ========
@@ -235,6 +239,7 @@ Arguments:
 * [--registry-username REGISTRY_USERNAME] username of account to login to on custom registry
 * [--registry-password REGISTRY_PASSWORD] password of account to login to on custom registry
 * [--registry-json REGISTRY_JSON] JSON file containing registry login info (see registry-login command documentation)
+
 
 ceph-volume
 -----------
@@ -361,6 +366,21 @@ print journald logs for a daemon container::
 This is similar to::
 
     journalctl -u mgr.myhost.ysubfo
+
+Can also specify additional journal arguments::
+
+    cephadm logs --name mgr.myhost.ysubfo -- -n 20 # last 20 lines
+    cephadm logs --name mgr.myhost.ysubfo -- -f # follow the log
+
+
+Positional arguments:
+
+* [command]               command (optional)
+
+Arguments:
+
+* [--fsid FSID]           cluster FSID
+* [--name NAME, -n NAME]  daemon name (type.id)
 
 
 prepare-host

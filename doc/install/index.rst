@@ -44,13 +44,13 @@ Ceph clusters using Ansible.
   management features and dashboard integration are not available.
 
 
-``ceph-deploy`` is a tool for quickly deploying clusters.
+`ceph-deploy <https://docs.ceph.com/projects/ceph-deploy/en/latest/>`_ is a tool for quickly deploying clusters.
 
   .. IMPORTANT::
 
    ceph-deploy is no longer actively maintained. It is not tested on versions of Ceph newer than Nautilus. It does not support RHEL8, CentOS 8, or newer operating systems.
 
-`DeepSea <https://github.com/SUSE/DeepSea>`_ installs Ceph using Salt.
+`ceph-salt <https://github.com/ceph/ceph-salt>`_ installs Ceph using Salt and cephadm.
 
 `jaas.ai/ceph-mon <https://jaas.ai/ceph-mon>`_ installs Ceph using Juju.
 
@@ -64,5 +64,10 @@ Ceph can also be :ref:`installed manually <install-manual>`.
 
    index_manual
 
+Windows
+~~~~~~~
 
+For Windows installations, please consult this document:
+`Windows installation guide`_.
 
+.. _Windows installation guide: ./windows-install

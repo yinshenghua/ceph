@@ -1,8 +1,9 @@
 # vim: expandtab smarttab shiftwidth=4 softtabstop=4
-from nose.tools import assert_raises, assert_equal, assert_greater, with_setup
+from nose.tools import assert_raises, assert_equal, assert_not_equal, assert_greater, with_setup
 import cephfs as libcephfs
 import fcntl
 import os
+import random
 import time
 import stat
 import uuid
@@ -34,6 +35,11 @@ def setup_test():
     cephfs.closedir(d)
 
     cephfs.chdir(b"/")
+    _, ret_buf = cephfs.listxattr("/")
+    print(f'ret_buf={ret_buf}')
+    xattrs = ret_buf.decode('utf-8').split('\x00')
+    for xattr in xattrs[:-1]:
+        cephfs.removexattr("/", xattr)
 
 @with_setup(setup_test)
 def test_conf_get():
@@ -140,6 +146,47 @@ def test_xattr():
     ret_val, ret_buff = cephfs.listxattr("/")
     assert_equal(9, ret_val)
     assert_equal("user.big\x00", ret_buff.decode('utf-8'))
+
+@with_setup(setup_test)
+def test_ceph_mirror_xattr():
+    def gen_mirror_xattr():
+        cluster_id = str(uuid.uuid4())
+        fs_id = random.randint(1, 10)
+        mirror_xattr = f'cluster_id={cluster_id} fs_id={fs_id}'
+        return mirror_xattr.encode('utf-8')
+
+    mirror_xattr_enc_1 = gen_mirror_xattr()
+
+    # mirror xattr is only allowed on root
+    cephfs.mkdir('/d0', 0o755)
+    assert_raises(libcephfs.InvalidValue, cephfs.setxattr,
+                  '/d0', 'ceph.mirror.info', mirror_xattr_enc_1, os.XATTR_CREATE)
+    cephfs.rmdir('/d0')
+
+    cephfs.setxattr('/', 'ceph.mirror.info', mirror_xattr_enc_1, os.XATTR_CREATE)
+    assert_equal(mirror_xattr_enc_1, cephfs.getxattr('/', 'ceph.mirror.info'))
+
+    # setting again with XATTR_CREATE should fail
+    assert_raises(libcephfs.ObjectExists, cephfs.setxattr,
+                  '/', 'ceph.mirror.info', mirror_xattr_enc_1, os.XATTR_CREATE)
+
+    # ceph.mirror.info should not show up in listing
+    ret_val, _ = cephfs.listxattr("/")
+    assert_equal(0, ret_val)
+
+    mirror_xattr_enc_2 = gen_mirror_xattr()
+
+    cephfs.setxattr('/', 'ceph.mirror.info', mirror_xattr_enc_2, os.XATTR_REPLACE)
+    assert_equal(mirror_xattr_enc_2, cephfs.getxattr('/', 'ceph.mirror.info'))
+
+    cephfs.removexattr('/', 'ceph.mirror.info')
+    # ceph.mirror.info is already removed
+    assert_raises(libcephfs.NoData, cephfs.getxattr, '/', 'ceph.mirror.info')
+    # removing again should throw error
+    assert_raises(libcephfs.NoData, cephfs.removexattr, "/", "ceph.mirror.info")
+
+    # check mirror info xattr format
+    assert_raises(libcephfs.InvalidValue, cephfs.setxattr, '/', 'ceph.mirror.info', b"unknown", 0)
 
 @with_setup(setup_test)
 def test_fxattr():
@@ -494,6 +541,31 @@ def test_futimens():
     cephfs.unlink(b'/file-1')
 
 @with_setup(setup_test)
+def test_lchmod():
+    fd = cephfs.open(b'/file-1', 'w', 0o755)
+    cephfs.write(fd, b'0000', 0)
+    cephfs.close(fd)
+
+    cephfs.symlink(b'/file-1', b'/file-2')
+
+    stx_pre_t = cephfs.statx(b'/file-1', libcephfs.CEPH_STATX_MODE, 0)
+    stx_pre_s = cephfs.statx(b'/file-2', libcephfs.CEPH_STATX_MODE, libcephfs.AT_SYMLINK_NOFOLLOW)
+
+    time.sleep(1)
+    cephfs.lchmod(b'/file-2', 0o400)
+
+    stx_post_t = cephfs.statx(b'/file-1', libcephfs.CEPH_STATX_MODE, 0)
+    stx_post_s = cephfs.statx(b'/file-2', libcephfs.CEPH_STATX_MODE, libcephfs.AT_SYMLINK_NOFOLLOW)
+
+    assert_equal(stx_post_t['mode'], stx_pre_t['mode'])
+    assert_not_equal(stx_post_s['mode'], stx_pre_s['mode'])
+    stx_post_s_perm_bits = stx_post_s['mode'] & ~stat.S_IFMT(stx_post_s["mode"])
+    assert_equal(stx_post_s_perm_bits, 0o400)
+
+    cephfs.unlink(b'/file-2')
+    cephfs.unlink(b'/file-1')
+
+@with_setup(setup_test)
 def test_fchmod():
     fd = cephfs.open(b'/file-fchmod', 'w', 0o655)
     st = cephfs.statx(b'/file-fchmod', libcephfs.CEPH_STATX_MODE, 0)
@@ -785,3 +857,34 @@ def test_disk_quota_exceeeded_error():
     assert_raises(libcephfs.DiskQuotaExceeded, cephfs.write, fd, b"abcdeghiklmnopqrstuvwxyz", 0)
     cephfs.close(fd)
     cephfs.unlink(b"/dir-1/file-1")
+
+@with_setup(setup_test)
+def test_empty_snapshot_info():
+    cephfs.mkdir("/dir-1", 0o755)
+
+    # snap without metadata
+    cephfs.mkdir("/dir-1/.snap/snap0", 0o755)
+    snap_info = cephfs.snap_info("/dir-1/.snap/snap0")
+    assert_equal(snap_info["metadata"], {})
+    assert_greater(snap_info["id"], 0)
+    cephfs.rmdir("/dir-1/.snap/snap0")
+
+    # remove directory
+    cephfs.rmdir("/dir-1")
+
+@with_setup(setup_test)
+def test_snapshot_info():
+    cephfs.mkdir("/dir-1", 0o755)
+
+    # snap with custom metadata
+    md = {"foo": "bar", "zig": "zag", "abcdefg": "12345"}
+    cephfs.mksnap("/dir-1", "snap0", 0o755, metadata=md)
+    snap_info = cephfs.snap_info("/dir-1/.snap/snap0")
+    assert_equal(snap_info["metadata"]["foo"], md["foo"])
+    assert_equal(snap_info["metadata"]["zig"], md["zig"])
+    assert_equal(snap_info["metadata"]["abcdefg"], md["abcdefg"])
+    assert_greater(snap_info["id"], 0)
+    cephfs.rmsnap("/dir-1", "snap0")
+
+    # remove directory
+    cephfs.rmdir("/dir-1")

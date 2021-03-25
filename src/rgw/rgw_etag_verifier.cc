@@ -5,7 +5,79 @@
 
 #define dout_subsys ceph_subsys_rgw
 
-int RGWPutObj_ETagVerifier_Atomic::process(bufferlist&& in, uint64_t logical_offset)
+namespace rgw::putobj {
+
+int create_etag_verifier(CephContext* cct, DataProcessor* filter,
+                         const bufferlist& manifest_bl,
+                         const std::optional<RGWCompressionInfo>& compression,
+                         etag_verifier_ptr& verifier)
+{
+  RGWObjManifest manifest;
+
+  try {
+    auto miter = manifest_bl.cbegin();
+    decode(manifest, miter);
+  } catch (buffer::error& err) {
+    ldout(cct, 0) << "ERROR: couldn't decode manifest" << dendl;
+    return -EIO;
+  }
+
+  RGWObjManifestRule rule;
+  bool found = manifest.get_rule(0, &rule);
+  if (!found) {
+    lderr(cct) << "ERROR: manifest->get_rule() could not find rule" << dendl;
+    return -EIO;
+  }
+
+  if (rule.start_part_num == 0) {
+    /* Atomic object */
+    verifier.emplace<ETagVerifier_Atomic>(cct, filter);
+    return 0;
+  }
+
+  uint64_t cur_part_ofs = UINT64_MAX;
+  std::vector<uint64_t> part_ofs;
+
+  /*
+   * We must store the offset of each part to calculate the ETAGs for each
+   * MPU part. These part ETags then become the input for the MPU object
+   * Etag.
+   */
+  for (auto mi = manifest.obj_begin(); mi != manifest.obj_end(); ++mi) {
+    if (cur_part_ofs == mi.get_part_ofs())
+      continue;
+    cur_part_ofs = mi.get_part_ofs();
+    ldout(cct, 20) << "MPU Part offset:" << cur_part_ofs << dendl;
+    part_ofs.push_back(cur_part_ofs);
+  }
+
+  if (compression) {
+    // if the source object was compressed, the manifest is storing
+    // compressed part offsets. transform the compressed offsets back to
+    // their original offsets by finding the first block of each part
+    const auto& blocks = compression->blocks;
+    auto block = blocks.begin();
+    for (auto& ofs : part_ofs) {
+      // find the compression_block with new_ofs == ofs
+      constexpr auto less = [] (const compression_block& block, uint64_t ofs) {
+        return block.new_ofs < ofs;
+      };
+      block = std::lower_bound(block, blocks.end(), ofs, less);
+      if (block == blocks.end() || block->new_ofs != ofs) {
+        ldout(cct, 4) << "no match for compressed offset " << ofs
+            << ", disabling etag verification" << dendl;
+        return -EIO;
+      }
+      ofs = block->old_ofs;
+      ldout(cct, 20) << "MPU Part uncompressed offset:" << ofs << dendl;
+    }
+  }
+
+  verifier.emplace<ETagVerifier_MPU>(cct, std::move(part_ofs), filter);
+  return 0;
+}
+
+int ETagVerifier_Atomic::process(bufferlist&& in, uint64_t logical_offset)
 {
   bufferlist out;
   if (in.length() > 0)
@@ -14,7 +86,7 @@ int RGWPutObj_ETagVerifier_Atomic::process(bufferlist&& in, uint64_t logical_off
   return Pipe::process(std::move(in), logical_offset);
 }
 
-void RGWPutObj_ETagVerifier_Atomic::calculate_etag()
+void ETagVerifier_Atomic::calculate_etag()
 {
   unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
   char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
@@ -30,7 +102,7 @@ void RGWPutObj_ETagVerifier_Atomic::calculate_etag()
           << dendl;
 }
 
-void RGWPutObj_ETagVerifier_MPU::process_end_of_MPU_part()
+void ETagVerifier_MPU::process_end_of_MPU_part()
 {
   unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
   char calc_md5_part[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
@@ -50,7 +122,7 @@ void RGWPutObj_ETagVerifier_MPU::process_end_of_MPU_part()
   next_part_index++;
 }
 
-int RGWPutObj_ETagVerifier_MPU::process(bufferlist&& in, uint64_t logical_offset)
+int ETagVerifier_MPU::process(bufferlist&& in, uint64_t logical_offset)
 {
   uint64_t bl_end = in.length() + logical_offset;
 
@@ -87,10 +159,14 @@ done:
   return Pipe::process(std::move(in), logical_offset);
 }
 
-void RGWPutObj_ETagVerifier_MPU::calculate_etag()
+void ETagVerifier_MPU::calculate_etag()
 {
+  const uint32_t parts = part_ofs.size();
+  constexpr auto digits10 = std::numeric_limits<uint32_t>::digits10;
+  constexpr auto extra = 2 + digits10; // add "-%u\0" at the end
+
   unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE], mpu_m[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
+  char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + extra];
 
   /* Return early if ETag has already been calculated */
   if (!calculated_etag.empty())
@@ -104,8 +180,10 @@ void RGWPutObj_ETagVerifier_MPU::calculate_etag()
   buf_to_hex(mpu_m, CEPH_CRYPTO_MD5_DIGESTSIZE, final_etag_str);
   snprintf(&final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2],
            sizeof(final_etag_str) - CEPH_CRYPTO_MD5_DIGESTSIZE * 2,
-           "-%lld", (long long)(part_ofs.size()));
+           "-%u", parts);
 
   calculated_etag = final_etag_str;
   ldout(cct, 20) << "MPU calculated ETag:" << calculated_etag << dendl;
 }
+
+} // namespace rgw::putobj

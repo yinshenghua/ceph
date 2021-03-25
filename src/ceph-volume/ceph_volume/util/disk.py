@@ -24,7 +24,7 @@ def get_partuuid(device):
     device
     """
     out, err, rc = process.call(
-        ['blkid', '-s', 'PARTUUID', '-o', 'value', device]
+        ['blkid', '-c', '/dev/null', '-s', 'PARTUUID', '-o', 'value', device]
     )
     return ' '.join(out).strip()
 
@@ -98,7 +98,7 @@ def blkid(device):
     PART_ENTRY_UUID                 PARTUUID
     """
     out, err, rc = process.call(
-        ['blkid', '-p', device]
+        ['blkid', '-c', '/dev/null', '-p', device]
     )
     return _blkid_parser(' '.join(out))
 
@@ -110,7 +110,7 @@ def get_part_entry_type(device):
     used for udev rules, but it is useful in this case as it is the only
     consistent way to retrieve the GUID used by ceph-disk to identify devices.
     """
-    out, err, rc = process.call(['blkid', '-p', '-o', 'udev', device])
+    out, err, rc = process.call(['blkid', '-c', '/dev/null', '-p', '-o', 'udev', device])
     for line in out:
         if 'ID_PART_ENTRY_TYPE=' in line:
             return line.split('=')[-1].strip()
@@ -123,7 +123,7 @@ def get_device_from_partuuid(partuuid):
     device is
     """
     out, err, rc = process.call(
-        ['blkid', '-t', 'PARTUUID="%s"' % partuuid, '-o', 'device']
+        ['blkid', '-c', '/dev/null', '-t', 'PARTUUID="%s"' % partuuid, '-o', 'device']
     )
     return ' '.join(out).strip()
 
@@ -603,6 +603,12 @@ class Size(object):
         _b = self._b / other
         return Size(b=_b)
 
+    def __bool__(self):
+        return self.b != 0
+
+    def __nonzero__(self):
+        return self.__bool__()
+
     def __getattr__(self, unit):
         """
         Calculate units on the fly, relies on the fact that ``bytes`` has been
@@ -754,7 +760,7 @@ def get_devices(_sys_block_path='/sys/block'):
 
         # If the mapper device is a logical volume it gets excluded
         if is_mapper_device(diskname):
-            if lvm.is_lv(diskname):
+            if lvm.get_device_lvs(diskname):
                 continue
 
         # all facts that have no defaults

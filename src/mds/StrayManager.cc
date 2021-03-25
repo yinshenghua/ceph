@@ -77,7 +77,7 @@ public:
   C_IO_PurgeStrayPurged(StrayManager *sm_, CDentry *d, bool oh) : 
     StrayManagerIOContext(sm_), dn(d), only_head(oh) { }
   void finish(int r) override {
-    ceph_assert(r == 0 || r == -ENOENT);
+    ceph_assert(r == 0 || r == -CEPHFS_ENOENT);
     sm->_purge_stray_purged(dn, only_head);
   }
   void print(ostream& out) const override {
@@ -133,9 +133,11 @@ void StrayManager::purge(CDentry *dn)
 
     item.size = to;
     item.layout = pi->layout;
-    item.old_pools.clear();
-    for (const auto &p : pi->old_pools)
-      item.old_pools.insert(p);
+    item.old_pools.reserve(pi->old_pools.size());
+    for (const auto &p : pi->old_pools) {
+      if (p != pi->layout.pool_id)
+	item.old_pools.push_back(p);
+    }
     item.snapc = *snapc;
   }
 
@@ -347,16 +349,7 @@ void StrayManager::_enqueue(CDentry *dn, bool trunc)
     return;
   }
 
-  CInode *in = dn->get_linkage()->get_inode();
-  if (in->snaprealm &&
-      !in->snaprealm->have_past_parents_open() &&
-      !in->snaprealm->open_parents(new C_RetryEnqueue(this, dn, trunc))) {
-    // this can happen if the dentry had been trimmed from cache.
-    return;
-  }
-
   dn->get_dir()->auth_pin(this);
-
   if (trunc) {
     truncate(dn);
   } else {
@@ -474,21 +467,17 @@ bool StrayManager::_eval_stray(CDentry *dn)
     // only important for directories.  normal file data snaps are handled
     // by the object store.
     if (in->snaprealm) {
-      if (!in->snaprealm->have_past_parents_open() &&
-          !in->snaprealm->open_parents(new C_MDC_EvalStray(this, dn))) {
-        return false;
-      }
-      in->snaprealm->prune_past_parents();
+      in->snaprealm->prune_past_parent_snaps();
       in->purge_stale_snap_data(in->snaprealm->get_snaps());
     }
     if (in->is_dir()) {
-      if (in->snaprealm && in->snaprealm->has_past_parents()) {
+      if (in->snaprealm && in->snaprealm->has_past_parent_snaps()) {
 	dout(20) << "  directory has past parents "
 		 << in->snaprealm << dendl;
 	if (in->state_test(CInode::STATE_MISSINGOBJS)) {
 	  mds->clog->error() << "previous attempt at committing dirfrag of ino "
 			     << in->ino() << " has failed, missing object";
-	  mds->handle_write_error(-ENOENT);
+	  mds->handle_write_error(-CEPHFS_ENOENT);
 	}
 	return false;  // not until some snaps are deleted.
       }
@@ -527,7 +516,7 @@ bool StrayManager::_eval_stray(CDentry *dn)
       return false;
     }
     // don't purge multiversion inode with snap data
-    if (in->snaprealm && in->snaprealm->has_past_parents() &&
+    if (in->snaprealm && in->snaprealm->has_past_parent_snaps() &&
 	in->is_any_old_inodes()) {
       // A file with snapshots: we will truncate the HEAD revision
       // but leave the metadata intact.

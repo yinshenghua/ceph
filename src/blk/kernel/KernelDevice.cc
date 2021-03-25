@@ -12,6 +12,7 @@
  *
  */
 
+#include <limits>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -70,7 +71,9 @@ KernelDevice::KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, ai
   unsigned int iodepth = cct->_conf->bdev_aio_max_queue_depth;
 
   if (use_ioring && ioring_queue_t::supported()) {
-    io_queue = std::make_unique<ioring_queue_t>(iodepth);
+    bool use_ioring_hipri = cct->_conf.get_val<bool>("bdev_ioring_hipri");
+    bool use_ioring_sqthread_poll = cct->_conf.get_val<bool>("bdev_ioring_sqthread_poll");
+    io_queue = std::make_unique<ioring_queue_t>(iodepth, use_ioring_hipri, use_ioring_sqthread_poll);
   } else {
     static bool once;
     if (use_ioring && !once) {
@@ -85,25 +88,36 @@ KernelDevice::KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, ai
 int KernelDevice::_lock()
 {
   dout(10) << __func__ << " " << fd_directs[WRITE_LIFE_NOT_SET] << dendl;
-  utime_t sleeptime;
-  sleeptime.set_from_double(cct->_conf->bdev_flock_retry_interval);
-
   // When the block changes, systemd-udevd will open the block,
   // read some information and close it. Then a failure occurs here.
   // So we need to try again here.
-  for (int i = 0; i < cct->_conf->bdev_flock_retry + 1; i++) {
-    int r = ::flock(fd_directs[WRITE_LIFE_NOT_SET], LOCK_EX | LOCK_NB);
-    if (r < 0 && errno == EAGAIN) {
-      dout(1) << __func__ << " flock busy on " << path << dendl;    
-      sleeptime.sleep();
-    } else if (r < 0) {
-      derr << __func__ << " flock failed on " << path << dendl;    
-      break;
-    } else {
+  int fd = fd_directs[WRITE_LIFE_NOT_SET];
+  uint64_t nr_tries = 0;
+  for (;;) {
+    struct flock fl = { F_WRLCK,
+                        SEEK_SET };
+    int r = ::fcntl(fd, F_OFD_SETLK, &fl);
+    if (r < 0) {
+      if (errno == EINVAL) {
+        r = ::flock(fd, LOCK_EX | LOCK_NB);
+      }
+    }
+    if (r == 0) {
       return 0;
     }
+    if (errno != EAGAIN) {
+      return -errno;
+    }
+    dout(1) << __func__ << " flock busy on " << path << dendl;
+    if (const uint64_t max_retry =
+	cct->_conf.get_val<uint64_t>("bdev_flock_retry");
+        max_retry > 0 && nr_tries++ == max_retry) {
+      return -EAGAIN;
+    }
+    double retry_interval =
+      cct->_conf.get_val<double>("bdev_flock_retry_interval");
+    std::this_thread::sleep_for(ceph::make_timespan(retry_interval));
   }
-  return -errno;
 }
 
 int KernelDevice::open(const string& p)
@@ -634,7 +648,6 @@ void KernelDevice::_aio_thread()
 	}
       }
     }
-    reap_ioc();
     if (cct->_conf->bdev_inject_crash) {
       ++inject_crash_count;
       if (inject_crash_count * cct->_conf->bdev_aio_poll_ms / 1000 >
@@ -646,7 +659,6 @@ void KernelDevice::_aio_thread()
       }
     }
   }
-  reap_ioc();
   dout(10) << __func__ << " end" << dendl;
 }
 
@@ -800,6 +812,8 @@ void KernelDevice::aio_submit(IOContext *ioc)
 
   void *priv = static_cast<void*>(ioc);
   int r, retries = 0;
+  // num of pending aios should not overflow when passed to submit_batch()
+  assert(pending <= std::numeric_limits<uint16_t>::max());
   r = io_queue->submit_batch(ioc->running_aios.begin(), e,
 			     pending, priv, &retries);
 
@@ -942,8 +956,8 @@ int KernelDevice::aio_write(
       ioc->pending_aios.push_back(aio_t(ioc, choose_fd(false, write_hint)));
       ++ioc->num_pending;
       auto& aio = ioc->pending_aios.back();
-      bufferptr p = ceph::buffer::create_small_page_aligned(len);
-      aio.bl.append(std::move(p));
+      aio.bl.push_back(
+        ceph::buffer::ptr_node::create(ceph::buffer::create_small_page_aligned(len)));
       aio.bl.prepare_iov(&aio.iov);
       aio.preadv(off, len);
       ++injecting_crash;
@@ -1076,8 +1090,8 @@ int KernelDevice::aio_read(
     ioc->pending_aios.push_back(aio_t(ioc, fd_directs[WRITE_LIFE_NOT_SET]));
     ++ioc->num_pending;
     aio_t& aio = ioc->pending_aios.back();
-    bufferptr p = ceph::buffer::create_small_page_aligned(len);
-    aio.bl.append(std::move(p));
+    aio.bl.push_back(
+      ceph::buffer::ptr_node::create(ceph::buffer::create_small_page_aligned(len)));
     aio.bl.prepare_iov(&aio.iov);
     aio.preadv(off, len);
     dout(30) << aio << dendl;

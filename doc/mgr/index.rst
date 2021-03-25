@@ -29,6 +29,7 @@ sensible.
     Writing modules <modules>
     Writing orchestrator plugins <orchestrator_modules>
     Dashboard module <dashboard>
+    Ceph RESTful API <ceph_api/index>
     Alerts module <alerts>
     DiskPrediction module <diskprediction>
     Local pool module <localpool>
@@ -44,3 +45,4 @@ sensible.
     Insights module <insights>
     Orchestrator module <orchestrator>
     Rook module <rook>
+    MDS Autoscaler module <mds_autoscaler>

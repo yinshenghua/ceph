@@ -43,13 +43,13 @@ def get_next_clone_entry(volume_client, volname, running_jobs):
 def open_at_volume(volume_client, volname, groupname, subvolname, op_type):
     with open_volume(volume_client, volname) as fs_handle:
         with open_group(fs_handle, volume_client.volspec, groupname) as group:
-            with open_subvol(fs_handle, volume_client.volspec, group, subvolname, op_type) as subvolume:
+            with open_subvol(volume_client.mgr, fs_handle, volume_client.volspec, group, subvolname, op_type) as subvolume:
                 yield subvolume
 
 @contextmanager
 def open_at_group(volume_client, fs_handle, groupname, subvolname, op_type):
     with open_group(fs_handle, volume_client.volspec, groupname) as group:
-        with open_subvol(fs_handle, volume_client.volspec, group, subvolname, op_type) as subvolume:
+        with open_subvol(volume_client.mgr, fs_handle, volume_client.volspec, group, subvolname, op_type) as subvolume:
             yield subvolume
 
 @contextmanager
@@ -117,6 +117,7 @@ def sync_attrs(fs_handle, target_path, source_statx):
         fs_handle.lchown(target_path, source_statx["uid"], source_statx["gid"])
         fs_handle.lutimes(target_path, (time.mktime(source_statx["atime"].timetuple()),
                                         time.mktime(source_statx["mtime"].timetuple())))
+        fs_handle.lchmod(target_path, source_statx["mode"])
     except cephfs.Error as e:
         log.warning("error synchronizing attrs for {0} ({1})".format(target_path, e))
         raise e
@@ -274,6 +275,9 @@ class Cloner(AsyncJobs):
         }
         super(Cloner, self).__init__(volume_client, "cloner", tp_size)
 
+    def reconfigure_max_concurrent_clones(self, tp_size):
+        super(Cloner, self).reconfigure_max_concurrent_clones("cloner", tp_size)
+
     def is_clone_cancelable(self, clone_state):
         return not (SubvolumeOpSm.is_complete_state(clone_state) or SubvolumeOpSm.is_failed_state(clone_state))
 
@@ -308,7 +312,7 @@ class Cloner(AsyncJobs):
         try:
             with open_volume(self.vc, volname) as fs_handle:
                 with open_group(fs_handle, self.vc.volspec, groupname) as group:
-                    with open_subvol(fs_handle, self.vc.volspec, group, clonename, SubvolumeOpType.CLONE_CANCEL) as clone_subvolume:
+                    with open_subvol(self.vc.mgr, fs_handle, self.vc.volspec, group, clonename, SubvolumeOpType.CLONE_CANCEL) as clone_subvolume:
                         status = clone_subvolume.status
                         clone_state = SubvolumeStates.from_value(status['state'])
                         if not self.is_clone_cancelable(clone_state):
@@ -328,7 +332,7 @@ class Cloner(AsyncJobs):
             with self.lock:
                 with open_volume_lockless(self.vc, volname) as fs_handle:
                     with open_group(fs_handle, self.vc.volspec, groupname) as group:
-                        with open_subvol(fs_handle, self.vc.volspec, group, clonename, SubvolumeOpType.CLONE_CANCEL) as clone_subvolume:
+                        with open_subvol(self.vc.mgr, fs_handle, self.vc.volspec, group, clonename, SubvolumeOpType.CLONE_CANCEL) as clone_subvolume:
                             if not self._cancel_job(volname, (track_idx, clone_subvolume.base_path)):
                                 raise VolumeException(-errno.EINVAL, "cannot cancel -- clone finished (check clone status)")
         except (IndexException, MetadataMgrException) as e:

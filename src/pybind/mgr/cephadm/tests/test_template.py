@@ -5,12 +5,12 @@ import pytest
 from cephadm.template import TemplateMgr, UndefinedError, TemplateNotFoundError
 
 
-def test_render(fs):
+def test_render(cephadm_module, fs):
     template_base = (pathlib.Path(__file__).parent / '../templates').resolve()
     fake_template = template_base / 'foo/bar'
     fs.create_file(fake_template, contents='{{ cephadm_managed }}{{ var }}')
 
-    template_mgr = TemplateMgr()
+    template_mgr = TemplateMgr(cephadm_module)
     value = 'test'
 
     # with base context

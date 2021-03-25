@@ -24,6 +24,7 @@ Synopsis
 | **ceph-bluestore-tool** bluefs-bdev-migrate --path *osd path* --dev-target *new-device* --devs-source *device1* [--devs-source *device2*]
 | **ceph-bluestore-tool** free-dump|free-score --path *osd path* [ --allocator block/bluefs-wal/bluefs-db/bluefs-slow ]
 | **ceph-bluestore-tool** reshard --path *osd path* --sharding *new sharding* [ --sharding-ctrl *control string* ]
+| **ceph-bluestore-tool** show-sharding --path *osd path*
 
 
 Description
@@ -109,6 +110,10 @@ Commands
    Interrupted resharding does not corrupt data. It is always possible to continue previous resharding,
    or select any other sharding scheme, including reverting to original one.
 
+:command:`show-sharding` --path *osd path*
+
+   Show sharding that is currently applied to BlueStore's RocksDB.
+
 Options
 =======
 
@@ -191,14 +196,14 @@ It is advised to first check if rescue process would be successfull::
   ceph-bluestore-tool fsck --path *osd path* \
   --bluefs_replay_recovery=true --bluefs_replay_recovery_disable_compact=true
 
-If above fsck is successfull fix procedure can be applied.
+If above fsck is successful fix procedure can be applied.
 
 Availability
 ============
 
 **ceph-bluestore-tool** is part of Ceph, a massively scalable,
 open-source, distributed storage system. Please refer to the Ceph
-documentation at http://ceph.com/docs for more information.
+documentation at https://docs.ceph.com for more information.
 
 
 See also

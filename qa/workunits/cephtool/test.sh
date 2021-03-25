@@ -345,6 +345,11 @@ function test_tiering_1()
   ceph osd tier add slow cache
   ceph osd tier add slow cache2
   expect_false ceph osd tier add slow2 cache
+  # application metadata should propagate to the tiers
+  ceph osd pool ls detail -f json | jq '.[] | select(.pool_name == "slow") | .application_metadata["rados"]' | grep '{}'
+  ceph osd pool ls detail -f json | jq '.[] | select(.pool_name == "slow2") | .application_metadata["rados"]' | grep '{}'
+  ceph osd pool ls detail -f json | jq '.[] | select(.pool_name == "cache") | .application_metadata["rados"]' | grep '{}'
+  ceph osd pool ls detail -f json | jq '.[] | select(.pool_name == "cache2") | .application_metadata["rados"]' | grep '{}'
   # forward and proxy are removed/deprecated
   expect_false ceph osd tier cache-mode cache forward
   expect_false ceph osd tier cache-mode cache forward --yes-i-really-mean-it
@@ -751,6 +756,7 @@ function test_mon_misc()
   ceph log last 100 | grep "$mymsg"
   ceph_watch_wait "$mymsg"
 
+  ceph mgr stat
   ceph mgr dump
   ceph mgr module ls
   ceph mgr module enable restful
@@ -1165,6 +1171,20 @@ function test_mon_mon()
   ceph mon feature set kraken --yes-i-really-mean-it
   expect_false ceph mon feature set abcd
   expect_false ceph mon feature set abcd --yes-i-really-mean-it
+
+  # test elector
+  expect_failure $TEMP_DIR ceph mon add disallowed_leader $first
+  ceph mon set election_strategy disallow
+  ceph mon add disallowed_leader $first
+  ceph mon set election_strategy connectivity
+  ceph mon rm disallowed_leader $first
+  ceph mon set election_strategy classic
+  expect_failure $TEMP_DIR ceph mon rm disallowed_leader $first
+
+  # test mon stat
+  # don't check output, just ensure it does not fail.
+  ceph mon stat
+  ceph mon stat -f json | jq '.'
 }
 
 function test_mon_priority_and_weight()
@@ -1480,12 +1500,10 @@ function test_mon_osd()
 	expect_false ceph osd set $f
 	expect_false ceph osd unset $f
   done
-  ceph osd require-osd-release pacific
+  ceph osd require-osd-release quincy
   # can't lower
+  expect_false ceph osd require-osd-release pacific
   expect_false ceph osd require-osd-release octopus
-  expect_false ceph osd require-osd-release nautilus
-  expect_false ceph osd require-osd-release mimic
-  expect_false ceph osd require-osd-release luminous
   # these are no-ops but should succeed.
 
   ceph osd set noup
@@ -1531,7 +1549,13 @@ function test_mon_osd()
   ceph osd info
   info_json=$(ceph osd info --format=json | jq -cM '.')
   dump_json=$(ceph osd dump --format=json | jq -cM '.osds')
-  [[ "${info_json}" == "${dump_json}" ]]
+  if [[ "${info_json}" != "${dump_json}" ]]; then
+    echo "waiting for OSDs to settle"
+    sleep 10
+    info_json=$(ceph osd info --format=json | jq -cM '.')
+    dump_json=$(ceph osd dump --format=json | jq -cM '.osds')
+    [[ "${info_json}" == "${dump_json}" ]]
+  fi
 
   info_json=$(ceph osd info 0 --format=json | jq -cM '.')
   dump_json=$(ceph osd dump --format=json | \

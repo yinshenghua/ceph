@@ -23,7 +23,7 @@ Synopsis
 
 | **ceph** **df** *{detail}*
 
-| **ceph** **fs** [ *ls* \| *new* \| *reset* \| *rm* ] ...
+| **ceph** **fs** [ *ls* \| *new* \| *reset* \| *rm* \| *authorize* ] ...
 
 | **ceph** **fsid**
 
@@ -385,6 +385,13 @@ Usage::
 
 	ceph fs rm <fs_name> {--yes-i-really-mean-it}
 
+Subcommand ``authorize`` creates a new client that will be authorized for the
+given path in ``<fs_name>``. Pass ``/`` to authorize for the entire FS.
+``<perms>`` below can be ``r``, ``rw`` or ``rwp``.
+
+Usage::
+
+    ceph fs authorize <fs_name> client.<client_id> <path> <perms> [<path> <perms>...]
 
 fsid
 ----
@@ -985,11 +992,16 @@ data should remain readable and writeable, although data redundancy
 may be reduced as some PGs may end up in a degraded (but active)
 state.  It will return a success code if it is okay to stop the
 OSD(s), or an error code and informative message if it is not or if no
-conclusion can be drawn at the current time.
+conclusion can be drawn at the current time.  When ``--max <num>`` is
+provided, up to <num> OSDs IDs will return (including the provided
+OSDs) that can all be stopped simultaneously.  This allows larger sets
+of stoppable OSDs to be generated easily by providing a single
+starting OSD and a max.  Additional OSDs are drawn from adjacent locations
+in the CRUSH hierarchy.
 
 Usage::
 
-  ceph osd ok-to-stop <id> [<ids>...]
+  ceph osd ok-to-stop <id> [<ids>...] [--max <num>]
 
 Subcommand ``pause`` pauses osd.
 
@@ -1145,7 +1157,7 @@ Usage::
 
         ceph osd pool application rm <pool-name> <app> <key>
 
-Subcommand ``set`` assosciates or updates, if it already exists, a key-value
+Subcommand ``set`` associates or updates, if it already exists, a key-value
 pair with the given application for the given pool.
 
 Usage::
@@ -1186,12 +1198,14 @@ Usage::
 	ceph osd reweight-by-pg {<int[100-]>} {<poolname> [<poolname...]}
 	{--no-increasing}
 
-Subcommand ``reweight-by-utilization`` reweight OSDs by utilization
-[overload-percentage-for-consideration, default 120].
+Subcommand ``reweight-by-utilization`` reweights OSDs by utilization.  It only reweights
+outlier OSDs whose utilization exceeds the average, eg. the default 120%
+limits reweight to those OSDs that are more than 20% over the average.
+[overload-threshold, default 120 [max_weight_change, default 0.05 [max_osds_to_adjust, default 4]]] 
 
 Usage::
 
-	ceph osd reweight-by-utilization {<int[100-]>}
+	ceph osd reweight-by-utilization {<int[100-]> {<float[0.0-]> {<int[0-]>}}}
 	{--no-increasing}
 
 Subcommand ``rm`` removes osd(s) <id> [<id>...] from the OSD map.
@@ -1624,7 +1638,7 @@ Availability
 ============
 
 :program:`ceph` is part of Ceph, a massively scalable, open-source, distributed storage system. Please refer to
-the Ceph documentation at http://ceph.com/docs for more information.
+the Ceph documentation at https://docs.ceph.com for more information.
 
 
 See also

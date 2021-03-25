@@ -238,8 +238,8 @@ int OSDMap::Incremental::identify_osd(uuid_d u) const
   return -1;
 }
 
-int OSDMap::Incremental::propagate_snaps_to_tiers(CephContext *cct,
-						  const OSDMap& osdmap)
+int OSDMap::Incremental::propagate_base_properties_to_tiers(CephContext *cct,
+							    const OSDMap& osdmap)
 {
   ceph_assert(epoch == osdmap.get_epoch() + 1);
 
@@ -279,6 +279,8 @@ int OSDMap::Incremental::propagate_snaps_to_tiers(CephContext *cct,
 	if (new_rem_it != new_removed_snaps.end()) {
 	  new_removed_snaps[tier_pool] = new_rem_it->second;
 	}
+
+	tier->application_metadata = base.application_metadata;
       }
     }
   }
@@ -646,11 +648,15 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
   }
 
   {
-    uint8_t target_v = 9;
+    uint8_t target_v = 9; // if bumping this, be aware of stretch_mode target_v 10!
     if (!HAVE_FEATURE(features, SERVER_LUMINOUS)) {
       target_v = 2;
     } else if (!HAVE_FEATURE(features, SERVER_NAUTILUS)) {
       target_v = 6;
+    }
+    if (change_stretch_mode) {
+      ceph_assert(target_v >= 9);
+      target_v = std::max((uint8_t)10, target_v);
     }
     ENCODE_START(target_v, 1, bl); // extended, osd-only data
     if (target_v < 7) {
@@ -692,6 +698,14 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
     }
     if (target_v >= 9) {
       encode(new_device_class_flags, bl);
+    }
+    if (target_v >= 10) {
+      encode(change_stretch_mode, bl);
+      encode(new_stretch_bucket_count, bl);
+      encode(new_degraded_stretch_mode, bl);
+      encode(new_recovering_stretch_mode, bl);
+      encode(new_stretch_mode_bucket, bl);
+      encode(stretch_mode_enabled, bl);
     }
     ENCODE_FINISH(bl); // osd-only data
   }
@@ -902,7 +916,7 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
   }
 
   {
-    DECODE_START(9, bl); // extended, osd-only data
+    DECODE_START(10, bl); // extended, osd-only data
     decode(new_hb_back_up, bl);
     decode(new_up_thru, bl);
     decode(new_last_clean_interval, bl);
@@ -959,6 +973,15 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
     if (struct_v >= 9) {
       decode(new_device_class_flags, bl);
     }
+    if (struct_v >= 10) {
+      decode(change_stretch_mode, bl);
+      decode(new_stretch_bucket_count, bl);
+      decode(new_degraded_stretch_mode, bl);
+      decode(new_recovering_stretch_mode, bl);
+      decode(new_stretch_mode_bucket, bl);
+      decode(stretch_mode_enabled, bl);
+    }
+
     DECODE_FINISH(bl); // osd-only data
   }
 
@@ -1286,6 +1309,16 @@ void OSDMap::Incremental::dump(Formatter *f) const
     f->close_section();
   }
   f->close_section();
+  f->open_object_section("stretch_mode");
+  {
+    f->dump_bool("change_stretch_mode", change_stretch_mode);
+    f->dump_bool("stretch_mode_enabled", stretch_mode_enabled);
+    f->dump_unsigned("new_stretch_bucket_count", new_stretch_bucket_count);
+    f->dump_unsigned("new_degraded_stretch_mode", new_degraded_stretch_mode);
+    f->dump_unsigned("new_recovering_stretch_mode", new_recovering_stretch_mode);
+    f->dump_int("new_stretch_mode_bucket", new_stretch_mode_bucket);
+  }
+  f->close_section();
   f->close_section();
 }
 
@@ -1364,7 +1397,6 @@ void OSDMap::get_blocklist(std::set<entity_addr_t> *bl) const
 
 void OSDMap::set_max_osd(int m)
 {
-  int o = max_osd;
   max_osd = m;
   osd_state.resize(max_osd, 0);
   osd_weight.resize(max_osd, CEPH_OSD_OUT);
@@ -1618,6 +1650,11 @@ uint64_t OSDMap::get_features(int entity_type, uint64_t *pmask) const
       features |= kraken_features;
     }
     mask |= kraken_features;
+
+    if (stretch_mode_enabled) {
+      features |= CEPH_FEATUREMASK_STRETCH_MODE;
+      mask |= CEPH_FEATUREMASK_STRETCH_MODE;
+    }
   }
 
   if (require_min_compat_client >= ceph_release_t::nautilus) {
@@ -2313,6 +2350,14 @@ int OSDMap::apply_incremental(const Incremental &inc)
     }
   }
 
+  if (inc.change_stretch_mode) {
+    stretch_mode_enabled = inc.stretch_mode_enabled;
+    stretch_bucket_count = inc.new_stretch_bucket_count;
+    degraded_stretch_mode = inc.new_degraded_stretch_mode;
+    recovering_stretch_mode = inc.new_recovering_stretch_mode;
+    stretch_mode_bucket = inc.new_stretch_mode_bucket;
+  }
+
   calc_num_osds();
   _calc_up_osd_features();
   return 0;
@@ -2981,13 +3026,16 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
   {
     // NOTE: any new encoding dependencies must be reflected by
     // SIGNIFICANT_FEATURES
-    uint8_t target_v = 9;
+    uint8_t target_v = 9; // when bumping this, be aware of stretch_mode target_v 10!
     if (!HAVE_FEATURE(features, SERVER_LUMINOUS)) {
       target_v = 1;
     } else if (!HAVE_FEATURE(features, SERVER_MIMIC)) {
       target_v = 5;
     } else if (!HAVE_FEATURE(features, SERVER_NAUTILUS)) {
       target_v = 6;
+    }
+    if (stretch_mode_enabled) {
+      target_v = std::max((uint8_t)10, target_v);
     }
     ENCODE_START(target_v, 1, bl); // extended, osd-only data
     if (target_v < 7) {
@@ -3036,6 +3084,13 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
     }
     if (target_v >= 9) {
       encode(device_class_flags, bl);
+    }
+    if (target_v >= 10) {
+      encode(stretch_mode_enabled, bl);
+      encode(stretch_bucket_count, bl);
+      encode(degraded_stretch_mode, bl);
+      encode(recovering_stretch_mode, bl);
+      encode(stretch_mode_bucket, bl);
     }
     ENCODE_FINISH(bl); // osd-only data
   }
@@ -3297,7 +3352,7 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
   }
 
   {
-    DECODE_START(9, bl); // extended, osd-only data
+    DECODE_START(10, bl); // extended, osd-only data
     decode(osd_addrs->hb_back_addrs, bl);
     decode(osd_info, bl);
     decode(blocklist, bl);
@@ -3362,6 +3417,19 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
       decode(device_class_flags, bl);
     } else {
       device_class_flags.clear();
+    }
+    if (struct_v >= 10) {
+      decode(stretch_mode_enabled, bl);
+      decode(stretch_bucket_count, bl);
+      decode(degraded_stretch_mode, bl);
+      decode(recovering_stretch_mode, bl);
+      decode(stretch_mode_bucket, bl);
+    } else {
+      stretch_mode_enabled = false;
+      stretch_bucket_count = 0;
+      degraded_stretch_mode = 0;
+      recovering_stretch_mode = 0;
+      stretch_mode_bucket = 0;
     }
     DECODE_FINISH(bl); // osd-only data
   }
@@ -3649,6 +3717,15 @@ void OSDMap::dump(Formatter *f) const
     f->close_section();
   }
   f->close_section();
+  f->open_object_section("stretch_mode");
+  {
+    f->dump_bool("stretch_mode_enabled", stretch_mode_enabled);
+    f->dump_unsigned("stretch_bucket_count", stretch_bucket_count);
+    f->dump_unsigned("degraded_stretch_mode", degraded_stretch_mode);
+    f->dump_unsigned("recovering_stretch_mode", recovering_stretch_mode);
+    f->dump_int("stretch_mode_bucket", stretch_mode_bucket);
+  }
+  f->close_section();
 }
 
 void OSDMap::generate_test_instances(list<OSDMap*>& o)
@@ -3798,6 +3875,13 @@ void OSDMap::print(ostream& out) const
     out << "require_osd_release " << require_osd_release
 	<< "\n";
   }
+  out << "stretch_mode_enabled " << (stretch_mode_enabled ? "true" : "false") << "\n";
+  if (stretch_mode_enabled) {
+    out << "stretch_bucket_count " << stretch_bucket_count << "\n";
+    out << "degraded_stretch_mode " << degraded_stretch_mode << "\n";
+    out << "recovering_stretch_mode " << recovering_stretch_mode << "\n";
+    out << "stretch_mode_bucket " << stretch_mode_bucket << "\n";
+  }
   if (get_cluster_snapshot().length())
     out << "cluster_snapshot " << get_cluster_snapshot() << "\n";
   out << "\n";
@@ -3818,7 +3902,7 @@ void OSDMap::print(ostream& out) const
   for (const auto& pg : *pg_temp)
     out << "pg_temp " << pg.first << " " << pg.second << "\n";
 
-  for (const auto pg : *primary_temp)
+  for (const auto& pg : *primary_temp)
     out << "primary_temp " << pg.first << " " << pg.second << "\n";
 
   for (const auto &addr : blocklist)
@@ -5145,7 +5229,7 @@ protected:
   }
 
   void dump_item(const CrushTreeDumper::Item &qi, F *f) override {
-    if (!tree && qi.is_bucket())
+    if (!tree && (qi.is_bucket() || dumped_osds.count(qi.id)))
       return;
     if (!should_dump(qi.id))
       return;
@@ -5233,7 +5317,7 @@ protected:
     *kb_used_meta = p->statfs.kb_used_internal_metadata();
     *kb_avail = p->statfs.kb_avail();
     
-    return *kb > 0;
+    return true;
   }
 
   bool get_bucket_utilization(int id, int64_t* kb, int64_t* kb_used,
@@ -5277,7 +5361,7 @@ protected:
       *kb_used_meta += kb_used_meta_i;
       *kb_avail += kb_avail_i;
     }
-    return *kb > 0;
+    return true;
   }
 
 protected:
@@ -5558,7 +5642,7 @@ void OSDMap::check_health(CephContext *cct,
         }
 	continue;
       }
-      if (is_out(i))
+      if (is_out(i) || (osd_state[i] & CEPH_OSD_NEW))
         continue;
       ++num_in_osds;
       if (down_in_osds.count(i) || up_in_osds.count(i))
@@ -5868,7 +5952,7 @@ void OSDMap::check_health(CephContext *cct,
       ss << "crush map has legacy tunables (require " << min
 	 << ", min is " << cct->_conf->mon_crush_min_required_version << ")";
       auto& d = checks->add("OLD_CRUSH_TUNABLES", HEALTH_WARN, ss.str(), 0);
-      d.detail.push_back("see http://docs.ceph.com/docs/master/rados/operations/crush-map/#tunables");
+      d.detail.push_back("see http://docs.ceph.com/en/latest/rados/operations/crush-map/#tunables");
     }
   }
 
@@ -5879,7 +5963,7 @@ void OSDMap::check_health(CephContext *cct,
       ss << "crush map has straw_calc_version=0";
       auto& d = checks->add("OLD_CRUSH_STRAW_CALC_VERSION", HEALTH_WARN, ss.str(), 0);
       d.detail.push_back(
-	"see http://docs.ceph.com/docs/master/rados/operations/crush-map/#tunables");
+	"see http://docs.ceph.com/en/latest/rados/operations/crush-map/#tunables");
     }
   }
 
@@ -6003,6 +6087,23 @@ void OSDMap::check_health(CephContext *cct,
       auto& d = checks->add("POOL_NO_REDUNDANCY", HEALTH_WARN,
         ss.str(), detail.size());
       d.detail.swap(detail);
+    }
+  }
+
+  // DEGRADED STRETCH MODE
+  if (cct->_conf.get_val<bool>("mon_warn_on_degraded_stretch_mode")) {
+    if (recovering_stretch_mode) {
+      stringstream ss;
+      ss << "We are recovering stretch mode buckets, only requiring "
+	 << degraded_stretch_mode << " of " << stretch_bucket_count << " buckets to peer" ;
+      checks->add("RECOVERING_STRETCH_MODE", HEALTH_WARN,
+			    ss.str(), 0);
+    } else if (degraded_stretch_mode) {
+      stringstream ss;
+      ss << "We are missing stretch mode buckets, only requiring "
+	 << degraded_stretch_mode << " of " << stretch_bucket_count << " buckets to peer" ;
+      checks->add("DEGRADED_STRETCH_MODE", HEALTH_WARN,
+			    ss.str(), 0);
     }
   }
 }

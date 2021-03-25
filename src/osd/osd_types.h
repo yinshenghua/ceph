@@ -202,6 +202,8 @@ WRITE_EQ_OPERATORS_2(pg_shard_t, osd, shard)
 WRITE_CMP_OPERATORS_2(pg_shard_t, osd, shard)
 std::ostream& operator<<(std::ostream &lhs, const pg_shard_t &rhs);
 
+using HobjToShardSetMapping = std::map<hobject_t, std::set<pg_shard_t>>;
+
 class IsPGRecoverablePredicate {
 public:
   /**
@@ -654,7 +656,7 @@ std::ostream& operator<<(std::ostream& out, const spg_t &pg);
 // ----------------------
 
 class coll_t {
-  enum type_t {
+  enum type_t : uint8_t {
     TYPE_META = 0,
     TYPE_LEGACY_TEMP = 1,  /* no longer used */
     TYPE_PG = 2,
@@ -674,6 +676,7 @@ class coll_t {
     calc_str();
   }
 
+  friend class denc_coll_t;
 public:
   coll_t() : type(TYPE_META), removal_seq(0)
   {
@@ -840,6 +843,40 @@ inline std::ostream& operator<<(std::ostream& out, const ceph_object_layout &ol)
   return out;
 }
 
+struct denc_coll_t {
+  coll_t coll;
+
+  auto &get_type() const { return coll.type; }
+  auto &get_type() { return coll.type; }
+  auto &get_pgid() const { return coll.pgid; }
+  auto &get_pgid() { return coll.pgid; }
+
+  denc_coll_t() = default;
+  denc_coll_t(const denc_coll_t &) = default;
+  denc_coll_t(denc_coll_t &&) = default;
+
+  denc_coll_t &operator=(const denc_coll_t &) = default;
+  denc_coll_t &operator=(denc_coll_t &&) = default;
+
+  explicit denc_coll_t(const coll_t &coll) : coll(coll) {}
+  operator coll_t() const {
+    return coll;
+  }
+
+  bool operator<(const denc_coll_t &rhs) const {
+    return coll < rhs.coll;
+  }
+
+  DENC(denc_coll_t, v, p) {
+    DENC_START(1, 1, p);
+    denc(v.get_type(), p);
+    denc(v.get_pgid().pgid.m_pool, p);
+    denc(v.get_pgid().pgid.m_seed, p);
+    denc(v.get_pgid().shard.id, p);
+    DENC_FINISH(p);
+  }
+};
+WRITE_CLASS_DENC(denc_coll_t)
 
 
 // compound rados version type
@@ -1060,6 +1097,9 @@ public:
     TARGET_SIZE_RATIO,  // fraction of total cluster
     PG_AUTOSCALE_BIAS,
     READ_LEASE_INTERVAL,
+    DEDUP_TIER,
+    DEDUP_CHUNK_ALGORITHM,
+    DEDUP_CDC_CHUNK_SIZE,
   };
 
   enum type_t {
@@ -1102,6 +1142,15 @@ public:
     }
     *val = boost::get<T>(i->second);
     return true;
+  }
+
+  template<typename T>
+  T value_or(key_t key, T&& default_value) const {
+    auto i = opts.find(key);
+    if (i == opts.end()) {
+      return std::forward<T>(default_value);
+    }
+    return boost::get<T>(i->second);
   }
 
   const value_t& get(key_t key) const;
@@ -1161,6 +1210,8 @@ struct pg_merge_meta_t {
 };
 WRITE_CLASS_ENCODER(pg_merge_meta_t)
 
+class OSDMap;
+
 /*
  * pg_pool
  */
@@ -1174,6 +1225,7 @@ struct pg_pool_t {
     //TYPE_RAID4 = 2,   // raid4 (never implemented)
     TYPE_ERASURE = 3,      // erasure-coded
   };
+  static constexpr uint32_t pg_CRUSH_ITEM_NONE = 0x7fffffff; /* can't import crush.h here */
   static std::string_view get_type_name(int t) {
     switch (t) {
     case TYPE_REPLICATED: return "replicated";
@@ -1381,7 +1433,16 @@ public:
   std::map<std::string, std::string> properties;  ///< OBSOLETE
   std::string erasure_code_profile; ///< name of the erasure code profile in OSDMap
   epoch_t last_change = 0;      ///< most recent epoch changed, exclusing snapshot changes
-
+  // If non-zero, require OSDs in at least this many different instances...
+  uint32_t peering_crush_bucket_count = 0;
+  // of this bucket type...
+  uint32_t peering_crush_bucket_barrier = 0;
+  // including this one
+  int32_t peering_crush_mandatory_member = pg_CRUSH_ITEM_NONE;
+  // The per-bucket replica count is calculated with this "target"
+  // instead of the above crush_bucket_count. This means we can maintain a
+  // target size of 4 without attempting to place them all in 1 DC
+  uint32_t peering_crush_bucket_target = 0;
   /// last epoch that forced clients to resend
   epoch_t last_force_op_resend = 0;
   /// last epoch that forced clients to resend (pre-nautilus clients only)
@@ -1452,6 +1513,20 @@ public:
     grade_table.resize(0);
   }
 
+  bool is_stretch_pool() const {
+    return peering_crush_bucket_count != 0;
+  }
+
+  bool stretch_set_can_peer(const set<int>& want, const OSDMap& osdmap,
+			    std::ostream *out) const;
+  bool stretch_set_can_peer(const vector<int>& want, const OSDMap& osdmap,
+			    std::ostream *out) const {
+    if (!is_stretch_pool()) return true;
+    set<int> swant;
+    for (auto i : want) swant.insert(i);
+    return stretch_set_can_peer(swant, osdmap, out);
+  }
+
   uint64_t target_max_bytes = 0;   ///< tiering: target max pool size
   uint64_t target_max_objects = 0; ///< tiering: target max pool size
 
@@ -1518,6 +1593,52 @@ public:
     case TYPE_FINGERPRINT_SHA512: return "sha512";
     default: return "unknown";
     }
+  }
+
+  typedef enum {
+    TYPE_DEDUP_CHUNK_NONE = 0,
+    TYPE_DEDUP_CHUNK_FASTCDC = 1,     
+    TYPE_DEDUP_CHUNK_FIXEDCDC = 2,     
+  } dedup_chunk_algo_t;
+  static dedup_chunk_algo_t get_dedup_chunk_algorithm_from_str(const std::string& s) {
+    if (s == "none")
+      return TYPE_DEDUP_CHUNK_NONE;
+    if (s == "fastcdc")
+      return TYPE_DEDUP_CHUNK_FASTCDC;
+    if (s == "fixed")
+      return TYPE_DEDUP_CHUNK_FIXEDCDC;
+    return (dedup_chunk_algo_t)-1;
+  }
+  const dedup_chunk_algo_t get_dedup_chunk_algorithm_type() const {
+    std::string algo_str;
+    opts.get(pool_opts_t::DEDUP_CHUNK_ALGORITHM, &algo_str);
+    return get_dedup_chunk_algorithm_from_str(algo_str);
+  }
+  const char *get_dedup_chunk_algorithm_name() const {
+    std::string dedup_chunk_algo_str;
+    dedup_chunk_algo_t dedup_chunk_algo_t;
+    opts.get(pool_opts_t::DEDUP_CHUNK_ALGORITHM, &dedup_chunk_algo_str);
+    dedup_chunk_algo_t = get_dedup_chunk_algorithm_from_str(dedup_chunk_algo_str);
+    return get_dedup_chunk_algorithm_name(dedup_chunk_algo_t);
+  }
+  static const char *get_dedup_chunk_algorithm_name(dedup_chunk_algo_t m) {
+    switch (m) {
+    case TYPE_DEDUP_CHUNK_NONE: return "none";
+    case TYPE_DEDUP_CHUNK_FASTCDC: return "fastcdc";
+    case TYPE_DEDUP_CHUNK_FIXEDCDC: return "fixed";
+    default: return "unknown";
+    }
+  }
+
+  int64_t get_dedup_tier() const {
+    int64_t tier_id;
+    opts.get(pool_opts_t::DEDUP_TIER, &tier_id);
+    return tier_id;
+  }
+  int64_t get_dedup_cdc_chunk_size() const {
+    int64_t chunk_size;
+    opts.get(pool_opts_t::DEDUP_CDC_CHUNK_SIZE, &chunk_size);
+    return chunk_size;
   }
 
   /// application -> key/value metadata
@@ -3055,7 +3176,6 @@ struct pg_fast_info_t {
 WRITE_CLASS_ENCODER(pg_fast_info_t)
 
 
-class OSDMap;
 /**
  * PastIntervals -- information needed to determine the PriorSet and
  * the might_have_unfound set
@@ -3191,6 +3311,14 @@ public:
     bool new_sort_bitwise,
     bool old_recovery_deletes,
     bool new_recovery_deletes,
+    uint32_t old_crush_count,
+    uint32_t new_crush_count,
+    uint32_t old_crush_target,
+    uint32_t new_crush_target,
+    uint32_t old_crush_barrier,
+    uint32_t new_crush_barrier,
+    int32_t old_crush_member,
+    int32_t new_crush_member,
     pg_t pgid
     );
 
@@ -3463,13 +3591,13 @@ PastIntervals::PriorSet::PriorSet(
   // so that we know what they do/do not have explicitly before
   // sending them any new info/logs/whatever.
   for (unsigned i = 0; i < acting.size(); i++) {
-    if (acting[i] != 0x7fffffff /* CRUSH_ITEM_NONE, can't import crush.h here */)
+    if (acting[i] != pg_pool_t::pg_CRUSH_ITEM_NONE)
       probe.insert(pg_shard_t(acting[i], ec_pool ? shard_id_t(i) : shard_id_t::NO_SHARD));
   }
   // It may be possible to exclude the up nodes, but let's keep them in
   // there for now.
   for (unsigned i = 0; i < up.size(); i++) {
-    if (up[i] != 0x7fffffff /* CRUSH_ITEM_NONE, can't import crush.h here */)
+    if (up[i] != pg_pool_t::pg_CRUSH_ITEM_NONE)
       probe.insert(pg_shard_t(up[i], ec_pool ? shard_id_t(i) : shard_id_t::NO_SHARD));
   }
 
@@ -4705,10 +4833,10 @@ public:
     return it->second.need;
   }
 
-  void claim(pg_missing_set& o) {
+  void claim(pg_missing_set&& o) {
     static_assert(!TrackChanges, "Can't use claim with TrackChanges");
-    missing.swap(o.missing);
-    rmissing.swap(o.rmissing);
+    missing = std::move(o.missing);
+    rmissing = std::move(o.rmissing);
   }
 
   /*
@@ -5447,7 +5575,7 @@ public:
     mut_ref(hoid, num);
   }
   void mut_ref(const hobject_t &hoid, int num) {
-    auto [iter, _] = ref_delta.try_emplace(hoid, 0);
+    [[maybe_unused]] auto [iter, _] = ref_delta.try_emplace(hoid, 0);
     iter->second += num;
     if (iter->second == 0)
       ref_delta.erase(iter);
@@ -5455,6 +5583,7 @@ public:
 
   auto begin() const { return ref_delta.begin(); }
   auto end() const { return ref_delta.end(); }
+  auto find(hobject_t &key) const { return ref_delta.find(key); }
 
   bool operator==(const object_ref_delta_t &rhs) const {
     return ref_delta == rhs.ref_delta;
@@ -5484,6 +5613,8 @@ struct chunk_info_t {
   cflag_t flags;   // FLAG_*
 
   chunk_info_t() : offset(0), length(0), flags((cflag_t)0) { }
+  chunk_info_t(uint32_t offset, uint32_t length, hobject_t oid) : 
+    offset(offset), length(length), oid(oid), flags((cflag_t)0) { }
 
   static std::string get_flag_string(uint64_t flags) {
     std::string r;
@@ -5597,7 +5728,7 @@ struct object_manifest_t {
   void calc_refs_to_inc_on_set(
     const object_manifest_t* g, ///< [in] manifest for clone > *this
     const object_manifest_t* l, ///< [in] manifest for clone < *this
-    object_ref_delta_t &delta    ///< [out] set of refs to drop
+    object_ref_delta_t &delta   ///< [out] set of refs to drop
   ) const;
 
   /**
@@ -5777,7 +5908,7 @@ struct object_info_t {
 
   void encode(ceph::buffer::list& bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator& bl);
-  void decode(ceph::buffer::list& bl) {
+  void decode(const ceph::buffer::list& bl) {
     auto p = std::cbegin(bl);
     decode(p);
   }
@@ -5801,7 +5932,7 @@ struct object_info_t {
       alloc_hint_flags(0)
   {}
 
-  explicit object_info_t(ceph::buffer::list& bl) {
+  explicit object_info_t(const ceph::buffer::list& bl) {
     decode(bl);
   }
 };
@@ -5917,6 +6048,8 @@ struct PushOp {
 WRITE_CLASS_ENCODER_FEATURES(PushOp)
 std::ostream& operator<<(std::ostream& out, const PushOp &op);
 
+enum class scrub_level_t : bool { shallow = false, deep = true };
+enum class scrub_type_t : bool { not_repair = false, do_repair = true };
 
 /*
  * summarize pg contents for purposes of a scrub
@@ -6454,5 +6587,9 @@ public:
               const ceph::buffer::list& xattr_data) const override;
 };
 
+// alias name for this structure:
+using missing_map_t = std::map<hobject_t,
+  std::pair<std::optional<uint32_t>,
+    std::optional<uint32_t>>>;
 
 #endif

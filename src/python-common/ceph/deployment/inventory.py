@@ -15,7 +15,7 @@ class Devices(object):
         # type: (List[Device]) -> None
         self.devices = devices  # type: List[Device]
 
-    def __eq__(self, other):
+    def __eq__(self, other: Any) -> bool:
         return self.to_json() == other.to_json()
 
     def to_json(self):
@@ -51,7 +51,7 @@ class Device(object):
                  rejected_reasons=None,  # type: Optional[List[str]]
                  lvs=None,  # type: Optional[List[str]]
                  device_id=None,  # type: Optional[str]
-                 lsm_data={},  # type: Dict[str, Dict[str, str]]
+                 lsm_data=None,  # type: Optional[Dict[str, Dict[str, str]]]
                  ):
         self.path = path
         self.sys_api = sys_api if sys_api is not None else {}  # type: Dict[str, Any]
@@ -59,7 +59,7 @@ class Device(object):
         self.rejected_reasons = rejected_reasons if rejected_reasons is not None else []
         self.lvs = lvs
         self.device_id = device_id
-        self.lsm_data = lsm_data
+        self.lsm_data = lsm_data if lsm_data is not None else {}  # type: Dict[str, Dict[str, str]]
 
     def to_json(self):
         # type: () -> dict
@@ -79,6 +79,8 @@ class Device(object):
                 if key != 'human_readable_type'
             }
         )
+        if ret.rejected_reasons:
+            ret.rejected_reasons = sorted(ret.rejected_reasons)
         return ret
 
     @property

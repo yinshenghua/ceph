@@ -27,6 +27,7 @@ add_executable(crimson-osd
   scheduler/mclock_scheduler.cc
   osdmap_gate.cc
   pg_map.cc
+  pg_interval_interrupt_condition.cc
   objclass.cc
   ${PROJECT_SOURCE_DIR}/src/objclass/class_api.cc
   ${PROJECT_SOURCE_DIR}/src/osd/ClassHandler.cc
@@ -42,10 +43,12 @@ add_executable(crimson-osd
   watch.cc
   )
 target_link_libraries(crimson-osd
+  crimson-admin
   crimson-common
   crimson-os
   crimson
   fmt::fmt
+  Boost::MPL
   dmclock::dmclock)
 set_target_properties(crimson-osd PROPERTIES
   POSITION_INDEPENDENT_CODE ${EXE_LINKER_USE_PIE})

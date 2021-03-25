@@ -7,18 +7,18 @@ import _ from 'lodash';
 import { merge, Observable, Subject } from 'rxjs';
 import { debounceTime, distinctUntilChanged, filter, map } from 'rxjs/operators';
 
-import { CephServiceService } from '../../../../shared/api/ceph-service.service';
-import { HostService } from '../../../../shared/api/host.service';
-import { PoolService } from '../../../../shared/api/pool.service';
-import { SelectMessages } from '../../../../shared/components/select/select-messages.model';
-import { SelectOption } from '../../../../shared/components/select/select-option.model';
-import { ActionLabelsI18n, URLVerbs } from '../../../../shared/constants/app.constants';
-import { CdForm } from '../../../../shared/forms/cd-form';
-import { CdFormBuilder } from '../../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../../shared/forms/cd-form-group';
-import { CdValidators } from '../../../../shared/forms/cd-validators';
-import { FinishedTask } from '../../../../shared/models/finished-task';
-import { TaskWrapperService } from '../../../../shared/services/task-wrapper.service';
+import { CephServiceService } from '~/app/shared/api/ceph-service.service';
+import { HostService } from '~/app/shared/api/host.service';
+import { PoolService } from '~/app/shared/api/pool.service';
+import { SelectMessages } from '~/app/shared/components/select/select-messages.model';
+import { SelectOption } from '~/app/shared/components/select/select-option.model';
+import { ActionLabelsI18n, URLVerbs } from '~/app/shared/constants/app.constants';
+import { CdForm } from '~/app/shared/forms/cd-form';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { CdValidators } from '~/app/shared/forms/cd-validators';
+import { FinishedTask } from '~/app/shared/models/finished-task';
+import { TaskWrapperService } from '~/app/shared/services/task-wrapper.service';
 
 @Component({
   selector: 'cd-service-form',
@@ -197,8 +197,10 @@ export class ServiceFormComponent extends CdForm implements OnInit {
   ngOnInit(): void {
     this.action = this.actionLabels.CREATE;
     this.cephServiceService.getKnownTypes().subscribe((resp: Array<string>) => {
-      // Remove service type 'osd', this is deployed a different way.
-      this.serviceTypes = _.difference(resp, ['osd']).sort();
+      // Remove service types:
+      // osd       - This is deployed a different way.
+      // container - This should only be used in the CLI.
+      this.serviceTypes = _.difference(resp, ['container', 'osd']).sort();
     });
     this.hostService.list().subscribe((resp: object[]) => {
       const options: SelectOption[] = [];
@@ -298,9 +300,7 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         case 'iscsi':
           serviceSpec['pool'] = values['pool'];
           if (_.isString(values['trusted_ip_list']) && !_.isEmpty(values['trusted_ip_list'])) {
-            let parts = _.split(values['trusted_ip_list'], ',');
-            parts = _.map(parts, _.trim);
-            serviceSpec['trusted_ip_list'] = parts;
+            serviceSpec['trusted_ip_list'] = values['trusted_ip_list'].trim();
           }
           if (_.isNumber(values['api_port']) && values['api_port'] > 0) {
             serviceSpec['api_port'] = values['api_port'];

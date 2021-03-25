@@ -6,12 +6,11 @@
 
 #include "include/encoding.h"
 
-#include "common/RWLock.h"
 #include "common/ceph_json.h"
 
 #include "rgw_coroutine.h"
 #include "rgw_http_client.h"
-#include "rgw_sal.h"
+#include "rgw_sal_rados.h"
 
 #include "rgw_datalog.h"
 #include "rgw_sync_module.h"
@@ -612,6 +611,13 @@ public:
 
   void wakeup();
 };
+
+class BucketIndexShardsManager;
+
+int rgw_read_remote_bilog_info(RGWRESTConn* conn,
+                               const rgw_bucket& bucket,
+                               BucketIndexShardsManager& markers,
+                               optional_yield y);
 
 class RGWBucketPipeSyncStatusManager : public DoutPrefixProvider {
   rgw::sal::RGWRadosStore *store;

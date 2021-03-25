@@ -638,6 +638,13 @@ void librados::ObjectReadOperation::tier_flush()
   o->tier_flush();
 }
 
+void librados::ObjectReadOperation::tier_evict()
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->tier_evict();
+}
+
 void librados::ObjectWriteOperation::set_redirect(const std::string& tgt_obj, 
 						  const IoCtx& tgt_ioctx,
 						  uint64_t tgt_version,
@@ -843,22 +850,24 @@ void librados::NObjectIteratorImpl::set_filter(const bufferlist &bl)
 void librados::NObjectIteratorImpl::get_next()
 {
   const char *entry, *key, *nspace;
+  size_t entry_size, key_size, nspace_size;
   if (ctx->nlc->at_end())
     return;
-  int ret = rados_nobjects_list_next(ctx.get(), &entry, &key, &nspace);
+  int ret = rados_nobjects_list_next2(ctx.get(), &entry, &key, &nspace,
+                                      &entry_size, &key_size, &nspace_size);
   if (ret == -ENOENT) {
     return;
   }
   else if (ret) {
     throw std::system_error(-ret, std::system_category(),
-                            "rados_nobjects_list_next");
+                            "rados_nobjects_list_next2");
   }
 
   if (cur_obj.impl == NULL)
     cur_obj.impl = new ListObjectImpl();
-  cur_obj.impl->nspace = nspace;
-  cur_obj.impl->oid = entry;
-  cur_obj.impl->locator = key ? key : string();
+  cur_obj.impl->nspace = string{nspace, nspace_size};
+  cur_obj.impl->oid = string{entry, entry_size};
+  cur_obj.impl->locator = key ? string(key, key_size) : string();
 }
 
 uint32_t librados::NObjectIteratorImpl::get_pg_hash_position() const
@@ -2152,6 +2161,25 @@ int librados::IoCtx::aio_notify(const string& oid, AioCompletion *c,
                                  NULL);
 }
 
+void librados::IoCtx::decode_notify_response(bufferlist &bl,
+                                             std::vector<librados::notify_ack_t> *acks,
+                                             std::vector<librados::notify_timeout_t> *timeouts)
+{
+  map<pair<uint64_t,uint64_t>,bufferlist> acked;
+  set<pair<uint64_t,uint64_t>> missed;
+
+  auto iter = bl.cbegin();
+  decode(acked, iter);
+  decode(missed, iter);
+
+  for (auto &[who, payload] : acked) {
+    acks->emplace_back(librados::notify_ack_t{who.first, who.second, payload});
+  }
+  for (auto &[notifier_id, cookie] : missed) {
+    timeouts->emplace_back(librados::notify_timeout_t{notifier_id, cookie});
+  }
+}
+
 void librados::IoCtx::notify_ack(const std::string& o,
 				 uint64_t notify_id, uint64_t handle,
 				 bufferlist& bl)
@@ -2280,22 +2308,22 @@ librados::IoCtx::IoCtx(IoCtxImpl *io_ctx_impl_)
 
 void librados::IoCtx::set_osdmap_full_try()
 {
-  io_ctx_impl->objecter->set_pool_full_try();
+  io_ctx_impl->extra_op_flags |= CEPH_OSD_FLAG_FULL_TRY;
 }
 
 void librados::IoCtx::unset_osdmap_full_try()
 {
-  io_ctx_impl->objecter->unset_pool_full_try();
+  io_ctx_impl->extra_op_flags &= ~CEPH_OSD_FLAG_FULL_TRY;
 }
 
 void librados::IoCtx::set_pool_full_try()
 {
-  io_ctx_impl->objecter->set_pool_full_try();
+  io_ctx_impl->extra_op_flags |= CEPH_OSD_FLAG_FULL_TRY;
 }
 
 void librados::IoCtx::unset_pool_full_try()
 {
-  io_ctx_impl->objecter->unset_pool_full_try();
+  io_ctx_impl->extra_op_flags &= ~CEPH_OSD_FLAG_FULL_TRY;
 }
 
 ///////////////////////////// Rados //////////////////////////////

@@ -137,9 +137,10 @@ void MDSDaemon::asok_command(
   dout(1) << "asok_command: " << command << " " << cmdmap
 	  << " (starting...)" << dendl;
 
-  int r = -ENOSYS;
+  int r = -CEPHFS_ENOSYS;
   bufferlist outbl;
-  stringstream ss;
+  CachedStackStringStream css;
+  auto& ss = *css;
   if (command == "status") {
     dump_status(f);
     r = 0;
@@ -168,7 +169,7 @@ void MDSDaemon::asok_command(
   } else if (command == "heap") {
     if (!ceph_using_tcmalloc()) {
       ss << "not using tcmalloc";
-      r = -EOPNOTSUPP;
+      r = -CEPHFS_EOPNOTSUPP;
     } else {
       string heapcmd;
       cmd_getval(cmdmap, "heapcmd", heapcmd);
@@ -196,7 +197,7 @@ void MDSDaemon::asok_command(
 	return;
       } catch (const TOPNSPC::common::bad_cmd_get& e) {
 	ss << e.what();
-	r = -EINVAL;
+	r = -CEPHFS_EINVAL;
       }
     }
   }
@@ -461,25 +462,36 @@ void MDSDaemon::clean_up_admin_socket()
 
 int MDSDaemon::init()
 {
+#ifdef _WIN32
+  // Some file related flags and types are stubbed on Windows. In order to avoid
+  // incorrect behavior, we're going to prevent the MDS from running on Windows
+  // until those limitations are addressed. MDS clients, however, are allowed
+  // to run on Windows.
+  derr << "The Ceph MDS does not support running on Windows at the moment."
+       << dendl;
+  return -CEPHFS_ENOSYS;
+#endif // _WIN32
+
+  dout(10) << "Dumping misc struct sizes:" << dendl;
   dout(10) << sizeof(MDSCacheObject) << "\tMDSCacheObject" << dendl;
   dout(10) << sizeof(CInode) << "\tCInode" << dendl;
-  dout(10) << sizeof(elist<void*>::item) << "\t elist<>::item   *7=" << 7*sizeof(elist<void*>::item) << dendl;
-  dout(10) << sizeof(CInode::mempool_inode) << "\t inode  " << dendl;
-  dout(10) << sizeof(CInode::mempool_old_inode) << "\t old_inode " << dendl;
-  dout(10) << sizeof(nest_info_t) << "\t  nest_info_t " << dendl;
-  dout(10) << sizeof(frag_info_t) << "\t  frag_info_t " << dendl;
-  dout(10) << sizeof(SimpleLock) << "\t SimpleLock   *5=" << 5*sizeof(SimpleLock) << dendl;
-  dout(10) << sizeof(ScatterLock) << "\t ScatterLock  *3=" << 3*sizeof(ScatterLock) << dendl;
+  dout(10) << sizeof(elist<void*>::item) << "\telist<>::item" << dendl;
+  dout(10) << sizeof(CInode::mempool_inode) << "\tinode" << dendl;
+  dout(10) << sizeof(CInode::mempool_old_inode) << "\told_inode" << dendl;
+  dout(10) << sizeof(nest_info_t) << "\tnest_info_t" << dendl;
+  dout(10) << sizeof(frag_info_t) << "\tfrag_info_t" << dendl;
+  dout(10) << sizeof(SimpleLock) << "\tSimpleLock" << dendl;
+  dout(10) << sizeof(ScatterLock) << "\tScatterLock" << dendl;
   dout(10) << sizeof(CDentry) << "\tCDentry" << dendl;
-  dout(10) << sizeof(elist<void*>::item) << "\t elist<>::item" << dendl;
-  dout(10) << sizeof(SimpleLock) << "\t SimpleLock" << dendl;
-  dout(10) << sizeof(CDir) << "\tCDir " << dendl;
-  dout(10) << sizeof(elist<void*>::item) << "\t elist<>::item   *2=" << 2*sizeof(elist<void*>::item) << dendl;
-  dout(10) << sizeof(fnode_t) << "\t fnode_t " << dendl;
-  dout(10) << sizeof(nest_info_t) << "\t  nest_info_t *2" << dendl;
-  dout(10) << sizeof(frag_info_t) << "\t  frag_info_t *2" << dendl;
-  dout(10) << sizeof(Capability) << "\tCapability " << dendl;
-  dout(10) << sizeof(xlist<void*>::item) << "\t xlist<>::item   *2=" << 2*sizeof(xlist<void*>::item) << dendl;
+  dout(10) << sizeof(elist<void*>::item) << "\telist<>::item" << dendl;
+  dout(10) << sizeof(SimpleLock) << "\tSimpleLock" << dendl;
+  dout(10) << sizeof(CDir) << "\tCDir" << dendl;
+  dout(10) << sizeof(elist<void*>::item) << "\telist<>::item" << dendl;
+  dout(10) << sizeof(fnode_t) << "\tfnode_t" << dendl;
+  dout(10) << sizeof(nest_info_t) << "\tnest_info_t" << dendl;
+  dout(10) << sizeof(frag_info_t) << "\tfrag_info_t" << dendl;
+  dout(10) << sizeof(Capability) << "\tCapability" << dendl;
+  dout(10) << sizeof(xlist<void*>::item) << "\txlist<>::item" << dendl;
 
   messenger->add_dispatcher_tail(&beacon);
   messenger->add_dispatcher_tail(this);
@@ -527,7 +539,7 @@ int MDSDaemon::init()
          << "maximum retry time reached." << dendl;
     std::lock_guard locker{mds_lock};
     suicide();
-    return -ETIMEDOUT;
+    return -CEPHFS_ETIMEDOUT;
   }
 
   mds_lock.lock();
@@ -595,8 +607,8 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
 
   int r = 0;
   cmdmap_t cmdmap;
-  std::stringstream ss;
-  std::string outs;
+  CachedStackStringStream css;
+  auto& ss = *css;
   bufferlist outbl;
 
   // If someone is using a closed session for sending commands (e.g.
@@ -621,20 +633,18 @@ void MDSDaemon::handle_command(const cref_t<MCommand> &m)
       << *m->get_connection()->peer_addrs << dendl;
 
     ss << "permission denied";
-    r = -EACCES;
+    r = -CEPHFS_EACCES;
   } else if (m->cmd.empty()) {
-    r = -EINVAL;
+    r = -CEPHFS_EINVAL;
     ss << "no command given";
-    outs = ss.str();
   } else if (!TOPNSPC::common::cmdmap_from_json(m->cmd, &cmdmap, ss)) {
-    r = -EINVAL;
-    outs = ss.str();
+    r = -CEPHFS_EINVAL;
   } else {
     cct->get_admin_socket()->queue_tell_command(m);
     return;
   }
 
-  auto reply = make_message<MCommandReply>(r, outs);
+  auto reply = make_message<MCommandReply>(r, ss.str());
   reply->set_tid(m->get_tid());
   reply->set_data(outbl);
   m->get_connection()->send_message2(reply);
@@ -747,12 +757,11 @@ void MDSDaemon::handle_mds_map(const cref_t<MMDSMap> &m)
 
     // Did I previously not hold a rank?  Initialize!
     if (mds_rank == NULL) {
-      mds_rank = new MDSRankDispatcher(
-	whoami, mds_lock, clog,
-	timer, beacon, mdsmap, messenger, monc, &mgrc,
-	new LambdaContext([this](int r){respawn();}),
-	new LambdaContext([this](int r){suicide();}),
-	ioctx);
+      mds_rank = new MDSRankDispatcher(whoami, m->map_fs_name, mds_lock, clog,
+          timer, beacon, mdsmap, messenger, monc, &mgrc,
+          new LambdaContext([this](int r){respawn();}),
+          new LambdaContext([this](int r){suicide();}),
+	  ioctx);
       dout(10) <<  __func__ << ": initializing MDS rank "
                << mds_rank->get_nodeid() << dendl;
       mds_rank->init();
@@ -835,6 +844,11 @@ void MDSDaemon::respawn()
   /* Dump recent in case the MDS was stuck doing something which caused it to
    * be removed from the MDSMap leading to respawn. */
   g_ceph_context->_log->dump_recent();
+
+  /* valgrind can't handle execve; just exit and let QA infra restart */
+  if (g_conf().get_val<bool>("mds_valgrind_exit")) {
+    _exit(0);
+  }
 
   char *new_argv[orig_argc+1];
   dout(1) << " e: '" << orig_argv[0] << "'" << dendl;

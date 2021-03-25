@@ -185,8 +185,8 @@ struct bluefs_transaction_t {
   typedef enum {
     OP_NONE = 0,
     OP_INIT,        ///< initial (empty) file system marker
-    OP_ALLOC_ADD,   ///< add extent to available block storage (extent)
-    OP_ALLOC_RM,    ///< remove extent from available block storage (extent)
+    OP_ALLOC_ADD,   ///< OBSOLETE: add extent to available block storage (extent)
+    OP_ALLOC_RM,    ///< OBSOLETE: remove extent from available block storage (extent)
     OP_DIR_LINK,    ///< (re)set a dir entry (dirname, filename, ino)
     OP_DIR_UNLINK,  ///< remove a dir entry (dirname, filename)
     OP_DIR_CREATE,  ///< create a dir (dirname)
@@ -214,38 +214,24 @@ struct bluefs_transaction_t {
     using ceph::encode;
     encode((__u8)OP_INIT, op_bl);
   }
-  void op_alloc_add(uint8_t id, uint64_t offset, uint64_t length) {
-    using ceph::encode;
-    encode((__u8)OP_ALLOC_ADD, op_bl);
-    encode(id, op_bl);
-    encode(offset, op_bl);
-    encode(length, op_bl);
-  }
-  void op_alloc_rm(uint8_t id, uint64_t offset, uint64_t length) {
-    using ceph::encode;
-    encode((__u8)OP_ALLOC_RM, op_bl);
-    encode(id, op_bl);
-    encode(offset, op_bl);
-    encode(length, op_bl);
-  }
-  void op_dir_create(const std::string& dir) {
+  void op_dir_create(std::string_view dir) {
     using ceph::encode;
     encode((__u8)OP_DIR_CREATE, op_bl);
     encode(dir, op_bl);
   }
-  void op_dir_remove(const std::string& dir) {
+  void op_dir_remove(std::string_view dir) {
     using ceph::encode;
     encode((__u8)OP_DIR_REMOVE, op_bl);
     encode(dir, op_bl);
   }
-  void op_dir_link(const std::string& dir, const std::string& file, uint64_t ino) {
+  void op_dir_link(std::string_view dir, std::string_view file, uint64_t ino) {
     using ceph::encode;
     encode((__u8)OP_DIR_LINK, op_bl);
     encode(dir, op_bl);
     encode(file, op_bl);
     encode(ino, op_bl);
   }
-  void op_dir_unlink(const std::string& dir, const std::string& file) {
+  void op_dir_unlink(std::string_view dir, std::string_view file) {
     using ceph::encode;
     encode((__u8)OP_DIR_UNLINK, op_bl);
     encode(dir, op_bl);
@@ -284,5 +270,4 @@ struct bluefs_transaction_t {
 WRITE_CLASS_ENCODER(bluefs_transaction_t)
 
 std::ostream& operator<<(std::ostream& out, const bluefs_transaction_t& t);
-
 #endif

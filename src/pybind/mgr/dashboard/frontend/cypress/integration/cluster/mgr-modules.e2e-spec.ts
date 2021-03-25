@@ -5,12 +5,13 @@ describe('Manager modules page', () => {
 
   beforeEach(() => {
     cy.login();
+    Cypress.Cookies.preserveOnce('token');
     mgrmodules.navigateTo();
   });
 
   describe('breadcrumb test', () => {
     it('should open and show breadcrumb', () => {
-      mgrmodules.expectBreadcrumbText('Manager modules');
+      mgrmodules.expectBreadcrumbText('Manager Modules');
     });
   });
 
