@@ -220,6 +220,9 @@
 /* Define to 1 if you have sched.h. */
 #cmakedefine HAVE_SCHED 1
 
+/* Define to 1 if you have sigdescr_np. */
+#cmakedefine HAVE_SIGDESCR_NP 1
+
 /* Support SSE (Streaming SIMD Extensions) instructions */
 #cmakedefine HAVE_SSE
 
@@ -243,6 +246,9 @@
 
 /* yasm can also build the isa-l */
 #cmakedefine HAVE_BETTER_YASM_ELF64
+
+/* Define if isa-l is compiled for arm64 */
+#cmakedefine HAVE_ARMV8_SIMD
 
 /* Define to 1 if strerror_r returns char *. */
 #cmakedefine STRERROR_R_CHAR_P 1

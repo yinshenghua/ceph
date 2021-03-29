@@ -7,7 +7,7 @@ import time
 from ceph.deployment.drive_group import DriveGroupSpec, DriveGroupValidationError
 from mgr_util import get_most_recent_rate
 
-from . import ApiController, RESTController, Endpoint, Task
+from . import ApiController, RESTController, Endpoint, Task, allow_empty_body
 from . import CreatePermission, ReadPermission, UpdatePermission, DeletePermission
 from .orchestrator import raise_if_no_orchestrator
 from .. import mgr
@@ -87,6 +87,7 @@ class Osd(RESTController):
     def _get_smart_data(osd_id):
         # type: (str) -> dict
         """Returns S.M.A.R.T data for the given OSD ID."""
+        logger.debug('[SMART] retrieving data from OSD with ID %s', osd_id)
         return CephService.get_smart_data_by_daemon('osd', osd_id)
 
     @RESTController.Resource('GET')
@@ -116,6 +117,22 @@ class Osd(RESTController):
             'osd_metadata': mgr.get_metadata('osd', svc_id),
             'histogram': histogram,
         }
+
+    @RESTController.Resource('GET')
+    @handle_send_command_error('osd')
+    def histogram(self, svc_id):
+        # type: (int) -> Dict[str, Any]
+        """
+        :return: Returns the histogram data.
+        """
+        try:
+            histogram = CephService.send_command(
+                'osd', srv_spec=svc_id, prefix='perf histogram dump')
+        except SendCommandError as e:  # pragma: no cover - the handling is too obvious
+            raise DashboardException(
+                component='osd', http_status_code=400, msg=str(e))
+
+        return histogram
 
     def set(self, svc_id, device_class):  # pragma: no cover
         old_device_class = CephService.send_command('mon', 'osd crush get-device-class',
@@ -190,23 +207,28 @@ class Osd(RESTController):
 
     @RESTController.Resource('POST', query_params=['deep'])
     @UpdatePermission
+    @allow_empty_body
     def scrub(self, svc_id, deep=False):
         api_scrub = "osd deep-scrub" if str_to_bool(deep) else "osd scrub"
         CephService.send_command("mon", api_scrub, who=svc_id)
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def mark_out(self, svc_id):
         CephService.send_command('mon', 'osd out', ids=[svc_id])
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def mark_in(self, svc_id):
         CephService.send_command('mon', 'osd in', ids=[svc_id])
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def mark_down(self, svc_id):
         CephService.send_command('mon', 'osd down', ids=[svc_id])
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def reweight(self, svc_id, weight):
         """
         Reweights the OSD temporarily.
@@ -228,6 +250,7 @@ class Osd(RESTController):
             weight=float(weight))
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def mark_lost(self, svc_id):
         """
         Note: osd must be marked `down` before marking lost.
@@ -281,6 +304,7 @@ class Osd(RESTController):
             component='osd', http_status_code=400, msg='Unknown method: {}'.format(method))
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def purge(self, svc_id):
         """
         Note: osd must be marked `down` before removal.
@@ -289,6 +313,7 @@ class Osd(RESTController):
                                  yes_i_really_mean_it=True)
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def destroy(self, svc_id):
         """
         Mark osd as being destroyed. Keeps the ID intact (allowing reuse), but
@@ -359,6 +384,17 @@ class OsdFlagsController(RESTController):
                 set(enabled_flags) - {'pauserd', 'pausewr'} | {'pause'})
         return sorted(enabled_flags)
 
+    @staticmethod
+    def _update_flags(action, flags, ids=None):
+        if ids:
+            if flags:
+                ids = list(map(str, ids))
+                CephService.send_command('mon', 'osd ' + action, who=ids,
+                                         flags=','.join(flags))
+        else:
+            for flag in flags:
+                CephService.send_command('mon', 'osd ' + action, '', key=flag)
+
     def list(self):
         return self._osd_flags()
 
@@ -374,10 +410,56 @@ class OsdFlagsController(RESTController):
         data = set(flags)
         added = data - enabled_flags
         removed = enabled_flags - data
-        for flag in added:
-            CephService.send_command('mon', 'osd set', '', key=flag)
-        for flag in removed:
-            CephService.send_command('mon', 'osd unset', '', key=flag)
+
+        self._update_flags('set', added)
+        self._update_flags('unset', removed)
+
         logger.info('Changed OSD flags: added=%s removed=%s', added, removed)
 
         return sorted(enabled_flags - removed | added)
+
+    @Endpoint('PUT', 'individual')
+    @UpdatePermission
+    def set_individual(self, flags, ids):
+        """
+        Updates flags (`noout`, `noin`, `nodown`, `noup`) for an individual
+        subset of OSDs.
+        """
+        assert isinstance(flags, dict)
+        assert isinstance(ids, list)
+        assert all(isinstance(id, int) for id in ids)
+
+        # These are to only flags that can be applied to an OSD individually.
+        all_flags = {'noin', 'noout', 'nodown', 'noup'}
+        added = set()
+        removed = set()
+        for flag, activated in flags.items():
+            if flag in all_flags:
+                if activated is not None:
+                    if activated:
+                        added.add(flag)
+                    else:
+                        removed.add(flag)
+
+        self._update_flags('set-group', added, ids)
+        self._update_flags('unset-group', removed, ids)
+
+        logger.error('Changed individual OSD flags: added=%s removed=%s for ids=%s',
+                     added, removed, ids)
+
+        return {'added': sorted(added),
+                'removed': sorted(removed),
+                'ids': ids}
+
+    @Endpoint('GET', 'individual')
+    @ReadPermission
+    def get_individual(self):
+        osd_map = mgr.get('osd_map')['osds']
+        resp = []
+
+        for osd in osd_map:
+            resp.append({
+                'osd': osd['osd'],
+                'flags': osd['state']
+            })
+        return resp

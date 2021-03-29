@@ -16,6 +16,8 @@ import re
 import time
 from mgr_util import profile_method
 
+ERROR_MSG_EMPTY_INPUT_FILE = 'Empty content: please add a password/secret to the file.'
+ERROR_MSG_NO_INPUT_FILE = 'Please specify the file containing the password/secret with "-i" option.'
 # Full list of strings in "osd_types.cc:pg_state_string()"
 PG_STATES = [
     "active",
@@ -337,6 +339,19 @@ def CLIWriteCommand(prefix, args="", desc=""):
     return CLICommand(prefix, args, desc, "w")
 
 
+def CLICheckNonemptyFileInput(func):
+    def check(*args, **kwargs):
+        if not 'inbuf' in kwargs:
+            return -errno.EINVAL, '', ERROR_MSG_NO_INPUT_FILE
+        if isinstance(kwargs['inbuf'], str):
+            # Delete new line separator at EOF (it may have been added by a text editor).
+            kwargs['inbuf'] = kwargs['inbuf'].rstrip('\r\n').rstrip('\n')
+        if not kwargs['inbuf']:
+            return -errno.EINVAL, '', ERROR_MSG_EMPTY_INPUT_FILE
+        return func(*args, **kwargs)
+    return check
+
+
 def _get_localized_key(prefix, key):
     return '{}/{}'.format(prefix, key)
 
@@ -609,7 +624,11 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
         self._logger = self.getLogger()
 
     def __del__(self):
+        self._cleanup()
         self._unconfigure_logging()
+
+    def _cleanup(self):
+        pass
 
     @classmethod
     def _register_options(cls, module_name):
@@ -668,6 +687,14 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
         :return: Byte string or None
         """
         return self._ceph_get_store(key)
+
+    def get_localized_store(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        r = self._ceph_get_store(_get_localized_key(self.get_mgr_id(), key))
+        if r is None:
+            r = self._ceph_get_store(key)
+            if r is None:
+                r = default
+        return r
 
     def get_active_uri(self):
         return self._ceph_get_active_uri()
@@ -1091,18 +1118,18 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         """
         return self._ceph_get_daemon_status(svc_type, svc_id)
 
-    def check_mon_command(self, cmd_dict: dict) -> HandleCommandResult:
+    def check_mon_command(self, cmd_dict: dict, inbuf: Optional[str]=None) -> HandleCommandResult:
         """
         Wrapper around :func:`~mgr_module.MgrModule.mon_command`, but raises,
         if ``retval != 0``.
         """
 
-        r = HandleCommandResult(*self.mon_command(cmd_dict))
+        r = HandleCommandResult(*self.mon_command(cmd_dict, inbuf))
         if r.retval:
             raise MonCommandFailed(f'{cmd_dict["prefix"]} failed: {r.stderr} retval: {r.retval}')
         return r
 
-    def mon_command(self, cmd_dict):
+    def mon_command(self, cmd_dict: dict, inbuf: Optional[str]=None):
         """
         Helper for modules that do simple, synchronous mon command
         execution.
@@ -1114,7 +1141,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         t1 = time.time()
         result = CommandResult()
-        self.send_command(result, "mon", "", json.dumps(cmd_dict), "")
+        self.send_command(result, "mon", "", json.dumps(cmd_dict), "", inbuf)
         r = result.wait()
         t2 = time.time()
 
@@ -1124,7 +1151,14 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         return r
 
-    def send_command(self, *args, **kwargs):
+    def send_command(
+            self,
+            result: CommandResult,
+            svc_type: str,
+            svc_id: str,
+            command: str,
+            tag: str,
+            inbuf: Optional[str]=None):
         """
         Called by the plugin to send a command to the mon
         cluster.
@@ -1144,8 +1178,9 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             completes, the ``notify()`` callback on the MgrModule instance is
             triggered, with notify_type set to "command", and notify_id set to
             the tag of the command.
+        :param str inbuf: input buffer for sending additional data.
         """
-        self._ceph_send_command(*args, **kwargs)
+        self._ceph_send_command(result, svc_type, svc_id, command, tag, inbuf)
 
     def set_health_checks(self, checks):
         """

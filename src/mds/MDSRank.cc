@@ -148,26 +148,25 @@ private:
     dout(20) << __func__ << dendl;
 
     // Attach contexts to wait for all expiring segments to expire
-    MDSGatherBuilder *expiry_gather = new MDSGatherBuilder(g_ceph_context);
+    MDSGatherBuilder expiry_gather(g_ceph_context);
 
     const auto &expiring_segments = mdlog->get_expiring_segments();
     for (auto p : expiring_segments) {
-      p->wait_for_expiry(expiry_gather->new_sub());
+      p->wait_for_expiry(expiry_gather.new_sub());
     }
-    dout(5) << __func__ << ": waiting for " << expiry_gather->num_subs_created()
+    dout(5) << __func__ << ": waiting for " << expiry_gather.num_subs_created()
             << " segments to expire" << dendl;
 
-    if (!expiry_gather->has_subs()) {
+    if (!expiry_gather.has_subs()) {
       trim_segments();
-      delete expiry_gather;
       return;
     }
 
     Context *ctx = new LambdaContext([this](int r) {
         handle_expire_segments(r);
       });
-    expiry_gather->set_finisher(new MDSInternalContextWrapper(mds, ctx));
-    expiry_gather->activate();
+    expiry_gather.set_finisher(new MDSInternalContextWrapper(mds, ctx));
+    expiry_gather.activate();
   }
 
   void handle_expire_segments(int r) {
@@ -328,9 +327,9 @@ private:
     auto now = mono_clock::now();
     auto duration = std::chrono::duration<double>(now-recall_start).count();
 
-    MDSGatherBuilder *gather = new MDSGatherBuilder(g_ceph_context);
+    MDSGatherBuilder gather(g_ceph_context);
     auto flags = Server::RecallFlags::STEADY|Server::RecallFlags::TRIM;
-    auto [throttled, count] = server->recall_client_state(gather, flags);
+    auto [throttled, count] = server->recall_client_state(&gather, flags);
     dout(10) << __func__
              << (throttled ? " (throttled)" : "")
              << " recalled " << count << " caps" << dendl;
@@ -342,17 +341,16 @@ private:
           recall_client_state();
       }));
       ctx->start_timer();
-      gather->set_finisher(new MDSInternalContextWrapper(mds, ctx));
-      gather->activate();
+      gather.set_finisher(new MDSInternalContextWrapper(mds, ctx));
+      gather.activate();
       mdlog->flush(); /* use down-time to incrementally flush log */
       do_trim(); /* use down-time to incrementally trim cache */
     } else {
-      if (!gather->has_subs()) {
-        delete gather;
+      if (!gather.has_subs()) {
         return handle_recall_client_state(0);
       } else if (recall_timeout > 0 && duration > recall_timeout) {
-        gather->set_finisher(new C_MDSInternalNoop);
-        gather->activate();
+        gather.set_finisher(new C_MDSInternalNoop);
+        gather.activate();
         return handle_recall_client_state(-ETIMEDOUT);
       } else {
         uint64_t remaining = (recall_timeout == 0 ? 0 : recall_timeout-duration);
@@ -362,8 +360,8 @@ private:
             }));
 
         ctx->start_timer();
-        gather->set_finisher(new MDSInternalContextWrapper(mds, ctx));
-        gather->activate();
+        gather.set_finisher(new MDSInternalContextWrapper(mds, ctx));
+        gather.activate();
       }
     }
   }
@@ -487,7 +485,7 @@ MDSRank::MDSRank(
     Context *suicide_hook_) :
     cct(msgr->cct), mds_lock(mds_lock_), clog(clog_),
     timer(timer_), mdsmap(mdsmap_),
-    objecter(new Objecter(g_ceph_context, msgr, monc_, nullptr, 0, 0)),
+    objecter(new Objecter(g_ceph_context, msgr, monc_, nullptr)),
     damage_table(whoami_), sessionmap(this),
     op_tracker(g_ceph_context, g_conf()->mds_enable_op_tracker,
                g_conf()->osd_num_op_tracker_shard),
@@ -1690,8 +1688,6 @@ void MDSRank::replay_start()
   if (is_standby_replay())
     standby_replaying = true;
 
-  calc_recovery_set();
-
   // Check if we need to wait for a newer OSD map before starting
   Context *fin = new C_IO_Wrapper(this, new C_MDS_BootStart(this, MDS_BOOT_INITIAL));
   bool const ready = objecter->wait_for_map(
@@ -1860,6 +1856,8 @@ void MDSRank::resolve_start()
 
   reopen_log();
 
+  calc_recovery_set();
+
   mdcache->resolve_start(new C_MDS_VoidFn(this, &MDSRank::resolve_done));
   finish_contexts(g_ceph_context, waiting_for_resolve);
 }
@@ -1925,9 +1923,7 @@ void MDSRank::rejoin_done()
 
   if (mdcache->is_any_uncommitted_fragment()) {
     dout(1) << " waiting for uncommitted fragments" << dendl;
-    MDSGatherBuilder gather(g_ceph_context, new C_MDS_VoidFn(this, &MDSRank::rejoin_done));
-    mdcache->wait_for_uncommitted_fragments(gather.get());
-    gather.activate();
+    mdcache->wait_for_uncommitted_fragments(new C_MDS_VoidFn(this, &MDSRank::rejoin_done));
     return;
   }
 
@@ -1957,7 +1953,6 @@ void MDSRank::clientreplay_start()
 {
   dout(1) << "clientreplay_start" << dendl;
   finish_contexts(g_ceph_context, waiting_for_replay);  // kick waiters
-  mdcache->start_files_to_recover();
   queue_one_replay();
 }
 
@@ -2010,7 +2005,6 @@ void MDSRank::active_start()
   mdcache->clean_open_file_lists();
   mdcache->export_remaining_imported_caps();
   finish_contexts(g_ceph_context, waiting_for_replay);  // kick waiters
-  mdcache->start_files_to_recover();
 
   mdcache->reissue_all_caps();
 
@@ -2027,7 +2021,7 @@ void MDSRank::recovery_done(int oldstate)
 
   mdcache->start_recovered_truncates();
   mdcache->start_purge_inodes();
-  mdcache->do_file_recover();
+  mdcache->start_files_to_recover();
 
   // tell connected clients
   //bcast_mds_map();     // not anymore, they get this from the monitor
@@ -2510,14 +2504,17 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "session ls" ||
 	     command == "client ls") {
     std::lock_guard l(mds_lock);
+    bool cap_dump = false;
     std::vector<std::string> filter_args;
+    cmd_getval(cmdmap, "cap_dump", cap_dump);
     cmd_getval(cmdmap, "filters", filter_args);
+
     SessionFilter filter;
     r = filter.parse(filter_args, &ss);
     if (r != 0) {
       goto out;
     }
-    dump_sessions(filter, f);
+    dump_sessions(filter, f, cap_dump);
   } else if (command == "session evict" ||
 	     command == "client evict") {
     std::lock_guard l(mds_lock);
@@ -2776,7 +2773,7 @@ void MDSRankDispatcher::evict_clients(
   gather.activate();
 }
 
-void MDSRankDispatcher::dump_sessions(const SessionFilter &filter, Formatter *f) const
+void MDSRankDispatcher::dump_sessions(const SessionFilter &filter, Formatter *f, bool cap_dump) const
 {
   // Dump sessions, decorated with recovery/replay status
   f->open_array_section("sessions");
@@ -2789,7 +2786,9 @@ void MDSRankDispatcher::dump_sessions(const SessionFilter &filter, Formatter *f)
       continue;
     }
 
-    f->dump_object("session", *s);
+    f->open_object_section("session");
+    s->dump(f, cap_dump);
+    f->close_section();
   }
   f->close_section(); // sessions
 }
@@ -3577,7 +3576,11 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_recall_warning_decay_rate",
     "mds_request_load_average_decay_rate",
     "mds_session_cache_liveness_decay_rate",
-    "mds_replay_unsafe_with_closed_session",
+    "mds_session_cap_acquisition_decay_rate",
+    "mds_max_caps_per_client",
+    "mds_session_cap_acquisition_throttle",
+    "mds_session_max_caps_throttle_ratio",
+    "mds_cap_acquisition_throttle_retry_request_time",
     NULL
   };
   return KEYS;
@@ -3628,7 +3631,10 @@ void MDSRank::get_task_status(std::map<std::string, std::string> *status) {
 
   // scrub summary for now..
   std::string_view scrub_summary = scrubstack->scrub_summary();
-  status->emplace(SCRUB_STATUS_KEY, std::move(scrub_summary));
+  if (!ScrubStack::is_idle(scrub_summary)) {
+    send_status = true;
+    status->emplace(SCRUB_STATUS_KEY, std::move(scrub_summary));
+  }
 }
 
 void MDSRank::schedule_update_timer_task() {
@@ -3644,13 +3650,17 @@ void MDSRank::send_task_status() {
   std::map<std::string, std::string> status;
   get_task_status(&status);
 
-  if (!status.empty()) {
-    dout(20) << __func__ << ": updating " << status.size() << " status keys" << dendl;
+  if (send_status) {
+    if (status.empty()) {
+      send_status = false;
+    }
 
+    dout(20) << __func__ << ": updating " << status.size() << " status keys" << dendl;
     int r = mgrc->service_daemon_update_task_status(std::move(status));
     if (r < 0) {
       derr << ": failed to update service daemon status: " << cpp_strerror(r) << dendl;
     }
+
   }
 
   schedule_update_timer_task();

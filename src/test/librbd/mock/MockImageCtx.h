@@ -208,6 +208,7 @@ struct MockImageCtx {
   MOCK_METHOD1(notify_update, void(Context *));
 
   MOCK_CONST_METHOD0(get_exclusive_lock_policy, exclusive_lock::Policy*());
+  MOCK_METHOD1(set_exclusive_lock_policy, void(exclusive_lock::Policy*));
   MOCK_CONST_METHOD0(get_journal_policy, journal::Policy*());
   MOCK_METHOD1(set_journal_policy, void(journal::Policy*));
 
@@ -292,6 +293,7 @@ struct MockImageCtx {
 
   EventSocket &event_socket;
 
+  MockImageCtx *child = nullptr;
   MockImageCtx *parent;
   MockOperations *operations;
   MockImageState *state;

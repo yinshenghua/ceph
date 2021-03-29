@@ -9,6 +9,8 @@ import errno
 import logging
 import os
 import socket
+import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -97,8 +99,8 @@ class CherryPyConfig(object):
         """
         server_addr = self.get_localized_module_option(  # type: ignore
             'server_addr', get_default_addr())
-        ssl = self.get_localized_module_option('ssl', True)  # type: ignore
-        if not ssl:
+        use_ssl = self.get_localized_module_option('ssl', True)  # type: ignore
+        if not use_ssl:
             server_port = self.get_localized_module_option('server_port', 8080)  # type: ignore
         else:
             server_port = self.get_localized_module_option('ssl_server_port', 8443)  # type: ignore
@@ -108,7 +110,7 @@ class CherryPyConfig(object):
                 'no server_addr configured; '
                 'try "ceph config set mgr mgr/{}/{}/server_addr <ip>"'
                 .format(self.module_name, self.get_mgr_id()))  # type: ignore
-        self.log.info('server: ssl=%s host=%s port=%d', 'yes' if ssl else 'no',  # type: ignore
+        self.log.info('server: ssl=%s host=%s port=%d', 'yes' if use_ssl else 'no',  # type: ignore
                       server_addr, server_port)
 
         # Initialize custom handlers.
@@ -140,13 +142,13 @@ class CherryPyConfig(object):
                 'application/javascript',
             ],
             'tools.json_in.on': True,
-            'tools.json_in.force': False,
+            'tools.json_in.force': True,
             'tools.plugin_hooks_filter_request.on': True,
         }
 
-        if ssl:
+        if use_ssl:
             # SSL initialization
-            cert = self.get_store("crt")  # type: ignore
+            cert = self.get_localized_store("crt")  # type: ignore
             if cert is not None:
                 self.cert_tmp = tempfile.NamedTemporaryFile()
                 self.cert_tmp.write(cert.encode('utf-8'))
@@ -155,7 +157,7 @@ class CherryPyConfig(object):
             else:
                 cert_fname = self.get_localized_module_option('crt_file')  # type: ignore
 
-            pkey = self.get_store("key")  # type: ignore
+            pkey = self.get_localized_store("key")  # type: ignore
             if pkey is not None:
                 self.pkey_tmp = tempfile.NamedTemporaryFile()
                 self.pkey_tmp.write(pkey.encode('utf-8'))
@@ -166,9 +168,18 @@ class CherryPyConfig(object):
 
             verify_tls_files(cert_fname, pkey_fname)
 
+            # Create custom SSL context to disable TLS 1.0 and 1.1.
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(cert_fname, pkey_fname)
+            if sys.version_info >= (3, 7):
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+            else:
+                context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+
             config['server.ssl_module'] = 'builtin'
             config['server.ssl_certificate'] = cert_fname
             config['server.ssl_private_key'] = pkey_fname
+            config['server.ssl_context'] = context
 
         self.update_cherrypy_config(config)
 
@@ -176,7 +187,7 @@ class CherryPyConfig(object):
             'url_prefix', default=''))
 
         uri = "{0}://{1}:{2}{3}/".format(
-            'https' if ssl else 'http',
+            'https' if use_ssl else 'http',
             socket.getfqdn(server_addr if server_addr != '::' else ''),
             server_port,
             self.url_prefix
@@ -268,9 +279,9 @@ class Module(MgrModule, CherryPyConfig):
 
         self._stopping = threading.Event()
         self.shutdown_event = threading.Event()
-
         self.ACCESS_CTRL_DB = None
         self.SSO_DB = None
+        self.health_checks = {}
 
     @classmethod
     def can_run(cls):
@@ -375,7 +386,7 @@ class Module(MgrModule, CherryPyConfig):
 
     def handle_command(self, inbuf, cmd):
         # pylint: disable=too-many-return-statements
-        res = handle_option_command(cmd)
+        res = handle_option_command(cmd, inbuf)
         if res[0] != -errno.ENOSYS:
             return res
         res = handle_sso_command(cmd)
@@ -414,6 +425,15 @@ class Module(MgrModule, CherryPyConfig):
                 self.__pool_stats[pool_id][stat_name].append((now, stat_val))
 
         return self.__pool_stats
+
+    def config_notify(self):
+        """
+        This method is called whenever one of our config options is changed.
+        """
+        PLUGIN_MANAGER.hook.config_notify()
+
+    def refresh_health_checks(self):
+        self.set_health_checks(self.health_checks)
 
 
 class StandbyModule(MgrStandbyModule, CherryPyConfig):

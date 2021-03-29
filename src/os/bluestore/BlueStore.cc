@@ -66,13 +66,13 @@ MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::Onode, bluestore_onode,
 
 // bluestore_cache_other
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::Buffer, bluestore_buffer,
-			      bluestore_cache_other);
+			      bluestore_Buffer);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::Extent, bluestore_extent,
-			      bluestore_cache_other);
+			      bluestore_Extent);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::Blob, bluestore_blob,
-			      bluestore_cache_other);
+			      bluestore_Blob);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::SharedBlob, bluestore_shared_blob,
-			      bluestore_cache_other);
+			      bluestore_SharedBlob);
 
 // bluestore_txc
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueStore::TransContext, bluestore_transcontext,
@@ -157,6 +157,11 @@ const string BLUESTORE_GLOBAL_STATFS_KEY = "bluestore_statfs";
  * We use ! as a terminator for strings; this works because it is < #
  * and will get escaped if it is present in the string.
  *
+ * NOTE: There is a bug in this implementation: due to implicit
+ * character type conversion in comparison it may produce unexpected
+ * ordering. Unfortunately fixing the bug would mean invalidating the
+ * keys in existing deployments. Instead we do additional sorting
+ * where it is needed.
  */
 template<typename S>
 static void append_escaped(const string &in, S *out)
@@ -164,11 +169,11 @@ static void append_escaped(const string &in, S *out)
   char hexbyte[in.length() * 3 + 1];
   char* ptr = &hexbyte[0];
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
-    if (*i <= '#') {
+    if (*i <= '#') { // bug: unexpected result for *i > 0x7f
       *ptr++ = '#';
       *ptr++ = "0123456789abcdef"[(*i >> 4) & 0x0f];
       *ptr++ = "0123456789abcdef"[*i & 0x0f];
-    } else if (*i >= '~') {
+    } else if (*i >= '~') { // bug: unexpected result for *i > 0x7f
       *ptr++ = '~';
       *ptr++ = "0123456789abcdef"[(*i >> 4) & 0x0f];
       *ptr++ = "0123456789abcdef"[*i & 0x0f];
@@ -290,47 +295,48 @@ static const char *_key_decode_shard(const char *key, shard_id_t *pshard)
   return key + 1;
 }
 
-static void get_coll_key_range(const coll_t& cid, int bits,
-			       string *temp_start, string *temp_end,
-			       string *start, string *end)
+static void get_coll_range(const coll_t& cid, int bits,
+                           ghobject_t *temp_start, ghobject_t *temp_end,
+                           ghobject_t *start, ghobject_t *end)
 {
-  temp_start->clear();
-  temp_end->clear();
-  start->clear();
-  end->clear();
-
   spg_t pgid;
   if (cid.is_pg(&pgid)) {
-    _key_encode_shard(pgid.shard, start);
+    start->shard_id = pgid.shard;
     *temp_start = *start;
 
-    _key_encode_u64(pgid.pool() + 0x8000000000000000ull, start);
-    _key_encode_u64((-2ll - pgid.pool()) + 0x8000000000000000ull, temp_start);
+    start->hobj.pool = pgid.pool();
+    temp_start->hobj.pool = -2ll - pgid.pool();
 
     *end = *start;
     *temp_end = *temp_start;
 
     uint32_t reverse_hash = hobject_t::_reverse_bits(pgid.ps());
-    _key_encode_u32(reverse_hash, start);
-    _key_encode_u32(reverse_hash, temp_start);
+    start->hobj.set_bitwise_key_u32(reverse_hash);
+    temp_start->hobj.set_bitwise_key_u32(reverse_hash);
 
     uint64_t end_hash = reverse_hash  + (1ull << (32 - bits));
     if (end_hash > 0xffffffffull)
       end_hash = 0xffffffffull;
 
-    _key_encode_u32(end_hash, end);
-    _key_encode_u32(end_hash, temp_end);
+    end->hobj.set_bitwise_key_u32(end_hash);
+    temp_end->hobj.set_bitwise_key_u32(end_hash);
   } else {
-    _key_encode_shard(shard_id_t::NO_SHARD, start);
-    _key_encode_u64(-1ull + 0x8000000000000000ull, start);
+    start->shard_id = shard_id_t::NO_SHARD;
+    start->hobj.pool = -1ull;
+
     *end = *start;
-    _key_encode_u32(0, start);
-    _key_encode_u32(0xffffffff, end);
+    start->hobj.set_bitwise_key_u32(0);
+    end->hobj.set_bitwise_key_u32(0xffffffff);
 
     // no separate temp section
     *temp_start = *end;
     *temp_end = *end;
   }
+
+  start->generation = 0;
+  end->generation = 0;
+  temp_start->generation = 0;
+  temp_end->generation = 0;
 }
 
 static void get_shared_blob_key(uint64_t sbid, string *key)
@@ -349,13 +355,15 @@ static int get_key_shared_blob(const string& key, uint64_t *sbid)
 }
 
 template<typename S>
-static int get_key_object(const S& key, ghobject_t *oid)
+static void _key_encode_prefix(const ghobject_t& oid, S *key)
 {
-  int r;
-  const char *p = key.c_str();
+  _key_encode_shard(oid.shard_id, key);
+  _key_encode_u64(oid.hobj.pool + 0x8000000000000000ull, key);
+  _key_encode_u32(oid.hobj.get_bitwise_key_u32(), key);
+}
 
-  if (key.length() < 1 + 8 + 4)
-    return -1;
+static const char *_key_decode_prefix(const char *p, ghobject_t *oid)
+{
   p = _key_decode_shard(p, &oid->shard_id);
 
   uint64_t pool;
@@ -366,6 +374,25 @@ static int get_key_object(const S& key, ghobject_t *oid)
   p = _key_decode_u32(p, &hash);
 
   oid->hobj.set_bitwise_key_u32(hash);
+
+  return p;
+}
+
+#define ENCODED_KEY_PREFIX_LEN (1 + 8 + 4)
+
+template<typename S>
+static int get_key_object(const S& key, ghobject_t *oid)
+{
+  int r;
+  const char *p = key.c_str();
+
+  if (key.length() < ENCODED_KEY_PREFIX_LEN)
+    return -1;
+
+  p = _key_decode_prefix(p, oid);
+
+  if (key.length() == ENCODED_KEY_PREFIX_LEN)
+    return -2;
 
   r = decode_escaped(p, &oid->hobj.nspace);
   if (r < 0)
@@ -415,7 +442,7 @@ static void get_object_key(CephContext *cct, const ghobject_t& oid, S *key)
 {
   key->clear();
 
-  size_t max_len = 1 + 8 + 4 +
+  size_t max_len = ENCODED_KEY_PREFIX_LEN +
                   (oid.hobj.nspace.length() * 3 + 1) +
                   (oid.hobj.get_key().length() * 3 + 1) +
                    1 + // for '<', '=', or '>'
@@ -423,9 +450,7 @@ static void get_object_key(CephContext *cct, const ghobject_t& oid, S *key)
                    8 + 8 + 1;
   key->reserve(max_len);
 
-  _key_encode_shard(oid.shard_id, key);
-  _key_encode_u64(oid.hobj.pool + 0x8000000000000000ull, key);
-  _key_encode_u32(oid.hobj.get_bitwise_key_u32(), key);
+  _key_encode_prefix(oid, key);
 
   append_escaped(oid.hobj.nspace, key);
 
@@ -648,6 +673,226 @@ ostream& operator<<(ostream& out, const BlueStore::Buffer& b)
     out << " " << BlueStore::Buffer::get_flag_name(b.flags);
   return out << ")";
 }
+
+namespace {
+
+/*
+ * Due to a bug in key string encoding (see a comment for append_escaped)
+ * the KeyValueDB iterator does not lexicographically sort the same
+ * way that ghobject_t does: objects with the same hash may have wrong order.
+ *
+ * This is the iterator wrapper that fixes the keys order.
+ */
+
+class CollectionListIterator {
+public:
+  CollectionListIterator(const KeyValueDB::Iterator &it)
+    : m_it(it) {
+  }
+  virtual ~CollectionListIterator() {
+  }
+
+  virtual bool valid() const = 0;
+  virtual const ghobject_t &oid() const = 0;
+  virtual void lower_bound(const ghobject_t &oid) = 0;
+  virtual void upper_bound(const ghobject_t &oid) = 0;
+  virtual void next() = 0;
+
+  virtual int cmp(const ghobject_t &oid) const = 0;
+
+  bool is_ge(const ghobject_t &oid) const {
+    return cmp(oid) >= 0;
+  }
+
+  bool is_lt(const ghobject_t &oid) const {
+    return cmp(oid) < 0;
+  }
+
+protected:
+  KeyValueDB::Iterator m_it;
+};
+
+class SimpleCollectionListIterator : public CollectionListIterator {
+public:
+  SimpleCollectionListIterator(CephContext *cct, const KeyValueDB::Iterator &it)
+    : CollectionListIterator(it), m_cct(cct) {
+  }
+
+  bool valid() const override {
+    return m_it->valid();
+  }
+
+  const ghobject_t &oid() const override {
+    ceph_assert(valid());
+
+    return m_oid;
+  }
+
+  void lower_bound(const ghobject_t &oid) override {
+    string key;
+    get_object_key(m_cct, oid, &key);
+
+    m_it->lower_bound(key);
+    get_oid();
+  }
+
+  void upper_bound(const ghobject_t &oid) override {
+    string key;
+    get_object_key(m_cct, oid, &key);
+
+    m_it->upper_bound(key);
+    get_oid();
+  }
+
+  void next() override {
+    ceph_assert(valid());
+
+    m_it->next();
+    get_oid();
+  }
+
+  int cmp(const ghobject_t &oid) const override {
+    ceph_assert(valid());
+
+    string key;
+    get_object_key(m_cct, oid, &key);
+
+    return m_it->key().compare(key);
+  }
+
+private:
+  CephContext *m_cct;
+  ghobject_t m_oid;
+
+  void get_oid() {
+    if (!valid()) {
+      return;
+    }
+
+    if (is_extent_shard_key(m_it->key())) {
+      next();
+      return;
+    }
+
+    m_oid = ghobject_t();
+    int r = get_key_object(m_it->key(), &m_oid);
+    ceph_assert(r == 0);
+  }
+};
+
+class SortedCollectionListIterator : public CollectionListIterator {
+public:
+  SortedCollectionListIterator(const KeyValueDB::Iterator &it)
+    : CollectionListIterator(it), m_chunk_iter(m_chunk.end()) {
+  }
+
+  bool valid() const override {
+    return m_chunk_iter != m_chunk.end();
+  }
+
+  const ghobject_t &oid() const override {
+    ceph_assert(valid());
+
+    return m_chunk_iter->first;
+  }
+
+  void lower_bound(const ghobject_t &oid) override {
+    std::string key;
+    _key_encode_prefix(oid, &key);
+
+    m_it->lower_bound(key);
+    m_chunk_iter = m_chunk.end();
+    if (!get_next_chunk()) {
+      return;
+    }
+
+    if (this->oid().shard_id != oid.shard_id ||
+        this->oid().hobj.pool != oid.hobj.pool ||
+        this->oid().hobj.get_bitwise_key_u32() != oid.hobj.get_bitwise_key_u32()) {
+      return;
+    }
+
+    m_chunk_iter = m_chunk.lower_bound(oid);
+    if (m_chunk_iter == m_chunk.end()) {
+      get_next_chunk();
+    }
+  }
+
+  void upper_bound(const ghobject_t &oid) override {
+    lower_bound(oid);
+
+    if (valid() && this->oid() == oid) {
+      next();
+    }
+  }
+
+  void next() override {
+    ceph_assert(valid());
+
+    m_chunk_iter++;
+    if (m_chunk_iter == m_chunk.end()) {
+      get_next_chunk();
+    }
+  }
+
+  int cmp(const ghobject_t &oid) const override {
+    ceph_assert(valid());
+
+    if (this->oid() < oid) {
+      return -1;
+    }
+    if (this->oid() > oid) {
+      return 1;
+    }
+    return 0;
+  }
+
+private:
+  std::map<ghobject_t, std::string> m_chunk;
+  std::map<ghobject_t, std::string>::iterator m_chunk_iter;
+
+  bool get_next_chunk() {
+    while (m_it->valid() && is_extent_shard_key(m_it->key())) {
+      m_it->next();
+    }
+
+    if (!m_it->valid()) {
+      return false;
+    }
+
+    ghobject_t oid;
+    int r = get_key_object(m_it->key(), &oid);
+    ceph_assert(r == 0);
+
+    m_chunk.clear();
+    while (true) {
+      m_chunk.insert({oid, m_it->key()});
+
+      do {
+        m_it->next();
+      } while (m_it->valid() && is_extent_shard_key(m_it->key()));
+
+      if (!m_it->valid()) {
+        break;
+      }
+
+      ghobject_t next;
+      r = get_key_object(m_it->key(), &next);
+      ceph_assert(r == 0);
+      if (next.shard_id != oid.shard_id ||
+          next.hobj.pool != oid.hobj.pool ||
+          next.hobj.get_bitwise_key_u32() != oid.hobj.get_bitwise_key_u32()) {
+        break;
+      }
+      oid = next;
+    }
+
+    m_chunk_iter = m_chunk.begin();
+    return true;
+  }
+};
+
+} // anonymous namespace
 
 // Garbage Collector
 
@@ -883,7 +1128,14 @@ struct LruOnodeCacheShard : public BlueStore::OnodeCacheShard {
     --num_pinned;
     dout(20) << __func__ << this << " " << " " << " " << o->oid << " unpinned" << dendl;
   }
-
+  void _unpin_and_rm(BlueStore::Onode* o) override
+  {
+    o->pop_cache();
+    ceph_assert(num_pinned);
+    --num_pinned;
+    ceph_assert(num);
+    --num;
+  }
   void _trim_to(uint64_t new_size) override
   {
     if (new_size >= lru.size()) {
@@ -1699,7 +1951,7 @@ void BlueStore::OnodeSpace::rename(
   OnodeRef& oldo,
   const ghobject_t& old_oid,
   const ghobject_t& new_oid,
-  const mempool::bluestore_cache_other::string& new_okey)
+  const mempool::bluestore_cache_meta::string& new_okey)
 {
   std::lock_guard l(cache->lock);
   ldout(cache->cct, 30) << __func__ << " " << old_oid << " -> " << new_oid
@@ -1733,12 +1985,12 @@ void BlueStore::OnodeSpace::rename(
   cache->_trim();
 }
 
-bool BlueStore::OnodeSpace::map_any(std::function<bool(OnodeRef)> f)
+bool BlueStore::OnodeSpace::map_any(std::function<bool(Onode*)> f)
 {
   std::lock_guard l(cache->lock);
   ldout(cache->cct, 20) << __func__ << dendl;
   for (auto& i : onode_map) {
-    if (f(i.second)) {
+    if (f(i.second.get())) {
       return true;
     }
   }
@@ -2146,7 +2398,7 @@ BlueStore::OldExtent* BlueStore::OldExtent::create(CollectionRef c,
 						   BlobRef& b) {
   OldExtent* oe = new OldExtent(lo, o, l, b);
   b->put_ref(c.get(), o, l, &(oe->r));
-  oe->blob_empty = b->get_referenced_bytes() == 0;
+  oe->blob_empty = !b->is_referenced();
   return oe;
 }
 
@@ -2288,7 +2540,7 @@ void BlueStore::ExtentMap::update(KeyValueDB::Transaction t,
       unsigned n;
       // we need to encode inline_bl to measure encoded length
       bool never_happen = encode_some(0, OBJECT_MAX_SIZE, inline_bl, &n);
-      inline_bl.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+      inline_bl.reassign_to_mempool(mempool::mempool_bluestore_inline_bl);
       ceph_assert(!never_happen);
       size_t len = inline_bl.length();
       dout(20) << __func__ << "  inline shard " << len << " bytes from " << n
@@ -3302,34 +3554,47 @@ BlueStore::BlobRef BlueStore::ExtentMap::split_blob(
 // decremented. And another 'putting' thread on the instance will release it.
 //
 void BlueStore::Onode::get() {
-  if (++nref == 2) {
-    c->get_onode_cache()->pin(this, [&]() {
-        bool was_pinned = pinned;
-        pinned = nref >= 2;
-        // additional increment for newly pinned instance
-        bool r = !was_pinned && pinned;
-        if (r) {
-          ++nref;
-        }
-        return cached && r;
-      });
+  if (++nref >= 2 && !pinned) {
+    OnodeCacheShard* ocs = c->get_onode_cache();
+    std::lock_guard l(ocs->lock);
+    bool was_pinned = pinned;
+    pinned = nref >= 2;
+    // additional increment for newly pinned instance
+    bool r = !was_pinned && pinned;
+    if (r) {
+      ++nref;
+    }
+    if (cached && r) {
+      ocs->_pin(this);
+    }
   }
 }
 void BlueStore::Onode::put() {
-  if (--nref == 2) {
-    c->get_onode_cache()->unpin(this, [&]() {
-        bool was_pinned = pinned;
-        pinned = pinned && nref > 2; // intentionally use > not >= as we have
-                                     // +1 due to pinned state
-        bool r = was_pinned && !pinned;
-        // additional decrement for newly unpinned instance
-        if (r) {
-          --nref;
-        }
-        return cached && r;
-      });
+  int n = --nref;
+  if (n == 2) {
+    OnodeCacheShard* ocs = c->get_onode_cache();
+    std::lock_guard l(ocs->lock);
+    bool need_unpin = pinned;
+    pinned = pinned && nref > 2; // intentionally use > not >= as we have
+                                 // +1 due to pinned state
+    need_unpin = need_unpin && !pinned;
+    if (cached && need_unpin) {
+      if (exists) {
+        ocs->_unpin(this);
+      } else {
+        ocs->_unpin_and_rm(this);
+        // remove will also decrement nref and delete Onode
+        c->onode_map._remove(oid);
+      }
+    }
+    // additional decrement for newly unpinned instance
+    // should be the last action since Onode can be released
+    // at any point after this decrement
+    if (need_unpin) {
+      n = --nref;
+    }
   }
-  if (nref == 0) {
+  if (n == 0) {
     delete this;
   }
 }
@@ -3345,7 +3610,7 @@ BlueStore::Onode* BlueStore::Onode::decode(
   auto p = v.front().begin_deep();
   on->onode.decode(p);
   for (auto& i : on->onode.attrs) {
-    i.second.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+    i.second.reassign_to_mempool(mempool::mempool_bluestore_cache_meta);
   }
 
   // initialize extent_map
@@ -3354,7 +3619,7 @@ BlueStore::Onode* BlueStore::Onode::decode(
     denc(on->extent_map.inline_bl, p);
     on->extent_map.decode_some(on->extent_map.inline_bl);
     on->extent_map.inline_bl.reassign_to_mempool(
-      mempool::mempool_bluestore_cache_other);
+      mempool::mempool_bluestore_cache_data);
   }
   else {
     on->extent_map.init_shards(false, false);
@@ -3778,7 +4043,7 @@ void BlueStore::Collection::split_cache(
 
       p = onode_map.onode_map.erase(p);
       dest->onode_map.onode_map[o->oid] = o;
-      if (get_onode_cache() != dest->get_onode_cache()) {
+      if (o->cached) {
         get_onode_cache()->move_pinned(dest->get_onode_cache(), o.get());
       }
       o->c = dest;
@@ -4717,8 +4982,15 @@ void BlueStore::_init_logger()
     "Average omap iterator lower_bound call latency");
   b.add_time_avg(l_bluestore_omap_next_lat, "omap_next_lat",
     "Average omap iterator next call latency");
+  b.add_time_avg(l_bluestore_omap_get_keys_lat, "omap_get_keys_lat",
+    "Average omap get_keys call latency");
+  b.add_time_avg(l_bluestore_omap_get_values_lat, "omap_get_values_lat",
+    "Average omap get_values call latency");
   b.add_time_avg(l_bluestore_clist_lat, "clist_lat",
     "Average collection listing latency");
+  b.add_time_avg(l_bluestore_remove_lat, "remove_lat",
+    "Average removal latency");
+
   logger = b.create_perf_counters();
   cct->get_perfcounters_collection()->add(logger);
 }
@@ -5499,6 +5771,14 @@ int BlueStore::_open_bluefs(bool create)
   if (bluefs_layout.shared_bdev == BlueFS::BDEV_SLOW) {
 
     string options = cct->_conf->bluestore_rocksdb_options;
+    string options_annex = cct->_conf->bluestore_rocksdb_options_annex;
+    if (!options_annex.empty()) {
+      if (!options.empty() &&
+        *options.rbegin() != ',') {
+        options += ',';
+      }
+      options += options_annex;
+    }
 
     rocksdb::Options rocks_opts;
     int r = RocksDBStore::ParseOptionsFromStringStatic(
@@ -5701,6 +5981,7 @@ int BlueStore::_open_db(bool create, bool to_repair_db, bool read_only)
   ceph_assert(!(create && read_only));
   string fn = path + "/db";
   string options;
+  string options_annex;
   stringstream err;
   std::shared_ptr<Int64ArrayMergeOperator> merge_op(new Int64ArrayMergeOperator);
 
@@ -5849,6 +6130,14 @@ int BlueStore::_open_db(bool create, bool to_repair_db, bool read_only)
 
   if (kv_backend == "rocksdb") {
     options = cct->_conf->bluestore_rocksdb_options;
+    options_annex = cct->_conf->bluestore_rocksdb_options_annex;
+    if (!options_annex.empty()) {
+      if (!options.empty() &&
+        *options.rbegin() != ',') {
+        options += ',';
+      }
+      options += options_annex;
+    }
 
     map<string,string> cf_map;
     cct->_conf.with_val<string>("bluestore_rocksdb_cfs",
@@ -7545,6 +7834,34 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
     }
   } // for (auto& i : ref_map)
 
+  {
+    auto &sbm = o->extent_map.spanning_blob_map;
+    size_t broken = 0;
+    BlobRef first_broken;
+    for (auto it = sbm.begin(); it != sbm.end();) {
+      auto it1 = it++;
+      if (ref_map.count(it1->second) == 0) {
+        if (!broken) {
+          first_broken = it1->second;
+          ++errors;
+        }
+        broken++;
+        if (repairer) {
+          sbm.erase(it1);
+        }
+      }
+    }
+    if (broken) {
+      derr << "fsck error: " << oid << " - " << broken
+           << " zombie spanning blob(s) found, the first one: "
+           << *first_broken << dendl;
+      if(repairer) {
+        auto txn = repairer->fix_spanning_blobs(db);
+	_record_onode(o, txn);
+      }
+    }
+  }
+
   if (o->onode.has_omap()) {
     _fsck_check_object_omap(depth, o, ctx);
   }
@@ -9084,6 +9401,30 @@ void BlueStore::inject_misreference(coll_t cid1, ghobject_t oid1,
   db->submit_transaction_sync(txn);
 }
 
+void BlueStore::inject_zombie_spanning_blob(coll_t cid, ghobject_t oid,
+                                            int16_t blob_id)
+{
+  OnodeRef o;
+  CollectionRef c = _get_collection(cid);
+  ceph_assert(c);
+  {
+    std::unique_lock l{ c->lock }; // just to avoid internal asserts
+    o = c->get_onode(oid, false);
+    ceph_assert(o);
+    o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+  }
+
+  BlobRef b = c->new_blob();
+  b->id = blob_id;
+  o->extent_map.spanning_blob_map[blob_id] = b;
+
+  KeyValueDB::Transaction txn;
+  txn = db->get_transaction();
+
+  _record_onode(o, txn);
+  db->submit_transaction_sync(txn);
+}
+
 void BlueStore::collect_metadata(map<string,string> *pm)
 {
   dout(10) << __func__ << dendl;
@@ -9360,7 +9701,7 @@ void BlueStore::_reap_collections()
   while (p != removed_colls.end()) {
     CollectionRef c = *p;
     dout(10) << __func__ << " " << c << " " << c->cid << dendl;
-    if (c->onode_map.map_any([&](OnodeRef o) {
+    if (c->onode_map.map_any([&](Onode* o) {
 	  ceph_assert(!o->exists);
 	  if (o->flushing_count.load()) {
 	    dout(10) << __func__ << " " << c << " " << c->cid << " " << o->oid
@@ -10348,7 +10689,7 @@ int BlueStore::getattr(
   int r;
   {
     std::shared_lock l(c->lock);
-    mempool::bluestore_cache_other::string k(name);
+    mempool::bluestore_cache_meta::string k(name);
 
     OnodeRef o = c->get_onode(oid, false);
     if (!o || !o->exists) {
@@ -10462,7 +10803,28 @@ int BlueStore::collection_list(
   int r;
   {
     std::shared_lock l(c->lock);
-    r = _collection_list(c, start, end, max, ls, pnext);
+    r = _collection_list(c, start, end, max, false, ls, pnext);
+  }
+
+  dout(10) << __func__ << " " << c->cid
+    << " start " << start << " end " << end << " max " << max
+    << " = " << r << ", ls.size() = " << ls->size()
+    << ", next = " << (pnext ? *pnext : ghobject_t())  << dendl;
+  return r;
+}
+
+int BlueStore::collection_list_legacy(
+  CollectionHandle &c_, const ghobject_t& start, const ghobject_t& end, int max,
+  vector<ghobject_t> *ls, ghobject_t *pnext)
+{
+  Collection *c = static_cast<Collection *>(c_.get());
+  c->flush();
+  dout(15) << __func__ << " " << c->cid
+           << " start " << start << " end " << end << " max " << max << dendl;
+  int r;
+  {
+    std::shared_lock l(c->lock);
+    r = _collection_list(c, start, end, max, true, ls, pnext);
   }
 
   dout(10) << __func__ << " " << c->cid
@@ -10474,7 +10836,7 @@ int BlueStore::collection_list(
 
 int BlueStore::_collection_list(
   Collection *c, const ghobject_t& start, const ghobject_t& end, int max,
-  vector<ghobject_t> *ls, ghobject_t *pnext)
+  bool legacy, vector<ghobject_t> *ls, ghobject_t *pnext)
 {
 
   if (!c->exists)
@@ -10483,11 +10845,11 @@ int BlueStore::_collection_list(
   auto start_time = mono_clock::now();
   int r = 0;
   ghobject_t static_next;
-  KeyValueDB::Iterator it;
-  string temp_start_key, temp_end_key;
-  string start_key, end_key;
+  std::unique_ptr<CollectionListIterator> it;
+  ghobject_t coll_range_temp_start, coll_range_temp_end;
+  ghobject_t coll_range_start, coll_range_end;
   bool set_next = false;
-  string pend;
+  ghobject_t pend;
   bool temp;
 
   if (!pnext)
@@ -10496,84 +10858,88 @@ int BlueStore::_collection_list(
   if (start.is_max() || start.hobj.is_max()) {
     goto out;
   }
-  get_coll_key_range(c->cid, c->cnode.bits, &temp_start_key, &temp_end_key,
-    &start_key, &end_key);
+  get_coll_range(c->cid, c->cnode.bits, &coll_range_temp_start,
+                 &coll_range_temp_end, &coll_range_start, &coll_range_end);
   dout(20) << __func__
-    << " range " << pretty_binary_string(temp_start_key)
-    << " to " << pretty_binary_string(temp_end_key)
-    << " and " << pretty_binary_string(start_key)
-    << " to " << pretty_binary_string(end_key)
+    << " range " << coll_range_temp_start
+    << " to " << coll_range_temp_end
+    << " and " << coll_range_start
+    << " to " << coll_range_end
     << " start " << start << dendl;
-  it = db->get_iterator(PREFIX_OBJ);
+  if (legacy) {
+    it = std::make_unique<SimpleCollectionListIterator>(
+      cct, db->get_iterator(PREFIX_OBJ));
+  } else {
+    it = std::make_unique<SortedCollectionListIterator>(
+      db->get_iterator(PREFIX_OBJ));
+  }
   if (start == ghobject_t() ||
     start.hobj == hobject_t() ||
     start == c->cid.get_min_hobj()) {
-    it->upper_bound(temp_start_key);
+    it->upper_bound(coll_range_temp_start);
     temp = true;
   } else {
-    string k;
-    get_object_key(cct, start, &k);
     if (start.hobj.is_temp()) {
       temp = true;
-      ceph_assert(k >= temp_start_key && k < temp_end_key);
+      ceph_assert(start >= coll_range_temp_start && start < coll_range_temp_end);
     } else {
       temp = false;
-      ceph_assert(k >= start_key && k < end_key);
+      ceph_assert(start >= coll_range_start && start < coll_range_end);
     }
-    dout(20) << __func__ << " start from " << pretty_binary_string(k)
-      << " temp=" << (int)temp << dendl;
-    it->lower_bound(k);
+    dout(20) << __func__ << " temp=" << (int)temp << dendl;
+    it->lower_bound(start);
   }
   if (end.hobj.is_max()) {
-    pend = temp ? temp_end_key : end_key;
+    pend = temp ? coll_range_temp_end : coll_range_end;
   } else {
-    get_object_key(cct, end, &end_key);
     if (end.hobj.is_temp()) {
       if (temp)
-	pend = end_key;
+        pend = end;
       else
-	goto out;
+        goto out;
     } else {
-      pend = temp ? temp_end_key : end_key;
+      pend = temp ? coll_range_temp_end : end;
     }
   }
-  dout(20) << __func__ << " pend " << pretty_binary_string(pend) << dendl;
+  dout(20) << __func__ << " pend " << pend << dendl;
   while (true) {
-    if (!it->valid() || it->key() >= pend) {
+    if (!it->valid() || it->is_ge(pend)) {
       if (!it->valid())
 	dout(20) << __func__ << " iterator not valid (end of db?)" << dendl;
       else
-	dout(20) << __func__ << " key " << pretty_binary_string(it->key())
-	         << " >= " << end << dendl;
+	dout(20) << __func__ << " oid " << it->oid() << " >= " << pend << dendl;
       if (temp) {
 	if (end.hobj.is_temp()) {
+          if (it->valid() && it->is_lt(coll_range_temp_end)) {
+            *pnext = it->oid();
+            set_next = true;
+          }
 	  break;
 	}
 	dout(30) << __func__ << " switch to non-temp namespace" << dendl;
 	temp = false;
-	it->upper_bound(start_key);
-	pend = end_key;
-	dout(30) << __func__ << " pend " << pretty_binary_string(pend) << dendl;
+	it->upper_bound(coll_range_start);
+        if (end.hobj.is_max())
+          pend = coll_range_end;
+        else
+          pend = end;
+	dout(30) << __func__ << " pend " << pend << dendl;
 	continue;
+      }
+      if (it->valid() && it->is_lt(coll_range_end)) {
+        *pnext = it->oid();
+        set_next = true;
       }
       break;
     }
-    dout(30) << __func__ << " key " << pretty_binary_string(it->key()) << dendl;
-    if (is_extent_shard_key(it->key())) {
-      it->next();
-      continue;
-    }
-    ghobject_t oid;
-    int r = get_key_object(it->key(), &oid);
-    ceph_assert(r == 0);
-    dout(20) << __func__ << " oid " << oid << " end " << end << dendl;
+    dout(20) << __func__ << " oid " << it->oid() << " end " << end << dendl;
     if (ls->size() >= (unsigned)max) {
       dout(20) << __func__ << " reached max " << max << dendl;
-      *pnext = oid;
+      *pnext = it->oid();
       set_next = true;
       break;
     }
-    ls->push_back(oid);
+    ls->push_back(it->oid());
     it->next();
   }
 out:
@@ -10720,6 +11086,7 @@ int BlueStore::omap_get_keys(
   dout(15) << __func__ << " " << c->get_cid() << " oid " << oid << dendl;
   if (!c->exists)
     return -ENOENT;
+  auto start1 = mono_clock::now();
   std::shared_lock l(c->lock);
   int r = 0;
   OnodeRef o = c->get_onode(oid, false);
@@ -10751,6 +11118,12 @@ int BlueStore::omap_get_keys(
     }
   }
  out:
+  c->store->log_latency(
+    __func__,
+    l_bluestore_omap_get_keys_lat,
+    mono_clock::now() - start1,
+    c->store->cct->_conf->bluestore_log_omap_iterator_age);
+
   dout(10) << __func__ << " " << c->get_cid() << " oid " << oid << " = " << r
 	   << dendl;
   return r;
@@ -10768,6 +11141,7 @@ int BlueStore::omap_get_values(
   if (!c->exists)
     return -ENOENT;
   std::shared_lock l(c->lock);
+  auto start1 = mono_clock::now();
   int r = 0;
   string final_key;
   OnodeRef o = c->get_onode(oid, false);
@@ -10795,6 +11169,12 @@ int BlueStore::omap_get_values(
     }
   }
  out:
+  c->store->log_latency(
+    __func__,
+    l_bluestore_omap_get_values_lat,
+    mono_clock::now() - start1,
+    c->store->cct->_conf->bluestore_log_omap_iterator_age);
+
   dout(10) << __func__ << " " << c->get_cid() << " oid " << oid << " = " << r
 	   << dendl;
   return r;
@@ -11839,7 +12219,25 @@ void BlueStore::_kv_sync_thread()
   ceph_assert(!kv_sync_started);
   kv_sync_started = true;
   kv_cond.notify_all();
+
+  auto t0 = mono_clock::now();
+  timespan twait = ceph::make_timespan(0);
+  size_t kv_submitted = 0;
+
   while (true) {
+    auto period = cct->_conf->bluestore_kv_sync_util_logging_s;
+    auto observation_period =
+      ceph::make_timespan(period);
+    auto elapsed = mono_clock::now() - t0;
+    if (period && elapsed >= observation_period) {
+      dout(5) << __func__ << " utilization: idle "
+	      << twait << " of " << elapsed
+	      << ", submitted: " << kv_submitted
+	      <<dendl;
+      t0 = mono_clock::now();
+      twait = ceph::make_timespan(0);
+      kv_submitted = 0;
+    }
     ceph_assert(kv_committing.empty());
     if (kv_queue.empty() &&
 	((deferred_done_queue.empty() && deferred_stable_queue.empty()) ||
@@ -11847,8 +12245,11 @@ void BlueStore::_kv_sync_thread()
       if (kv_stop)
 	break;
       dout(20) << __func__ << " sleep" << dendl;
+      auto t = mono_clock::now();
       kv_sync_in_progress = false;
       kv_cond.wait(l);
+      twait += mono_clock::now() - t;
+
       dout(20) << __func__ << " wake" << dendl;
     } else {
       deque<TransContext*> kv_submitting;
@@ -11942,6 +12343,7 @@ void BlueStore::_kv_sync_thread()
       for (auto txc : kv_committing) {
 	throttle.log_state_latency(*txc, logger, l_bluestore_state_kv_queued_lat);
 	if (txc->state == TransContext::STATE_KV_QUEUED) {
+	  ++kv_submitted;
 	  _txc_apply_kv(txc, false);
 	  --txc->osr->kv_committing_serially;
 	} else {
@@ -13584,12 +13986,23 @@ int BlueStore::_do_alloc_write(
     if (wi.compressed) {
       final_length = wi.compressed_bl.length();
       csum_length = final_length;
+      unsigned csum_order = ctz(csum_length);
       l = &wi.compressed_bl;
       dblob.set_compressed(wi.blob_length, wi.compressed_len);
+      if (csum != Checksummer::CSUM_NONE) {
+        dout(20) << __func__ << " initialize csum setting for compressed blob " << *b
+                 << " csum_type " << Checksummer::get_csum_type_string(csum)
+                 << " csum_order " << csum_order
+                 << " csum_length 0x" << std::hex << csum_length
+                 << " blob_length 0x" << wi.blob_length
+                 << " compressed_length 0x" << wi.compressed_len << std::dec
+                 << dendl;
+        dblob.init_csum(csum, csum_order, csum_length);
+      }
     } else if (wi.new_blob) {
+      unsigned csum_order;
       // initialize newly created blob only
       ceph_assert(dblob.is_mutable());
-      unsigned csum_order;
       if (l->length() != wi.blob_length) {
         // hrm, maybe we could do better here, but let's not bother.
         dout(20) << __func__ << " forcing csum_order to block_size_order "
@@ -14312,7 +14725,23 @@ int BlueStore::_remove(TransContext *txc,
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " onode " << o.get()
 	   << " txc "<< txc << dendl;
+
+  auto start_time = mono_clock::now();
   int r = _do_remove(txc, c, o);
+  log_latency_fn(
+    __func__,
+    l_bluestore_remove_lat,
+    mono_clock::now() - start_time,
+    cct->_conf->bluestore_log_op_age,
+    [&](const ceph::timespan& lat) {
+      ostringstream ostr;
+      ostr << ", lat = " << timespan_str(lat)
+        << " cid =" << c->cid
+        << " oid =" << o->oid;
+      return ostr.str();
+    }
+  );
+
   dout(10) << __func__ << " " << c->cid << " " << o->oid << " = " << r << dendl;
   return r;
 }
@@ -14330,10 +14759,10 @@ int BlueStore::_setattr(TransContext *txc,
   if (val.is_partial()) {
     auto& b = o->onode.attrs[name.c_str()] = bufferptr(val.c_str(),
 						       val.length());
-    b.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+    b.reassign_to_mempool(mempool::mempool_bluestore_cache_meta);
   } else {
     auto& b = o->onode.attrs[name.c_str()] = val;
-    b.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+    b.reassign_to_mempool(mempool::mempool_bluestore_cache_meta);
   }
   txc->write_onode(o);
   dout(10) << __func__ << " " << c->cid << " " << o->oid
@@ -14356,10 +14785,10 @@ int BlueStore::_setattrs(TransContext *txc,
     if (p->second.is_partial()) {
       auto& b = o->onode.attrs[p->first.c_str()] =
 	bufferptr(p->second.c_str(), p->second.length());
-      b.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+      b.reassign_to_mempool(mempool::mempool_bluestore_cache_meta);
     } else {
       auto& b = o->onode.attrs[p->first.c_str()] = p->second;
-      b.reassign_to_mempool(mempool::mempool_bluestore_cache_other);
+      b.reassign_to_mempool(mempool::mempool_bluestore_cache_meta);
     }
   }
   txc->write_onode(o);
@@ -14771,7 +15200,7 @@ int BlueStore::_rename(TransContext *txc,
 	   << new_oid << dendl;
   int r;
   ghobject_t old_oid = oldo->oid;
-  mempool::bluestore_cache_other::string new_okey;
+  mempool::bluestore_cache_meta::string new_okey;
 
   if (newo) {
     if (newo->exists) {
@@ -14866,7 +15295,7 @@ int BlueStore::_remove_collection(TransContext *txc, const coll_t &cid,
     }
     size_t nonexistent_count = 0;
     ceph_assert((*c)->exists);
-    if ((*c)->onode_map.map_any([&](OnodeRef o) {
+    if ((*c)->onode_map.map_any([&](Onode* o) {
         if (o->exists) {
           dout(1) << __func__ << " " << o->oid << " " << o
 		  << " exists in onode_map" << dendl;
@@ -14885,7 +15314,7 @@ int BlueStore::_remove_collection(TransContext *txc, const coll_t &cid,
     // then check if all of them are marked as non-existent.
     // Bypass the check if (next != ghobject_t::get_max())
     r = _collection_list(c->get(), ghobject_t(), ghobject_t::get_max(),
-                         nonexistent_count + 1, &ls, &next);
+                         nonexistent_count + 1, false, &ls, &next);
     if (r >= 0) {
       // If true mean collecton has more objects than nonexistent_count,
       // so bypass check.
@@ -15747,6 +16176,15 @@ bool BlueStoreRepairer::fix_bluefs_extents(std::atomic<uint64_t>& out_of_sync_fl
   return true;
 }
 
+KeyValueDB::Transaction BlueStoreRepairer::fix_spanning_blobs(KeyValueDB* db)
+{
+  if (!fix_onode_txn) {
+    fix_onode_txn = db->get_transaction();
+  }
+  ++to_repair_cnt;
+  return fix_onode_txn;
+}
+
 bool BlueStoreRepairer::preprocess_misreference(KeyValueDB *db)
 {
   if (misreferenced_extents.size()) {
@@ -15781,6 +16219,10 @@ unsigned BlueStoreRepairer::apply(KeyValueDB* db)
   if (fix_misreferences_txn) {
     db->submit_transaction_sync(fix_misreferences_txn);
     fix_misreferences_txn = nullptr;
+  }
+  if (fix_onode_txn) {
+    db->submit_transaction_sync(fix_onode_txn);
+    fix_onode_txn = nullptr;
   }
   if (fix_shared_blob_txn) {
     db->submit_transaction_sync(fix_shared_blob_txn);

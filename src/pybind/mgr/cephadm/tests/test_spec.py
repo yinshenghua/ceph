@@ -1,9 +1,13 @@
+# Disable autopep8 for this file:
+
+# fmt: off
+
 import json
 
 import pytest
 
 from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, \
-    IscsiServiceSpec, AlertManagerSpec
+    IscsiServiceSpec, AlertManagerSpec, HostPlacementSpec, CustomContainerSpec
 
 from orchestrator import DaemonDescription, OrchestratorError
 
@@ -101,6 +105,16 @@ def test_spec_octopus(spec_json):
         if 'spec' in j_c:
             spec = j_c.pop('spec')
             j_c.update(spec)
+        if 'placement' in j_c:
+            if 'hosts' in j_c['placement']:
+                j_c['placement']['hosts'] = [
+                    {
+                        'hostname': HostPlacementSpec.parse(h).hostname,
+                        'network': HostPlacementSpec.parse(h).network,
+                        'name': HostPlacementSpec.parse(h).name
+                    }
+                    for h in j_c['placement']['hosts']
+                ]
         j_c.pop('objectstore', None)
         j_c.pop('filter_logic', None)
         return j_c
@@ -259,7 +273,18 @@ def test_dd_octopus(dd_json):
     # https://tracker.ceph.com/issues/44934
     # Those are real user data from early octopus.
     # Please do not modify those JSON values.
-    assert dd_json == DaemonDescription.from_json(dd_json).to_json()
+
+    # Convert datetime properties to old style.
+    # 2020-04-03T07:29:16.926292Z -> 2020-04-03T07:29:16.926292
+    def convert_to_old_style_json(j):
+        for k in ['last_refresh', 'created', 'started', 'last_deployed',
+                  'last_configured']:
+            if k in j:
+                j[k] = j[k].rstrip('Z')
+        return j
+
+    assert dd_json == convert_to_old_style_json(
+        DaemonDescription.from_json(dd_json).to_json())
 
 
 @pytest.mark.parametrize("spec,dd,valid",
@@ -517,6 +542,33 @@ def test_dd_octopus(dd_json):
         ),
         True
     ),
+    (
+        # fixed daemon id for teuthology.
+        IscsiServiceSpec(
+            service_type='iscsi',
+            service_id='iscsi',
+        ),
+        DaemonDescription(
+            daemon_type='iscsi',
+            daemon_id="iscsi.a",
+            hostname="host1",
+        ),
+        True
+    ),
+
+    (
+        CustomContainerSpec(
+            service_type='container',
+            service_id='hello-world',
+            image='docker.io/library/hello-world:latest',
+        ),
+        DaemonDescription(
+            daemon_type='container',
+            daemon_id='hello-world.mgr0',
+            hostname='mgr0',
+        ),
+        True
+    ),
 ])
 def test_daemon_description_service_name(spec: ServiceSpec,
                                          dd: DaemonDescription,
@@ -539,3 +591,56 @@ def test_alertmanager_spec_2():
     spec = AlertManagerSpec(user_data={'default_webhook_urls': ['foo']})
     assert isinstance(spec.user_data, dict)
     assert 'default_webhook_urls' in spec.user_data.keys()
+
+
+def test_custom_container_spec():
+    spec = CustomContainerSpec(service_id='hello-world',
+                               image='docker.io/library/hello-world:latest',
+                               entrypoint='/usr/bin/bash',
+                               uid=1000,
+                               gid=2000,
+                               volume_mounts={'foo': '/foo'},
+                               args=['--foo'],
+                               envs=['FOO=0815'],
+                               bind_mounts=[
+                                   [
+                                       'type=bind',
+                                       'source=lib/modules',
+                                       'destination=/lib/modules',
+                                       'ro=true'
+                                   ]
+                               ],
+                               ports=[8080, 8443],
+                               dirs=['foo', 'bar'],
+                               files={
+                                   'foo.conf': 'foo\nbar',
+                                   'bar.conf': ['foo', 'bar']
+                               })
+    assert spec.service_type == 'container'
+    assert spec.entrypoint == '/usr/bin/bash'
+    assert spec.uid == 1000
+    assert spec.gid == 2000
+    assert spec.volume_mounts == {'foo': '/foo'}
+    assert spec.args == ['--foo']
+    assert spec.envs == ['FOO=0815']
+    assert spec.bind_mounts == [
+        [
+            'type=bind',
+            'source=lib/modules',
+            'destination=/lib/modules',
+            'ro=true'
+        ]
+    ]
+    assert spec.ports == [8080, 8443]
+    assert spec.dirs == ['foo', 'bar']
+    assert spec.files == {
+        'foo.conf': 'foo\nbar',
+        'bar.conf': ['foo', 'bar']
+    }
+
+
+def test_custom_container_spec_config_json():
+    spec = CustomContainerSpec(service_id='foo', image='foo', dirs=None)
+    config_json = spec.config_json()
+    for key in ['entrypoint', 'uid', 'gid', 'bind_mounts', 'dirs']:
+        assert key not in config_json

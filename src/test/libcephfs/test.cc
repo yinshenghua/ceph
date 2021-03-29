@@ -33,6 +33,7 @@
 #include <sys/xattr.h>
 #endif
 
+#include <fmt/format.h>
 #include <map>
 #include <vector>
 #include <thread>
@@ -77,6 +78,30 @@ TEST(LibCephFS, OpenEmptyComponent) {
   ASSERT_LT(0, fd);
 
   ASSERT_EQ(0, ceph_close(cmount, fd));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, OpenReadTruncate) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(0, ceph_create(&cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_read_file(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, "/"));
+
+  auto path = fmt::format("test_open_rdt_{}", getpid());
+  int fd = ceph_open(cmount, path.c_str(), O_WRONLY|O_CREAT, 0666);
+  ASSERT_LE(0, fd);
+
+  auto data = std::string("hello world");
+  ASSERT_EQ(ceph_write(cmount, fd, data.c_str(), data.size(), 0), (int)data.size());
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
+  fd = ceph_open(cmount, path.c_str(), O_RDONLY, 0);
+  ASSERT_LE(0, fd);
+  ASSERT_EQ(ceph_ftruncate(cmount, fd, 0), -EBADF);
+  ASSERT_EQ(ceph_ftruncate(cmount, fd, 1), -EBADF);
+  ASSERT_EQ(0, ceph_close(cmount, fd));
+
   ceph_shutdown(cmount);
 }
 
@@ -2017,7 +2042,13 @@ TEST(LibCephFS, ShutdownRace)
 
   for (int i = 0; i < nthreads; ++i)
     threads[i].join();
-  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rold), 0);
+  /*
+   * Let's just ignore restoring the open files limit,
+   * the kernel will defer releasing the file descriptors
+   * and then the process will be possibly reachthe open
+   * files limit. More detail, please see tracer#43039
+   */
+//  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &rold), 0);
 }
 
 static void get_current_time_utimbuf(struct utimbuf *utb)

@@ -52,7 +52,7 @@ set(unittest_librbd_srcs
   test_mock_TrashWatcher.cc
   test_mock_Watcher.cc
   cache/test_mock_WriteAroundObjectDispatch.cc
-  cache/test_mock_ParentImageCache.cc
+  cache/test_mock_ParentCacheObjectDispatch.cc
   deep_copy/test_mock_ImageCopyRequest.cc
   deep_copy/test_mock_MetadataCopyRequest.cc
   deep_copy/test_mock_ObjectCopyRequest.cc
@@ -93,6 +93,7 @@ set(unittest_librbd_srcs
   mirror/snapshot/test_mock_UnlinkPeerRequest.cc
   mirror/snapshot/test_mock_Utils.cc
   mirror/test_mock_DisableRequest.cc
+  object_map/test_mock_DiffRequest.cc
   object_map/test_mock_InvalidateRequest.cc
   object_map/test_mock_LockRequest.cc
   object_map/test_mock_RefreshRequest.cc

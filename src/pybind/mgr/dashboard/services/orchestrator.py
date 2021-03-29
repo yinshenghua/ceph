@@ -2,14 +2,15 @@
 from __future__ import absolute_import
 import logging
 
-from typing import List, Optional
+from functools import wraps
+from typing import List, Optional, Dict
 
+from ceph.deployment.service_spec import ServiceSpec
 from orchestrator import InventoryFilter, DeviceLightLoc, Completion
 from orchestrator import ServiceDescription, DaemonDescription
 from orchestrator import OrchestratorClientMixin, raise_if_exception, OrchestratorError
 from orchestrator import HostSpec
 from .. import mgr
-from ..tools import wraps
 
 logger = logging.getLogger('orchestrator')
 
@@ -84,8 +85,10 @@ class InventoryManager(ResourceManager):
 
 class ServiceManager(ResourceManager):
     @wait_api_result
-    def list(self, service_name: Optional[str] = None) -> List[ServiceDescription]:
-        return self.api.describe_service(None, service_name)
+    def list(self,
+             service_type: Optional[str] = None,
+             service_name: Optional[str] = None) -> List[ServiceDescription]:
+        return self.api.describe_service(service_type, service_name)
 
     @wait_api_result
     def get(self, service_name: str) -> ServiceDescription:
@@ -94,8 +97,11 @@ class ServiceManager(ResourceManager):
     @wait_api_result
     def list_daemons(self,
                      service_name: Optional[str] = None,
+                     daemon_type: Optional[str] = None,
                      hostname: Optional[str] = None) -> List[DaemonDescription]:
-        return self.api.list_daemons(service_name, host=hostname)
+        return self.api.list_daemons(service_name=service_name,
+                                     daemon_type=daemon_type,
+                                     host=hostname)
 
     def reload(self, service_type, service_ids):
         if not isinstance(service_ids, list):
@@ -109,6 +115,15 @@ class ServiceManager(ResourceManager):
         self.api.orchestrator_wait(completion_list)
         for c in completion_list:
             raise_if_exception(c)
+
+    @wait_api_result
+    def apply(self, service_spec: Dict) -> Completion:
+        spec = ServiceSpec.from_json(service_spec)
+        return self.api.apply([spec])
+
+    @wait_api_result
+    def remove(self, service_name: str) -> List[str]:
+        return self.api.remove_service(service_name)
 
 
 class OsdManager(ResourceManager):

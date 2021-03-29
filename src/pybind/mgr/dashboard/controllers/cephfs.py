@@ -8,7 +8,8 @@ import os
 import cherrypy
 import cephfs
 
-from . import ApiController, ControllerDoc, RESTController, UiApiController
+from . import ApiController, ControllerDoc, RESTController, UiApiController, \
+    allow_empty_body
 from .. import mgr
 from ..exceptions import DashboardException
 from ..security import Scope
@@ -289,10 +290,12 @@ class CephFS(RESTController):
                 client['type'] = "userspace"
                 client['version'] = client['client_metadata']['ceph_version']
                 client['hostname'] = client['client_metadata']['hostname']
+                client['root'] = client['client_metadata']['root']
             elif "kernel_version" in client['client_metadata']:  # pragma: no cover - no complexity
                 client['type'] = "kernel"
                 client['version'] = client['client_metadata']['kernel_version']
                 client['hostname'] = client['client_metadata']['hostname']
+                client['root'] = client['client_metadata']['root']
             else:  # pragma: no cover - no complexity there
                 client['type'] = "unknown"
                 client['version'] = ""
@@ -385,6 +388,7 @@ class CephFS(RESTController):
         return path
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def mk_dirs(self, fs_id, path):
         """
         Create a directory.
@@ -395,6 +399,7 @@ class CephFS(RESTController):
         cfs.mk_dirs(path)
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def rm_dir(self, fs_id, path):
         """
         Remove a directory.
@@ -405,6 +410,7 @@ class CephFS(RESTController):
         cfs.rm_dir(path)
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def mk_snapshot(self, fs_id, path, name=None):
         """
         Create a snapshot.
@@ -420,6 +426,7 @@ class CephFS(RESTController):
         return cfs.mk_snapshot(path, name)
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def rm_snapshot(self, fs_id, path, name):
         """
         Remove a snapshot.
@@ -444,6 +451,7 @@ class CephFS(RESTController):
         return cfs.get_quotas(path)
 
     @RESTController.Resource('POST')
+    @allow_empty_body
     def set_quotas(self, fs_id, path, max_bytes=None, max_files=None):
         """
         Set the quotas of the specified path.

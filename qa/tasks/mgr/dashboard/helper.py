@@ -4,8 +4,12 @@ from __future__ import absolute_import
 
 import json
 import logging
-from collections import namedtuple
+import random
+import re
+import string
 import time
+from collections import namedtuple
+from typing import List
 
 import requests
 import six
@@ -65,14 +69,13 @@ class DashboardTestCase(MgrTestCase):
                 raise ex
 
         user_create_args = [
-            'dashboard', 'ac-user-create', username, password
+            'dashboard', 'ac-user-create', username
         ]
         if force_password:
             user_create_args.append('--force-password')
         if cmd_args:
             user_create_args.extend(cmd_args)
-        cls._ceph_cmd(user_create_args)
-
+        cls._ceph_cmd_with_secret(user_create_args, password)
         if roles:
             set_roles_args = ['dashboard', 'ac-user-set-roles', username]
             for idx, role in enumerate(roles):
@@ -96,18 +99,19 @@ class DashboardTestCase(MgrTestCase):
             cls._ceph_cmd(set_roles_args)
 
     @classmethod
-    def login(cls, username, password):
+    def login(cls, username, password, set_cookies=False):
         if cls._loggedin:
             cls.logout()
-        cls._post('/api/auth', {'username': username, 'password': password})
+        cls._post('/api/auth', {'username': username,
+                                'password': password}, set_cookies=set_cookies)
         cls._assertEq(cls._resp.status_code, 201)
         cls._token = cls.jsonBody()['token']
         cls._loggedin = True
 
     @classmethod
-    def logout(cls):
+    def logout(cls, set_cookies=False):
         if cls._loggedin:
-            cls._post('/api/auth/logout')
+            cls._post('/api/auth/logout', set_cookies=set_cookies)
             cls._assertEq(cls._resp.status_code, 200)
             cls._token = None
             cls._loggedin = False
@@ -195,29 +199,49 @@ class DashboardTestCase(MgrTestCase):
     def tearDownClass(cls):
         super(DashboardTestCase, cls).tearDownClass()
 
-    # pylint: disable=inconsistent-return-statements
+    # pylint: disable=inconsistent-return-statements, too-many-branches
     @classmethod
-    def _request(cls, url, method, data=None, params=None):
+    def _request(cls, url, method, data=None, params=None, set_cookies=False):
         url = "{}{}".format(cls._base_uri, url)
-        log.info("Request %s to %s", method, url)
+        log.debug("Request %s to %s", method, url)
         headers = {}
+        cookies = {}
         if cls._token:
-            headers['Authorization'] = "Bearer {}".format(cls._token)
+            if set_cookies:
+                cookies['token'] = cls._token
+            else:
+                headers['Authorization'] = "Bearer {}".format(cls._token)
 
-        if method == 'GET':
-            cls._resp = cls._session.get(url, params=params, verify=False,
-                                         headers=headers)
-        elif method == 'POST':
-            cls._resp = cls._session.post(url, json=data, params=params,
-                                          verify=False, headers=headers)
-        elif method == 'DELETE':
-            cls._resp = cls._session.delete(url, json=data, params=params,
-                                            verify=False, headers=headers)
-        elif method == 'PUT':
-            cls._resp = cls._session.put(url, json=data, params=params,
-                                         verify=False, headers=headers)
+        if set_cookies:
+            if method == 'GET':
+                cls._resp = cls._session.get(url, params=params, verify=False,
+                                         headers=headers, cookies=cookies)
+            elif method == 'POST':
+                cls._resp = cls._session.post(url, json=data, params=params,
+                                          verify=False, headers=headers, cookies=cookies)
+            elif method == 'DELETE':
+                cls._resp = cls._session.delete(url, json=data, params=params,
+                                            verify=False, headers=headers, cookies=cookies)
+            elif method == 'PUT':
+                cls._resp = cls._session.put(url, json=data, params=params,
+                                         verify=False, headers=headers, cookies=cookies)
+            else:
+                assert False
         else:
-            assert False
+            if method == 'GET':
+                cls._resp = cls._session.get(url, params=params, verify=False,
+                                             headers=headers)
+            elif method == 'POST':
+                cls._resp = cls._session.post(url, json=data, params=params,
+                                              verify=False, headers=headers)
+            elif method == 'DELETE':
+                cls._resp = cls._session.delete(url, json=data, params=params,
+                                                verify=False, headers=headers)
+            elif method == 'PUT':
+                cls._resp = cls._session.put(url, json=data, params=params,
+                                             verify=False, headers=headers)
+            else:
+                assert False
         try:
             if not cls._resp.ok:
                 # Output response for easier debugging.
@@ -231,8 +255,8 @@ class DashboardTestCase(MgrTestCase):
             raise ex
 
     @classmethod
-    def _get(cls, url, params=None):
-        return cls._request(url, 'GET', params=params)
+    def _get(cls, url, params=None, set_cookies=False):
+        return cls._request(url, 'GET', params=params, set_cookies=set_cookies)
 
     @classmethod
     def _view_cache_get(cls, url, retries=5):
@@ -253,16 +277,16 @@ class DashboardTestCase(MgrTestCase):
         return res
 
     @classmethod
-    def _post(cls, url, data=None, params=None):
-        cls._request(url, 'POST', data, params)
+    def _post(cls, url, data=None, params=None, set_cookies=False):
+        cls._request(url, 'POST', data, params, set_cookies=set_cookies)
 
     @classmethod
-    def _delete(cls, url, data=None, params=None):
-        cls._request(url, 'DELETE', data, params)
+    def _delete(cls, url, data=None, params=None, set_cookies=False):
+        cls._request(url, 'DELETE', data, params, set_cookies=set_cookies)
 
     @classmethod
-    def _put(cls, url, data=None, params=None):
-        cls._request(url, 'PUT', data, params)
+    def _put(cls, url, data=None, params=None, set_cookies=False):
+        cls._request(url, 'PUT', data, params, set_cookies=set_cookies)
 
     @classmethod
     def _assertEq(cls, v1, v2):
@@ -281,15 +305,15 @@ class DashboardTestCase(MgrTestCase):
 
     # pylint: disable=too-many-arguments
     @classmethod
-    def _task_request(cls, method, url, data, timeout):
-        res = cls._request(url, method, data)
+    def _task_request(cls, method, url, data, timeout, set_cookies=False):
+        res = cls._request(url, method, data, set_cookies=set_cookies)
         cls._assertIn(cls._resp.status_code, [200, 201, 202, 204, 400, 403, 404])
 
         if cls._resp.status_code == 403:
             return None
 
         if cls._resp.status_code != 202:
-            log.info("task finished immediately")
+            log.debug("task finished immediately")
             return res
 
         cls._assertIn('name', res)
@@ -301,8 +325,7 @@ class DashboardTestCase(MgrTestCase):
         res_task = None
         while retries > 0 and not res_task:
             retries -= 1
-            log.info("task (%s, %s) is still executing", task_name,
-                     task_metadata)
+            log.debug("task (%s, %s) is still executing", task_name, task_metadata)
             time.sleep(1)
             _res = cls._get('/api/task?name={}'.format(task_name))
             cls._assertEq(cls._resp.status_code, 200)
@@ -317,7 +340,7 @@ class DashboardTestCase(MgrTestCase):
             raise Exception("Waiting for task ({}, {}) to finish timed out. {}"
                             .format(task_name, task_metadata, _res))
 
-        log.info("task (%s, %s) finished", task_name, task_metadata)
+        log.debug("task (%s, %s) finished", task_name, task_metadata)
         if res_task['success']:
             if method == 'POST':
                 cls._resp.status_code = 201
@@ -334,16 +357,16 @@ class DashboardTestCase(MgrTestCase):
             return res_task['exception']
 
     @classmethod
-    def _task_post(cls, url, data=None, timeout=60):
-        return cls._task_request('POST', url, data, timeout)
+    def _task_post(cls, url, data=None, timeout=60, set_cookies=False):
+        return cls._task_request('POST', url, data, timeout, set_cookies=set_cookies)
 
     @classmethod
-    def _task_delete(cls, url, timeout=60):
-        return cls._task_request('DELETE', url, None, timeout)
+    def _task_delete(cls, url, timeout=60, set_cookies=False):
+        return cls._task_request('DELETE', url, None, timeout, set_cookies=set_cookies)
 
     @classmethod
-    def _task_put(cls, url, data=None, timeout=60):
-        return cls._task_request('PUT', url, data, timeout)
+    def _task_put(cls, url, data=None, timeout=60, set_cookies=False):
+        return cls._task_request('PUT', url, data, timeout, set_cookies=set_cookies)
 
     @classmethod
     def cookies(cls):
@@ -403,14 +426,30 @@ class DashboardTestCase(MgrTestCase):
     @classmethod
     def _ceph_cmd(cls, cmd):
         res = cls.mgr_cluster.mon_manager.raw_cluster_cmd(*cmd)
-        log.info("command result: %s", res)
+        log.debug("command result: %s", res)
         return res
 
     @classmethod
     def _ceph_cmd_result(cls, cmd):
         exitstatus = cls.mgr_cluster.mon_manager.raw_cluster_cmd_result(*cmd)
-        log.info("command exit status: %d", exitstatus)
+        log.debug("command exit status: %d", exitstatus)
         return exitstatus
+
+    @classmethod
+    def _ceph_cmd_with_secret(cls, cmd: List[str], secret: str, return_exit_code: bool = False):
+        cmd.append('-i')
+        cmd.append('{}'.format(cls._ceph_create_tmp_file(secret)))
+        if return_exit_code:
+            return cls._ceph_cmd_result(cmd)
+        return cls._ceph_cmd(cmd)
+
+    @classmethod
+    def _ceph_create_tmp_file(cls, content: str) -> str:
+        """Create a temporary file in the remote cluster"""
+        file_name = ''.join(random.choices(string.ascii_letters + string.digits, k=20))
+        file_path = '/tmp/{}'.format(file_name)
+        cls._cmd(['sh', '-c', 'echo -n {} > {}'.format(content, file_path)])
+        return file_path
 
     def set_config_key(self, key, value):
         self._ceph_cmd(['config-key', 'set', key, value])

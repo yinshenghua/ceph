@@ -268,7 +268,35 @@ section.
 To create a user with the administrator role you can use the following
 commands::
 
-  $ ceph dashboard ac-user-create <username> <password> administrator
+  $ ceph dashboard ac-user-create <username> -i <file-containing-password> administrator
+
+Account Lock-out
+^^^^^^^^^^^^^^^^
+
+It disables a user account if a user repeatedly enters the wrong credentials
+for multiple times. It is enabled by default to prevent brute-force or dictionary
+attacks. The user can get or set the default number of lock-out attempts using
+these commands respectively::
+
+  $ ceph dashboard get-account-lockout-attempts
+  $ ceph dashboard set-account-lockout-attempts <value:int>
+
+.. warning::
+
+  This feature can be disabled by setting the default number of lock-out attempts to 0.
+  However, by disabling this feature, the account is more vulnerable to brute-force or
+  dictionary based attacks. This can be disabled by::
+
+    $ ceph dashboard set-account-lockout-attempts 0
+
+Enable a Locked User
+^^^^^^^^^^^^^^^^^^^^
+
+If a user account is disabled as a result of multiple invalid login attempts, then
+it needs to be manually enabled by the administrator. This can be done by the following
+command::
+
+  $ ceph dashboard ac-user-enable <username>
 
 Accessing the Dashboard
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -305,8 +333,8 @@ The credentials of an existing user can also be obtained by using
 
 Finally, provide the credentials to the dashboard::
 
-  $ ceph dashboard set-rgw-api-access-key <access_key>
-  $ ceph dashboard set-rgw-api-secret-key <secret_key>
+  $ ceph dashboard set-rgw-api-access-key -i <file-containing-access-key>
+  $ ceph dashboard set-rgw-api-secret-key -i <file-containing-secret-key>
 
 In a typical default configuration with a single RGW endpoint, this is all you
 have to do to get the Object Gateway management functionality working. The
@@ -368,7 +396,8 @@ To disable API SSL verification run the following command::
 The available iSCSI gateways must be defined using the following commands::
 
   $ ceph dashboard iscsi-gateway-list
-  $ ceph dashboard iscsi-gateway-add <scheme>://<username>:<password>@<host>[:port]
+  $ # Gateway URL format for a new gateway: <scheme>://<username>:<password>@<host>[:port]
+  $ ceph dashboard iscsi-gateway-add -i <file-containing-gateway-url> [<gateway_name>]
   $ ceph dashboard iscsi-gateway-rm <gateway_name>
 
 
@@ -468,10 +497,19 @@ More details can be found in the documentation of the :ref:`mgr-prometheus`.
     [security]
     allow_embedding = true
 
+Enabling RBD-Image monitoring
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Due to performance reasons, monitoring of RBD images is disabled by default. For
+more information please see :ref:`prometheus-rbd-io-statistics`. If disabled,
+the overview and details dashboards will stay empty in Grafana and the metrics
+will not be visible in Prometheus.
+
 After you have set up Grafana and Prometheus, you will need to configure the
 connection information that the Ceph Dashboard will use to access Grafana.
 
-You need to tell the dashboard on which url Grafana instance is running/deployed::
+You need to tell the dashboard on which URL the Grafana instance is
+running/deployed::
 
   $ ceph dashboard set-grafana-api-url <grafana-server-url>  # default: ''
 
@@ -494,6 +532,38 @@ e.g. caused by certificates signed by unknown CA or not matching the host name::
   $ ceph dashboard set-grafana-api-ssl-verify False
 
 You can directly access Grafana Instance as well to monitor your cluster.
+
+Alternative URL for Browsers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Ceph Dashboard backend requires the Grafana URL to be able to verify the
+existence of Grafana Dashboards before the frontend even loads them. Due to the
+nature of how Grafana is implemented in Ceph Dashboard, this means that two
+working connections are required in order to be able to see Grafana graphs in
+Ceph Dashboard:
+
+- The backend (Ceph Mgr module) needs to verify the existence of the requested
+  graph. If this request succeeds, it lets the frontend know that it can safely
+  access Grafana.
+- The frontend then requests the Grafana graphs directly from the user's
+  browser using an iframe. The Grafana instance is accessed directly without any
+  detour through Ceph Dashboard.
+
+Now, it might be the case that your environment makes it difficult for the
+user's browser to directly access the URL configured in Ceph Dashboard. To solve
+this issue, a separate URL can be configured which will solely be used to tell
+the frontend (the user's browser) which URL it should use to access Grafana.
+This setting won't ever be changed automatically, unlike the GRAFANA_API_URL
+which is set by :ref:`cephadm` (only if cephadm is used to deploy monitoring
+services).
+
+To change the URL that is returned to the frontend issue the following command::
+
+  $ ceph dashboard set-grafana-frontend-api-url <grafana-server-url>
+
+If no value is set for that option, it will simply fall back to the value of the
+GRAFANA_API_URL option. If set, it will instruct the browser to use this URL to
+access Grafana.
 
 .. _dashboard-sso-support:
 
@@ -650,6 +720,19 @@ in order to manage silences.
   should not disturb each other through annoying duplicated notifications
   popping up.
 
+If you are using a self-signed certificate in your Prometheus or your
+Alertmanager setup, you should disable certificate verification in the
+dashboard to avoid refused connections, e.g. caused by certificates signed by
+unknown CA or not matching the host name.
+
+- For Prometheus::
+
+  $ ceph dashboard set-prometheus-api-ssl-verify False
+
+- For Alertmanager::
+
+  $ ceph dashboard set-alertmanager-api-ssl-verify False
+
 .. _dashboard-user-role-management:
 
 User and Role Management
@@ -726,7 +809,7 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Create User*::
 
-  $ ceph dashboard ac-user-create [--enabled] [--force-password] [--pwd_update_required] <username> [<password>] [<rolename>] [<name>] [<email>] [<pwd_expiration_date>]
+  $ ceph dashboard ac-user-create [--enabled] [--force-password] [--pwd_update_required] <username> -i <file-containing-password> [<rolename>] [<name>] [<email>] [<pwd_expiration_date>]
 
   To bypass the password policy checks use the `force-password` option.
   Use the option `pwd_update_required` so that a newly created user has
@@ -738,11 +821,11 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Change Password*::
 
-  $ ceph dashboard ac-user-set-password [--force-password] <username> <password>
+  $ ceph dashboard ac-user-set-password [--force-password] <username> -i <file-containing-password>
 
 - *Change Password Hash*::
 
-  $ ceph dashboard ac-user-set-password-hash <username> <hash>
+  $ ceph dashboard ac-user-set-password-hash <username> -i <file-containing-password-hash>
 
   The hash must be a bcrypt hash and salt, e.g. ``$2b$12$Pt3Vq/rDt2y9glTPSV.VFegiLkQeIpddtkhoFetNApYmIJOY8gau2``.
   This can be used to import users from an external database.
@@ -879,7 +962,7 @@ view and create Ceph pools, and have read-only access to any other scopes.
 
 1. *Create the user*::
 
-   $ ceph dashboard ac-user-create bob mypassword
+   $ ceph dashboard ac-user-create bob -i <file-containing-password>
 
 2. *Create role and specify scope permissions*::
 
@@ -1084,6 +1167,16 @@ NFS-Ganesha cluster.
 
 When configuring the Ceph Dashboard with multiple NFS-Ganesha clusters, the
 Web UI will automatically allow to choose to which cluster an export belongs.
+
+
+Support for NFS-Ganesha Clusters Deployed by the Orchestrator
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Ceph Dashboard can be used to manage NFS-Ganesha clusters deployed by the
+Orchestrator. It can detect the clusters automatically. For more details
+on deploying NFS-Ganesha clusters with the Orchestrator, please see :ref:`orchestrator-cli-stateless-services`.
+Or particularly, see :ref:`deploy-cephadm-nfs-ganesha` for how to deploy
+NFS-Ganesha clusters with the Cephadm backend.
 
 
 Plug-ins

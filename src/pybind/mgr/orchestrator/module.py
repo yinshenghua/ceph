@@ -1,4 +1,3 @@
-import datetime
 import errno
 import json
 from typing import List, Set, Optional, Iterator, cast, Dict, Any, Union
@@ -12,8 +11,9 @@ from prettytable import PrettyTable
 from ceph.deployment.inventory import Device
 from ceph.deployment.drive_group import DriveGroupSpec, DeviceSelection
 from ceph.deployment.service_spec import PlacementSpec, ServiceSpec
+from ceph.utils import datetime_now
 
-from mgr_util import format_bytes, to_pretty_timedelta
+from mgr_util import format_bytes, to_pretty_timedelta, format_dimless
 from mgr_module import MgrModule, HandleCommandResult
 
 from ._interface import OrchestratorClientMixin, DeviceLightLoc, _cli_read_command, \
@@ -71,14 +71,26 @@ def to_format(what, format: str, many: bool, cls):
         raise OrchestratorError(f'unsupported format type: {format}')
 
 
-def generate_preview_tables(data):
+def generate_preview_tables(data, osd_only=False):
     error = [x.get('error') for x in data if x.get('error')]
     if error:
         return json.dumps(error)
     warning = [x.get('warning') for x in data if x.get('warning')]
     osd_table = preview_table_osd(data)
     service_table = preview_table_services(data)
-    tables = f"""
+
+    if osd_only:
+        tables = f"""
+{''.join(warning)}
+
+################
+OSDSPEC PREVIEWS
+################
+{osd_table}
+"""
+        return tables
+    else:
+        tables = f"""
 {''.join(warning)}
 
 ####################
@@ -91,7 +103,7 @@ OSDSPEC PREVIEWS
 ################
 {osd_table}
 """
-    return tables
+        return tables
 
 
 def preview_table_osd(data):
@@ -108,18 +120,12 @@ def preview_table_osd(data):
                 if spec.get('error'):
                     return spec.get('message')
                 dg_name = spec.get('osdspec')
-                for osd in spec.get('data', {}).get('osds', []):
-                    db_path = '-'
-                    wal_path = '-'
-                    block_db = osd.get('block.db', {}).get('path')
-                    block_wal = osd.get('block.wal', {}).get('path')
-                    block_data = osd.get('data', {}).get('path', '')
+                for osd in spec.get('data', []):
+                    db_path = osd.get('block_db', '-')
+                    wal_path = osd.get('block_wal', '-')
+                    block_data = osd.get('data', '')
                     if not block_data:
                         continue
-                    if block_db:
-                        db_path = spec.get('data', {}).get('vg', {}).get('devices', [])
-                    if block_wal:
-                        wal_path = spec.get('data', {}).get('wal_vg', {}).get('devices', [])
                     table.add_row(('osd', dg_name, host, block_data, db_path, wal_path))
     return table.get_string()
 
@@ -174,7 +180,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
         encoded = json.dumps({
             'ident': list(self.ident),
             'fault': list(self.fault),
-            })
+        })
         self.set_store('active_devices', encoded)
 
     def _refresh_health(self):
@@ -208,7 +214,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             stdout=json.dumps({
                 'ident': list(self.ident),
                 'fault': list(self.fault)
-                }, indent=4, sort_keys=True))
+            }, indent=4, sort_keys=True))
 
     def light_on(self, fault_ident, devid):
         # type: (str, str) -> HandleCommandResult
@@ -280,7 +286,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
         'name=addr,type=CephString,req=false '
         'name=labels,type=CephString,n=N,req=false',
         'Add a host')
-    def _add_host(self, hostname:str, addr: Optional[str]=None, labels: Optional[List[str]]=None):
+    def _add_host(self, hostname: str, addr: Optional[str] = None, labels: Optional[List[str]] = None):
         s = HostSpec(hostname=hostname, addr=addr, labels=labels)
         completion = self.add_host(s)
         self._orchestrator_wait([completion])
@@ -366,10 +372,11 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
         'orch device ls',
         "name=hostname,type=CephString,n=N,req=false "
         "name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false "
-        "name=refresh,type=CephBool,req=false",
+        "name=refresh,type=CephBool,req=false "
+        "name=wide,type=CephBool,req=false",
         'List devices on a host')
-    def _list_devices(self, hostname=None, format='plain', refresh=False):
-        # type: (Optional[List[str]], str, bool) -> HandleCommandResult
+    def _list_devices(self, hostname=None, format='plain', refresh=False, wide=False):
+        # type: (Optional[List[str]], str, bool, bool) -> HandleCommandResult
         """
         Provide information about storage devices present in cluster hosts
 
@@ -387,32 +394,78 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
         if format != 'plain':
             return HandleCommandResult(stdout=to_format(completion.result, format, many=True, cls=InventoryHost))
         else:
-            out = []
+            display_map = {
+                "Unsupported": "N/A",
+                "N/A": "N/A",
+                "On": "On",
+                "Off": "Off",
+                True: "Yes",
+                False: "No",
+            }
 
-            table = PrettyTable(
-                ['HOST', 'PATH', 'TYPE', 'SIZE', 'DEVICE_ID', 'MODEL', 'VENDOR', 'ROTATIONAL', 'AVAIL',
-                 'REJECT REASONS'],
-                border=False)
+            out = []
+            if wide:
+                table = PrettyTable(
+                    ['Hostname', 'Path', 'Type', 'Transport', 'RPM', 'Vendor', 'Model',
+                     'Serial', 'Size', 'Health', 'Ident', 'Fault', 'Available',
+                     'Reject Reasons'],
+                    border=False)
+            else:
+                table = PrettyTable(
+                    ['Hostname', 'Path', 'Type', 'Serial', 'Size',
+                     'Health', 'Ident', 'Fault', 'Available'],
+                    border=False)
             table.align = 'l'
             table._align['SIZE'] = 'r'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for host_ in completion.result: # type: InventoryHost
+            for host_ in sorted(completion.result, key=lambda h: h.name):  # type: InventoryHost
                 for d in host_.devices.devices:  # type: Device
-                    table.add_row(
-                        (
-                            host_.name,
-                            d.path,
-                            d.human_readable_type,
-                            format_bytes(d.sys_api.get('size', 0), 5),
-                            d.device_id,
-                            d.sys_api.get('model') or 'n/a',
-                            d.sys_api.get('vendor') or 'n/a',
-                            d.sys_api.get('rotational') or 'n/a',
-                            d.available,
-                            ', '.join(d.rejected_reasons)
+
+                    led_ident = 'N/A'
+                    led_fail = 'N/A'
+                    if d.lsm_data.get('ledSupport', None):
+                        led_ident = d.lsm_data['ledSupport']['IDENTstatus']
+                        led_fail = d.lsm_data['ledSupport']['FAILstatus']
+
+                    if d.device_id is not None:
+                        fallback_serial = d.device_id.split('_')[-1]
+                    else:
+                        fallback_serial = ""
+
+                    if wide:
+                        table.add_row(
+                            (
+                                host_.name,
+                                d.path,
+                                d.human_readable_type,
+                                d.lsm_data.get('transport', 'Unknown'),
+                                d.lsm_data.get('rpm', 'Unknown'),
+                                d.sys_api.get('vendor') or 'N/A',
+                                d.sys_api.get('model') or 'N/A',
+                                d.lsm_data.get('serialNum', fallback_serial),
+                                format_dimless(d.sys_api.get('size', 0), 5),
+                                d.lsm_data.get('health', 'Unknown'),
+                                display_map[led_ident],
+                                display_map[led_fail],
+                                display_map[d.available],
+                                ', '.join(d.rejected_reasons)
+                            )
                         )
-                    )
+                    else:
+                        table.add_row(
+                            (
+                                host_.name,
+                                d.path,
+                                d.human_readable_type,
+                                d.lsm_data.get('serialNum', fallback_serial),
+                                format_dimless(d.sys_api.get('size', 0), 5),
+                                d.lsm_data.get('health', 'Unknown'),
+                                display_map[led_ident],
+                                display_map[led_fail],
+                                display_map[d.available]
+                            )
+                        )
             out.append(table.get_string())
             return HandleCommandResult(stdout='\n'.join(out))
 
@@ -465,12 +518,12 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             else:
                 return HandleCommandResult(stdout=to_format(services, format, many=True, cls=ServiceDescription))
         else:
-            now = datetime.datetime.utcnow()
+            now = datetime_now()
             table = PrettyTable(
                 ['NAME', 'RUNNING', 'REFRESHED', 'AGE',
                  'PLACEMENT',
                  'IMAGE NAME', 'IMAGE ID'
-                ],
+                 ],
                 border=False)
             table.align['NAME'] = 'l'
             table.align['RUNNING'] = 'r'
@@ -530,7 +583,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             if len(daemons) == 0:
                 return HandleCommandResult(stdout="No daemons reported")
 
-            now = datetime.datetime.utcnow()
+            now = datetime_now()
             table = PrettyTable(
                 ['NAME', 'HOST', 'STATUS', 'REFRESHED', 'AGE',
                  'VERSION', 'IMAGE NAME', 'IMAGE ID', 'CONTAINER ID'],
@@ -561,6 +614,18 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
                     ukn(s.container_image_name),
                     ukn(s.container_image_id)[0:12],
                     ukn(s.container_id)))
+
+            remove_column = 'CONTAINER ID'
+            if table.get_string(fields=[remove_column], border=False,
+                    header=False).count('<unknown>') == len(daemons):
+                try:
+                    table.del_column(remove_column)
+                except AttributeError as e:
+                    # del_column method was introduced in prettytable 2.0
+                    if str(e) != "del_column":
+                        raise
+                    table.field_names.remove(remove_column)
+                    table._rows = [row[:-1] for row in table._rows]
 
             return HandleCommandResult(stdout=table.get_string())
 
@@ -628,34 +693,36 @@ Examples:
         if inbuf:
             if unmanaged is not None:
                 return HandleCommandResult(-errno.EINVAL, stderr=usage)
+
             try:
-                drivegroups = yaml.safe_load_all(inbuf)
+                drivegroups = [_dg for _dg in yaml.safe_load_all(inbuf)]
+            except yaml.scanner.ScannerError as e:
+                msg = f"Invalid YAML received : {str(e)}"
+                self.log.exception(e)
+                return HandleCommandResult(-errno.EINVAL, stderr=msg)
 
-                dg_specs = []
-                for dg in drivegroups:
-                    spec = DriveGroupSpec.from_json(dg)
-                    if dry_run:
-                        spec.preview_only = True
-                    dg_specs.append(spec)
+            dg_specs = []
+            for dg in drivegroups:
+                spec = DriveGroupSpec.from_json(dg)
+                if dry_run:
+                    spec.preview_only = True
+                dg_specs.append(spec)
 
-                completion = self.apply(dg_specs)
+            completion = self.apply(dg_specs)
+            self._orchestrator_wait([completion])
+            raise_if_exception(completion)
+            out = completion.result_str()
+            if dry_run:
+                completion = self.plan(dg_specs)
                 self._orchestrator_wait([completion])
                 raise_if_exception(completion)
-                out = completion.result_str()
-                if dry_run:
-                    completion = self.plan(dg_specs)
-                    self._orchestrator_wait([completion])
-                    raise_if_exception(completion)
-                    data = completion.result
-                    if format == 'plain':
-                        out = preview_table_osd(data)
-                    else:
-                        out = to_format(data, format, many=True, cls=None)
-                return HandleCommandResult(stdout=out)
+                data = completion.result
+                if format == 'plain':
+                    out = generate_preview_tables(data, True)
+                else:
+                    out = to_format(data, format, many=True, cls=None)
+            return HandleCommandResult(stdout=out)
 
-            except ValueError as e:
-                msg = 'Failed to read JSON/YAML input: {}'.format(str(e)) + usage
-                return HandleCommandResult(-errno.EINVAL, stderr=msg)
         if all_available_devices:
             if unmanaged is None:
                 unmanaged = False
@@ -678,7 +745,7 @@ Examples:
                 self._orchestrator_wait([completion])
                 data = completion.result
                 if format == 'plain':
-                    out = preview_table_osd(data)
+                    out = generate_preview_tables(data , True)
                 else:
                     out = to_format(data, format, many=True, cls=None)
             return HandleCommandResult(stdout=out)
@@ -703,7 +770,8 @@ Usage:
             host_name, block_device = svc_arg.split(":")
             block_devices = block_device.split(',')
             devs = DeviceSelection(paths=block_devices)
-            drive_group = DriveGroupSpec(placement=PlacementSpec(host_pattern=host_name), data_devices=devs)
+            drive_group = DriveGroupSpec(placement=PlacementSpec(
+                host_pattern=host_name), data_devices=devs)
         except (TypeError, KeyError, ValueError):
             msg = "Invalid host:device spec: '{}'".format(svc_arg) + usage
             return HandleCommandResult(-errno.EINVAL, stderr=msg)
@@ -761,7 +829,7 @@ Usage:
             table.left_padding_width = 0
             table.right_padding_width = 2
             for osd in sorted(report, key=lambda o: o.osd_id):
-                table.add_row([osd.osd_id, osd.nodename, osd.drain_status_human(),
+                table.add_row([osd.osd_id, osd.hostname, osd.drain_status_human(),
                                osd.get_pg_count(), osd.replace, osd.replace, osd.drain_started_at])
             out = table.get_string()
 
@@ -967,7 +1035,7 @@ Usage:
         "name=name,type=CephString "
         "name=image,type=CephString,req=false",
         'Redeploy a daemon (with a specifc image)')
-    def _daemon_action_redeploy(self, name, image):
+    def _daemon_action_redeploy(self, name: str, image: Optional[str] = None) -> HandleCommandResult:
         if '.' not in name:
             raise OrchestratorError('%s is not a valid daemon name' % name)
         completion = self.daemon_action("redeploy", name, image=image)
@@ -986,7 +1054,8 @@ Usage:
                 raise OrchestratorError('%s is not a valid daemon name' % name)
             (daemon_type) = name.split('.')[0]
             if not force and daemon_type in ['osd', 'mon', 'prometheus']:
-                raise OrchestratorError('must pass --force to REMOVE daemon with potentially PRECIOUS DATA for %s' % name)
+                raise OrchestratorError(
+                    'must pass --force to REMOVE daemon with potentially PRECIOUS DATA for %s' % name)
         completion = self.remove_daemons(names)
         self._orchestrator_wait([completion])
         raise_if_exception(completion)
@@ -1022,7 +1091,7 @@ Usage:
                     inbuf: Optional[str] = None) -> HandleCommandResult:
         usage = """Usage:
   ceph orch apply -i <yaml spec> [--dry-run]
-  ceph orch apply <service_type> <placement> [--unmanaged]
+  ceph orch apply <service_type> [--placement=<placement_string>] [--unmanaged]
         """
         if inbuf:
             if service_type or placement or unmanaged:
@@ -1037,7 +1106,8 @@ Usage:
         else:
             placementspec = PlacementSpec.from_string(placement)
             assert service_type
-            specs = [ServiceSpec(service_type, placement=placementspec, unmanaged=unmanaged, preview_only=dry_run)]
+            specs = [ServiceSpec(service_type, placement=placementspec,
+                                 unmanaged=unmanaged, preview_only=dry_run)]
 
         completion = self.apply(specs)
         self._orchestrator_wait([completion])
@@ -1103,7 +1173,7 @@ Usage:
         'name=ssl,type=CephBool,req=false '
         'name=placement,type=CephString,req=false '
         'name=dry_run,type=CephBool,req=false '
-        'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false ' 
+        'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false '
         'name=unmanaged,type=CephBool,req=false',
         'Update the number of RGW instances for the given zone')
     def _apply_rgw(self,
@@ -1153,7 +1223,7 @@ Usage:
         'name=namespace,type=CephString,req=false '
         'name=placement,type=CephString,req=false '
         'name=dry_run,type=CephBool,req=false '
-        'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false ' 
+        'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false '
         'name=unmanaged,type=CephBool,req=false',
         'Scale an NFS service')
     def _apply_nfs(self,
@@ -1200,7 +1270,7 @@ Usage:
         'name=trusted_ip_list,type=CephString,req=false '
         'name=placement,type=CephString,req=false '
         'name=dry_run,type=CephBool,req=false '
-        'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false ' 
+        'name=format,type=CephChoices,strings=plain|json|json-pretty|yaml,req=false '
         'name=unmanaged,type=CephBool,req=false',
         'Scale an iSCSI service')
     def _apply_iscsi(self,
@@ -1377,8 +1447,8 @@ Usage:
         """
         if image and re.match(r'^v?\d+\.\d+\.\d+$', image) and ceph_version is None:
             ver = image[1:] if image.startswith('v') else image
-            s =  f"Error: unable to pull image name `{image}`.\n" \
-                 f"  Maybe you meant `--ceph-version {ver}`?"
+            s = f"Error: unable to pull image name `{image}`.\n" \
+                f"  Maybe you meant `--ceph-version {ver}`?"
             raise OrchestratorValidationError(s)
 
     @_cli_write_command(

@@ -519,6 +519,13 @@ class VolumeGroup(object):
         return int(self.vg_extent_size) * int(self.vg_free_count)
 
     @property
+    def free_percent(self):
+        """
+        Return free space in VG in bytes
+        """
+        return int(self.vg_free_count) / int(self.vg_extent_count)
+
+    @property
     def size(self):
         """
         Returns VG size in bytes
@@ -581,15 +588,37 @@ class VolumeGroup(object):
 
     def bytes_to_extents(self, size):
         '''
-        Return a how many extents we can fit into a size in bytes.
+        Return a how many free extents we can fit into a size in bytes. This has
+        some uncertainty involved. If size/extent_size is within 1% of the
+        actual free extents we will return the extent count, otherwise we'll
+        throw an error.
+        This accomodates for the size calculation in batch. We need to report
+        the OSD layout but have not yet created any LVM structures. We use the
+        disk size in batch if no VG is present and that will overshoot the
+        actual free_extent count due to LVM overhead.
+
         '''
-        return int(size / int(self.vg_extent_size))
+        b_to_ext = int(size / int(self.vg_extent_size))
+        if b_to_ext < int(self.vg_free_count):
+            # return bytes in extents if there is more space
+            return b_to_ext
+        elif b_to_ext / int(self.vg_free_count) - 1 < 0.01:
+            # return vg_fre_count if its less then 1% off
+            logger.info(
+                'bytes_to_extents results in {} but only {} '
+                'are available, adjusting the latter'.format(b_to_ext,
+                                                             self.vg_free_count))
+            return int(self.vg_free_count)
+        # else raise an exception
+        raise RuntimeError('Can\'t convert {} to free extents, only {} ({} '
+                           'bytes) are free'.format(size, self.vg_free_count,
+                                                    self.free))
 
     def slots_to_extents(self, slots):
         '''
         Return how many extents fit the VG slot times
         '''
-        return int(int(self.vg_free_count) / slots)
+        return int(int(self.vg_extent_count) / slots)
 
 
 def create_vg(devices, name=None, name_prefix=None):
@@ -740,7 +769,8 @@ def get_device_vgs(device, name_prefix=''):
 ###############################
 
 LV_FIELDS = 'lv_tags,lv_path,lv_name,vg_name,lv_uuid,lv_size'
-LV_CMD_OPTIONS =  ['--noheadings', '--readonly', '--separator=";"', '-a']
+LV_CMD_OPTIONS =  ['--noheadings', '--readonly', '--separator=";"', '-a',
+                   '--units=b', '--nosuffix']
 
 
 class Volume(object):

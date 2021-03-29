@@ -7,6 +7,8 @@ import time
 from six import StringIO
 from textwrap import dedent
 import os
+
+from teuthology.misc import sudo_write_file
 from teuthology.orchestra import run
 from teuthology.orchestra.run import CommandFailedError, ConnectionLostError, Raw
 from tasks.cephfs.filesystem import Filesystem
@@ -173,6 +175,29 @@ class CephFSMount(object):
             if r.exitstatus != 0:
                 raise RuntimeError("Expected file {0} not found".format(suffix))
 
+    def write_file(self, path, data, perms=None):
+        """
+        Write the given data at the given path and set the given perms to the
+        file on the path.
+        """
+        if path.find(self.mountpoint) == -1:
+            path = os.path.join(self.mountpoint, path)
+
+        sudo_write_file(self.client_remote, path, data)
+
+        if perms:
+            self.run_shell(args=f'chmod {perms} {path}')
+
+    def read_file(self, path):
+        """
+        Return the data from the file on given path.
+        """
+        if path.find(self.mountpoint) == -1:
+            path = os.path.join(self.mountpoint, path)
+
+        return self.run_shell(args=['sudo', 'cat', path], omit_sudo=False).\
+            stdout.getvalue().strip()
+
     def create_destroy(self):
         assert(self.is_mounted())
 
@@ -201,7 +226,7 @@ class CephFSMount(object):
         return self.run_shell(["bash", "-c", Raw(f"'{payload}'")], **kwargs)
 
     def run_shell(self, args, wait=True, stdin=None, check_status=True,
-                  omit_sudo=True):
+                  omit_sudo=True, timeout=10800):
         if isinstance(args, str):
             args = args.split()
 
@@ -209,7 +234,8 @@ class CephFSMount(object):
         return self.client_remote.run(args=args, stdout=StringIO(),
                                       stderr=StringIO(), wait=wait,
                                       stdin=stdin, check_status=check_status,
-                                      omit_sudo=omit_sudo)
+                                      omit_sudo=omit_sudo,
+                                      timeout=timeout)
 
     def open_no_data(self, basename):
         """
@@ -484,13 +510,14 @@ class CephFSMount(object):
             n = {count}
             abs_path = "{abs_path}"
 
-            if not os.path.exists(os.path.dirname(abs_path)):
-                os.makedirs(os.path.dirname(abs_path))
+            if not os.path.exists(abs_path):
+                os.makedirs(abs_path)
 
             handles = []
             for i in range(0, n):
-                fname = "{{0}}_{{1}}".format(abs_path, i)
-                handles.append(open(fname, 'w'))
+                fname = "file_"+str(i)
+                path = os.path.join(abs_path, fname)
+                handles.append(open(path, 'w'))
 
             while True:
                 time.sleep(1)

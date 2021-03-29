@@ -145,7 +145,7 @@
             class="tc_submenuitem tc_submenuitem_modules"
             *ngIf="permissions.configOpt.read">
           <a i18n
-             routerLink="/mgr-modules">Manager modules</a>
+             routerLink="/mgr-modules">Manager Modules</a>
         </li>
         <li routerLinkActive="active"
             class="tc_submenuitem tc_submenuitem_log"
@@ -158,8 +158,8 @@
             *ngIf="permissions.prometheus.read">
           <a routerLink="/monitoring">
             <ng-container i18n>Monitoring</ng-container>
-            <small *ngIf="prometheusAlertService.alerts.length > 0"
-                   class="badge badge-danger">{{ prometheusAlertService.alerts.length }}</small>
+            <small *ngIf="prometheusAlertService.activeAlerts > 0"
+                   class="badge badge-danger">{{ prometheusAlertService.activeAlerts }}</small>
           </a>
         </li>
       </ul>

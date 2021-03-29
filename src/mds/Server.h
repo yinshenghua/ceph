@@ -77,6 +77,7 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
+  l_mdss_cap_acquisition_throttle,
   l_mdss_last,
 };
 
@@ -164,7 +165,6 @@ public:
   void set_trace_dist(const ref_t<MClientReply> &reply, CInode *in, CDentry *dn,
 		      MDRequestRef& mdr);
 
-
   void handle_slave_request(const cref_t<MMDSSlaveRequest> &m);
   void handle_slave_request_reply(const cref_t<MMDSSlaveRequest> &m);
   void dispatch_slave_request(MDRequestRef& mdr);
@@ -234,7 +234,7 @@ public:
 
   // link
   void handle_client_link(MDRequestRef& mdr);
-  void _link_local(MDRequestRef& mdr, CDentry *dn, CInode *targeti);
+  void _link_local(MDRequestRef& mdr, CDentry *dn, CInode *targeti, SnapRealm *target_realm);
   void _link_local_finish(MDRequestRef& mdr, CDentry *dn, CInode *targeti,
 			  version_t, version_t, bool);
 
@@ -319,8 +319,7 @@ private:
   friend class Batch_Getattr_Lookup;
 
   void reply_client_request(MDRequestRef& mdr, const ref_t<MClientReply> &reply);
-  void flush_session(Session *session, MDSGatherBuilder *gather);
-  void clear_batch_ops(const MDRequestRef& mdr);
+  void flush_session(Session *session, MDSGatherBuilder& gather);
 
   MDSRank *mds;
   MDCache *mdcache;
@@ -342,6 +341,7 @@ private:
   feature_bitset_t supported_features;
   feature_bitset_t required_client_features;
 
+  bool forward_all_requests_to_auth = false;
   bool replay_unsafe_with_closed_session = false;
   double cap_revoke_eviction_timeout = 0;
   uint64_t max_snaps_per_dir = 100;
@@ -349,6 +349,12 @@ private:
 
   DecayCounter recall_throttle;
   time last_recall_state;
+
+  // Cache cap acquisition throttle configs
+  uint64_t max_caps_per_client;
+  uint64_t cap_acquisition_throttle;
+  double max_caps_throttle_ratio;
+  double caps_throttle_retry_request_timeout;
 };
 
 static inline constexpr auto operator|(Server::RecallFlags a, Server::RecallFlags b) {

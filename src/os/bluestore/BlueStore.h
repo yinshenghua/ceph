@@ -135,7 +135,10 @@ enum {
   l_bluestore_omap_upper_bound_lat,
   l_bluestore_omap_lower_bound_lat,
   l_bluestore_omap_next_lat,
+  l_bluestore_omap_get_keys_lat,
+  l_bluestore_omap_get_values_lat,
   l_bluestore_clist_lat,
+  l_bluestore_remove_lat,
   l_bluestore_last
 };
 
@@ -280,7 +283,7 @@ public:
 	boost::intrusive::list_member_hook<>,
 	&Buffer::state_item> > state_list_t;
 
-    mempool::bluestore_cache_other::map<uint32_t, std::unique_ptr<Buffer>>
+    mempool::bluestore_cache_meta::map<uint32_t, std::unique_ptr<Buffer>>
       buffer_map;
 
     // we use a bare intrusive list here instead of std::map because
@@ -469,7 +472,7 @@ public:
 
     // we use a bare pointer because we don't want to affect the ref
     // count
-    mempool::bluestore_cache_other::unordered_map<uint64_t,SharedBlob*> sb_map;
+    mempool::bluestore_cache_meta::unordered_map<uint64_t,SharedBlob*> sb_map;
 
     SharedBlobRef lookup(uint64_t sbid) {
       std::lock_guard l(lock);
@@ -684,7 +687,7 @@ public:
 #endif
   };
   typedef boost::intrusive_ptr<Blob> BlobRef;
-  typedef mempool::bluestore_cache_other::map<int,BlobRef> blob_map_t;
+  typedef mempool::bluestore_cache_meta::map<int,BlobRef> blob_map_t;
 
   /// a logical extent, pointing to (some portion of) a blob
   typedef boost::intrusive::set_base_hook<boost::intrusive::optimize_size<true> > ExtentBase; //making an alias to avoid build warnings
@@ -792,7 +795,7 @@ public:
       bool loaded = false;   ///< true if shard is loaded
       bool dirty = false;    ///< true if shard is dirty and needs reencoding
     };
-    mempool::bluestore_cache_other::vector<Shard> shards;    ///< shards
+    mempool::bluestore_cache_meta::vector<Shard> shards;    ///< shards
 
     bufferlist inline_bl;    ///< cached encoded map, if unsharded; empty=>dirty
 
@@ -1059,7 +1062,7 @@ public:
     ghobject_t oid;
 
     /// key under PREFIX_OBJ where we are stored
-    mempool::bluestore_cache_other::string key;
+    mempool::bluestore_cache_meta::string key;
 
     boost::intrusive::list_member_hook<> lru_item;
 
@@ -1068,7 +1071,7 @@ public:
     bool cached;              ///< Onode is logically in the cache
                               /// (it can be pinned and hence physically out
                               /// of it at the moment though)
-    bool pinned;              ///< Onode is pinned
+    std::atomic_bool pinned;  ///< Onode is pinned
                               /// (or should be pinned when cached)
     ExtentMap extent_map;
 
@@ -1081,7 +1084,7 @@ public:
     ceph::condition_variable flush_cond;   ///< wait here for uncommitted txns
 
     Onode(Collection *c, const ghobject_t& o,
-	  const mempool::bluestore_cache_other::string& k)
+	  const mempool::bluestore_cache_meta::string& k)
       : nref(0),
 	c(c),
 	oid(o),
@@ -1211,20 +1214,7 @@ public:
                                    PerfCounters *logger);
     virtual void _add(Onode* o, int level) = 0;
     virtual void _rm(Onode* o) = 0;
-
-    void pin(Onode* o, std::function<bool ()> validator) {
-      std::lock_guard l(lock);
-      if (validator()) {
-        _pin(o);
-      }
-    }
-
-    void unpin(Onode* o, std::function<bool()> validator) {
-      std::lock_guard l(lock);
-      if (validator()) {
-        _unpin(o);
-      }
-    }
+    virtual void _unpin_and_rm(Onode* o) = 0;
 
     virtual void move_pinned(OnodeCacheShard *to, Onode *o) = 0;
     virtual void add_stats(uint64_t *onodes, uint64_t *pinned_onodes) = 0;
@@ -1283,10 +1273,10 @@ public:
 
   private:
     /// forward lookups
-    mempool::bluestore_cache_other::unordered_map<ghobject_t,OnodeRef> onode_map;
+    mempool::bluestore_cache_meta::unordered_map<ghobject_t,OnodeRef> onode_map;
 
-    friend class Collection; // for split_cache()
-
+    friend struct Collection; // for split_cache()
+    friend struct Onode; // for put()
     friend struct LruOnodeCacheShard;
     void _remove(const ghobject_t& oid);
   public:
@@ -1299,7 +1289,7 @@ public:
     OnodeRef lookup(const ghobject_t& o);
     void rename(OnodeRef& o, const ghobject_t& old_oid,
 		const ghobject_t& new_oid,
-		const mempool::bluestore_cache_other::string& new_okey);
+		const mempool::bluestore_cache_meta::string& new_okey);
     void clear();
     bool empty();
 
@@ -1307,7 +1297,7 @@ public:
     void dump(CephContext *cct);
 
     /// return true if f true for any item
-    bool map_any(std::function<bool(OnodeRef)> f);
+    bool map_any(std::function<bool(Onode*)> f);
   };
 
   class OpSequencer;
@@ -2161,8 +2151,14 @@ private:
       MetaCache(BlueStore *s) : MempoolCache(s) {};
 
       virtual uint64_t _get_used_bytes() const {
-        return mempool::bluestore_cache_other::allocated_bytes() +
-            mempool::bluestore_cache_onode::allocated_bytes();
+        return mempool::bluestore_Buffer::allocated_bytes() +
+          mempool::bluestore_Blob::allocated_bytes() +
+          mempool::bluestore_Extent::allocated_bytes() +
+          mempool::bluestore_cache_meta::allocated_bytes() +
+          mempool::bluestore_cache_other::allocated_bytes() +
+	   mempool::bluestore_cache_onode::allocated_bytes() +
+          mempool::bluestore_SharedBlob::allocated_bytes() +
+          mempool::bluestore_inline_bl::allocated_bytes();
       }
 
       virtual string get_cache_name() const {
@@ -2423,7 +2419,7 @@ private:
 
   int _collection_list(
     Collection *c, const ghobject_t& start, const ghobject_t& end,
-    int max, vector<ghobject_t> *ls, ghobject_t *next);
+    int max, bool legacy, vector<ghobject_t> *ls, ghobject_t *next);
 
   template <typename T, typename F>
   T select_option(const std::string& opt_name, T val1, F f) {
@@ -2744,6 +2740,13 @@ public:
 		      int max,
 		      vector<ghobject_t> *ls, ghobject_t *next) override;
 
+  int collection_list_legacy(CollectionHandle &c,
+                             const ghobject_t& start,
+                             const ghobject_t& end,
+                             int max,
+                             vector<ghobject_t> *ls,
+                             ghobject_t *next) override;
+
   int omap_get(
     CollectionHandle &c,     ///< [in] Collection containing oid
     const ghobject_t &oid,   ///< [in] Object containing omap
@@ -2870,6 +2873,7 @@ public:
   void inject_misreference(coll_t cid1, ghobject_t oid1,
 			   coll_t cid2, ghobject_t oid2,
 			   uint64_t offset);
+  void inject_zombie_spanning_blob(coll_t cid, ghobject_t oid, int16_t blob_id);
   // resets global per_pool_omap in DB
   void inject_legacy_omap();
   // resets per_pool_omap | pgmeta_omap for onode
@@ -3517,6 +3521,7 @@ public:
 		      FreelistManager* fm,
 		      uint64_t offset, uint64_t len);
   bool fix_bluefs_extents(std::atomic<uint64_t>& out_of_sync_flag);
+  KeyValueDB::Transaction fix_spanning_blobs(KeyValueDB* db);
 
   void init(uint64_t total_space, uint64_t lres_tracking_unit_size);
 
@@ -3555,6 +3560,7 @@ private:
   KeyValueDB::Transaction fix_shared_blob_txn;
 
   KeyValueDB::Transaction fix_misreferences_txn;
+  KeyValueDB::Transaction fix_onode_txn;
 
   StoreSpaceTracker space_usage_tracker;
 

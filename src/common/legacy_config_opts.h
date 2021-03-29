@@ -82,6 +82,7 @@ SAFE_OPTION(plugin_dir, OPT_STR)
 
 OPTION(compressor_zlib_isal, OPT_BOOL)
 OPTION(compressor_zlib_level, OPT_INT) //regular zlib compression level, not applicable to isa-l optimized version
+OPTION(compressor_zstd_level, OPT_INT) //regular zstd compression level
 
 OPTION(qat_compressor_enabled, OPT_BOOL)
 
@@ -261,6 +262,7 @@ OPTION(mon_reweight_max_change, OPT_DOUBLE)
 OPTION(mon_health_to_clog, OPT_BOOL)
 OPTION(mon_health_to_clog_interval, OPT_INT)
 OPTION(mon_health_to_clog_tick_interval, OPT_DOUBLE)
+OPTION(mon_health_detail_to_clog, OPT_BOOL)
 OPTION(mon_data_avail_crit, OPT_INT)
 OPTION(mon_data_avail_warn, OPT_INT)
 OPTION(mon_data_size_warn, OPT_U64) // issue a warning when the monitor's data store goes over 15GB (in bytes)
@@ -896,6 +898,8 @@ OPTION(bdev_nvme_unbind_from_kernel, OPT_BOOL)
 OPTION(bdev_nvme_retry_count, OPT_INT) // -1 means by default which is 4
 OPTION(bdev_enable_discard, OPT_BOOL)
 OPTION(bdev_async_discard, OPT_BOOL)
+OPTION(bdev_flock_retry_interval, OPT_FLOAT)
+OPTION(bdev_flock_retry, OPT_INT)
 
 OPTION(objectstore_blackhole, OPT_BOOL)
 
@@ -911,10 +915,10 @@ OPTION(bluefs_compact_log_sync, OPT_BOOL)  // sync or async log compaction?
 OPTION(bluefs_buffered_io, OPT_BOOL)
 OPTION(bluefs_sync_write, OPT_BOOL)
 OPTION(bluefs_allocator, OPT_STR)     // stupid | bitmap
-OPTION(bluefs_preextend_wal_files, OPT_BOOL)  // this *requires* that rocksdb has recycling enabled
 OPTION(bluefs_log_replay_check_allocations, OPT_BOOL)
 OPTION(bluefs_replay_recovery, OPT_BOOL)
 OPTION(bluefs_replay_recovery_disable_compact, OPT_BOOL)
+OPTION(bluefs_check_for_zeros, OPT_BOOL)
 
 OPTION(bluestore_bluefs, OPT_BOOL)
 OPTION(bluestore_bluefs_env_mirror, OPT_BOOL) // mirror to normal Env for debug
@@ -1011,6 +1015,7 @@ OPTION(bluestore_bitmapallocator_span_size, OPT_INT) // must be power of 2 align
 OPTION(bluestore_max_deferred_txc, OPT_U64)
 OPTION(bluestore_max_defer_interval, OPT_U64)
 OPTION(bluestore_rocksdb_options, OPT_STR)
+OPTION(bluestore_rocksdb_options_annex, OPT_STR)
 OPTION(bluestore_fsck_on_mount, OPT_BOOL)
 OPTION(bluestore_fsck_on_mount_deep, OPT_BOOL)
 OPTION(bluestore_fsck_quick_fix_on_mount, OPT_BOOL)
@@ -1062,6 +1067,7 @@ OPTION(bluestore_debug_enforce_settings, OPT_STR)
 OPTION(bluestore_volume_selection_policy, OPT_STR)
 OPTION(bluestore_volume_selection_reserved_factor, OPT_DOUBLE)
 OPTION(bluestore_volume_selection_reserved, OPT_INT)
+OPTION(bluestore_kv_sync_util_logging_s, OPT_DOUBLE)
 
 OPTION(kstore_max_ops, OPT_U64)
 OPTION(kstore_max_bytes, OPT_U64)
@@ -1239,8 +1245,6 @@ OPTION(journal_discard, OPT_BOOL) //using ssd disk as journal, whether support d
 
 OPTION(fio_dir, OPT_STR) // fio data directory for fio-objectstore
 
-OPTION(rados_mon_op_timeout, OPT_DOUBLE) // how many seconds to wait for a response from the monitor before returning an error from a rados operation. 0 means no limit.
-OPTION(rados_osd_op_timeout, OPT_DOUBLE) // how many seconds to wait for a response from osds before returning an error from a rados operation. 0 means no limit.
 OPTION(rados_tracing, OPT_BOOL) // true if LTTng-UST tracepoints should be enabled
 
 
@@ -1444,6 +1448,7 @@ OPTION(rgw_curl_low_speed_limit, OPT_INT) // low speed limit for certain curl ca
 OPTION(rgw_curl_low_speed_time, OPT_INT) // low speed time for certain curl calls
 OPTION(rgw_copy_obj_progress, OPT_BOOL) // should dump progress during long copy operations?
 OPTION(rgw_copy_obj_progress_every_bytes, OPT_INT) // min bytes between copy progress output
+OPTION(rgw_sync_obj_etag_verify, OPT_BOOL) // verify if the copied object from remote is identical to source
 OPTION(rgw_obj_tombstone_cache_size, OPT_INT) // how many objects in tombstone cache, which is used in multi-zone sync to keep
                                                     // track of removed objects' mtime
 

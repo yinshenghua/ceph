@@ -414,10 +414,8 @@ Base is the package that includes all the files shared amongst ceph servers
 
 %package -n cephadm
 Summary:        Utility to bootstrap Ceph clusters
+BuildArch:      noarch
 Requires:       lvm2
-%if 0%{?suse_version}
-Requires:       apparmor-abstractions
-%endif
 Requires:       python%{python3_pkgversion}
 %if 0%{?weak_deps}
 Recommends:     podman
@@ -475,6 +473,14 @@ Group:		System/Filesystems
 %endif
 Provides:	ceph-test:/usr/bin/ceph-monstore-tool
 Requires:	ceph-base = %{_epoch_prefix}%{version}-%{release}
+%if 0%{?weak_deps}
+Recommends:	nvme-cli
+%if 0%{?suse_version}
+Requires:       smartmontools
+%else
+Recommends:	smartmontools
+%endif
+%endif
 %description mon
 ceph-mon is the cluster monitor daemon for the Ceph distributed file
 system. One or more instances of ceph-mon form a Paxos part-time
@@ -720,6 +726,9 @@ Requires:	librgw2 = %{_epoch_prefix}%{version}-%{release}
 %if 0%{?rhel} || 0%{?fedora}
 Requires:	mailcap
 %endif
+%if 0%{?weak_deps}
+Recommends:	gawk
+%endif
 %description radosgw
 RADOS is a distributed object store used by the Ceph distributed
 storage system.  This package provides a REST gateway to the
@@ -751,6 +760,14 @@ Requires:	lvm2
 Requires:	sudo
 Requires:	libstoragemgmt
 Requires:	python%{python3_pkgversion}-ceph-common = %{_epoch_prefix}%{version}-%{release}
+%if 0%{?weak_deps}
+Recommends:	nvme-cli
+%if 0%{?suse_version}
+Requires:       smartmontools
+%else
+Recommends:	smartmontools
+%endif
+%endif
 %description osd
 ceph-osd is the object storage daemon for the Ceph distributed file
 system.  It is responsible for storing objects on a local file system
@@ -1301,8 +1318,7 @@ ln -sf %{_sbindir}/mount.ceph %{buildroot}/sbin/mount.ceph
 install -m 0644 -D udev/50-rbd.rules %{buildroot}%{_udevrulesdir}/50-rbd.rules
 
 # sudoers.d
-install -m 0600 -D sudoers.d/ceph-osd-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-osd-smartctl
-install -m 0600 -D sudoers.d/cephadm %{buildroot}%{_sysconfdir}/sudoers.d/cephadm
+install -m 0440 -D sudoers.d/ceph-osd-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-osd-smartctl
 
 %if 0%{?rhel} >= 8
 pathfix.py -pni "%{__python3} %{py3_shbang_opts}" %{buildroot}%{_bindir}/*
@@ -1459,7 +1475,6 @@ exit 0
 %files -n cephadm
 %{_sbindir}/cephadm
 %{_mandir}/man8/cephadm.8*
-%{_sysconfdir}/sudoers.d/cephadm
 %attr(0700,cephadm,cephadm) %dir %{_sharedstatedir}/cephadm
 %attr(0700,cephadm,cephadm) %dir %{_sharedstatedir}/cephadm/.ssh
 %attr(0600,cephadm,cephadm) %{_sharedstatedir}/cephadm/.ssh/authorized_keys
@@ -1931,6 +1946,8 @@ fi
 %{_bindir}/radosgw-token
 %{_bindir}/radosgw-es
 %{_bindir}/radosgw-object-expirer
+%{_bindir}/rgw-gap-list
+%{_bindir}/rgw-gap-list-comparator
 %{_bindir}/rgw-orphan-list
 %{_libdir}/libradosgw.so*
 %{_mandir}/man8/radosgw.8*
@@ -2139,7 +2156,6 @@ fi
 
 %files -n librgw2
 %{_libdir}/librgw.so.*
-%{_libdir}/librgw_admin_user.so.*
 %if %{with lttng}
 %{_libdir}/librgw_op_tp.so.*
 %{_libdir}/librgw_rados_tp.so.*
@@ -2152,10 +2168,8 @@ fi
 %files -n librgw-devel
 %dir %{_includedir}/rados
 %{_includedir}/rados/librgw.h
-%{_includedir}/rados/librgw_admin_user.h
 %{_includedir}/rados/rgw_file.h
 %{_libdir}/librgw.so
-%{_libdir}/librgw_admin_user.so
 %if %{with lttng}
 %{_libdir}/librgw_op_tp.so
 %{_libdir}/librgw_rados_tp.so

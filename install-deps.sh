@@ -153,13 +153,21 @@ function install_pkg_on_ubuntu {
 }
 
 function install_boost_on_ubuntu {
-    local codename=$1
-    if apt -qq list ceph-libboost1.67-dev 2>/dev/null | grep -q installed; then
-	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove 'ceph-libboost.*1.67.*'
-	$SUDO rm /etc/apt/sources.list.d/ceph-libboost1.67.list
-    fi
-    local project=libboost
     local ver=1.72
+    local installed_ver=$(apt -qq list --installed ceph-libboost*-dev 2>/dev/null |
+                              grep -e 'libboost[0-9].[0-9]\+-dev' |
+                              cut -d' ' -f2 |
+                              cut -d'.' -f1,2)
+    if test -n "$installed_ver"; then
+        if echo "$installed_ver" | grep -q "^$ver"; then
+            return
+        else
+            $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove "ceph-libboost.*${installed_ver}.*"
+            $SUDO rm -f /etc/apt/sources.list.d/ceph-libboost${installed_ver}.list
+        fi
+    fi
+    local codename=$1
+    local project=libboost
     local sha1=1d7c7a00cc3f37e340bae0360191a757b44ec80c
     install_pkg_on_ubuntu \
 	$project \
@@ -365,7 +373,8 @@ else
 			  --enable rhel-7-server-devtools-rpms
                     dts_ver=8
                 elif test $ID = centos -a $MAJOR_VERSION = 8 ; then
-                    $SUDO dnf config-manager --set-enabled PowerTools
+                    # Enable 'powertools' or 'PowerTools' repo
+                    $SUDO dnf config-manager --set-enabled $(dnf repolist --all 2>/dev/null|gawk 'tolower($0) ~ /^powertools\s/{print $1}')
 		    # before EPEL8 and PowerTools provide all dependencies, we use sepia for the dependencies
                     $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
                     $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
