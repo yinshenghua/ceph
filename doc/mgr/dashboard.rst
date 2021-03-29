@@ -62,10 +62,9 @@ aspects of your Ceph cluster:
 * **Overall cluster health**: Display overall cluster status, performance
   and capacity metrics.
 * **Embedded Grafana Dashboards**: Ceph Dashboard is capable of embedding
-  `Grafana <https://grafana.com>`_ dashboards in many locations, to display
-  additional information and performance metrics gathered by the
-  :ref:`mgr-prometheus`. See :ref:`dashboard-grafana` for details on how to
-  configure this functionality.
+  `Grafana`_ dashboards in many locations, to display additional information
+  and performance metrics gathered by the :ref:`mgr-prometheus`. See
+  :ref:`dashboard-grafana` for details on how to configure this functionality.
 * **Cluster logs**: Display the latest updates to the cluster's event and
   audit log files. Log entries can be filtered by priority, date or keyword.
 * **Hosts**: Display a list of all hosts associated to the cluster, which
@@ -257,7 +256,7 @@ section.
 To create a user with the administrator role you can use the following
 commands::
 
-  $ ceph dashboard ac-user-create <username> <password> administrator
+  $ ceph dashboard ac-user-create <username> -i <file-containing-password> administrator
 
 .. _dashboard-enabling-object-gateway:
 
@@ -284,8 +283,8 @@ The credentials of an existing user can also be obtained by using
 
 Finally, provide the credentials to the dashboard::
 
-  $ ceph dashboard set-rgw-api-access-key <access_key>
-  $ ceph dashboard set-rgw-api-secret-key <secret_key>
+  $ ceph dashboard set-rgw-api-access-key -i <file-containing-access-key>
+  $ ceph dashboard set-rgw-api-secret-key -i <file-containing-secret-key>
 
 In a typical default configuration with a single RGW endpoint, this is all you
 have to do to get the Object Gateway management functionality working. The
@@ -345,15 +344,41 @@ To disable API SSL verification run the following commmand::
 
 The available iSCSI gateways must be defined using the following commands::
 
-    $ ceph dashboard iscsi-gateway-list
-    $ ceph dashboard iscsi-gateway-add <scheme>://<username>:<password>@<host>[:port]
-    $ ceph dashboard iscsi-gateway-rm <gateway_name>
+  $ ceph dashboard iscsi-gateway-list
+  $ # Gateway URL format for a new gateway: <scheme>://<username>:<password>@<host>[:port]
+  $ ceph dashboard iscsi-gateway-add -i <file-containing-gateway-url> [<gateway_name>]
+  $ ceph dashboard iscsi-gateway-rm <gateway_name>
 
 
 .. _dashboard-grafana:
 
 Enabling the Embedding of Grafana Dashboards
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+`Grafana`_ requires data from `Prometheus <https://prometheus.io/>`_. Although
+Grafana can use other data sources, the Grafana dashboards we provide contain
+queries that are specific to Prometheus. Our Grafana dashboards therefore
+require Prometheus as the data source. The Ceph :ref:`mgr-prometheus` also only
+exports its data in the Prometheus' common format. The Grafana dashboards rely
+on metric names from the Prometheus module and `Node exporter
+<https://prometheus.io/docs/guides/node-exporter/>`_. The Node exporter is a
+separate application that provides machine metrics.
+
+.. note::
+
+  Prometheus' security model presumes that untrusted users have access to the
+  Prometheus HTTP endpoint and logs. Untrusted users have access to all the
+  (meta)data Prometheus collects that is contained in the database, plus a
+  variety of operational and debugging information.
+
+  However, Prometheus' HTTP API is limited to read-only operations.
+  Configurations can *not* be changed using the API and secrets are not
+  exposed. Moreover, Prometheus has some built-in measures to mitigate the
+  impact of denial of service attacks.
+
+  Please see `Prometheus' Security model
+  <https://prometheus.io/docs/operating/security/>` for more detailed
+  information.
 
 Grafana and Prometheus are likely going to be bundled and installed by some
 orchestration tools along Ceph in the near future, but currently, you will have
@@ -414,7 +439,8 @@ More details can be found in the documentation of the :ref:`mgr-prometheus`.
 After you have set up Grafana and Prometheus, you will need to configure the
 connection information that the Ceph Dashboard will use to access Grafana.
 
-You need to tell the dashboard on which url Grafana instance is running/deployed::
+You need to tell the dashboard on which URL the Grafana instance is
+running/deployed::
 
   $ ceph dashboard set-grafana-api-url <grafana-server-url>  # default: ''
 
@@ -436,6 +462,35 @@ e.g. caused by certificates signed by unknown CA or not matching the host name::
   $ ceph dashboard set-grafana-api-ssl-verify False
 
 You can directly access Grafana Instance as well to monitor your cluster.
+
+Alternative URL for Browsers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The Ceph Dashboard backend requires the Grafana URL to be able to verify the
+existence of Grafana Dashboards before the frontend even loads them. Due to the
+nature of how Grafana is implemented in Ceph Dashboard, this means that two
+working connections are required in order to be able to see Grafana graphs in
+Ceph Dashboard:
+
+- The backend (Ceph Mgr module) needs to verify the existence of the requested
+  graph. If this request succeeds, it lets the frontend know that it can safely
+  access Grafana.
+- The frontend then requests the Grafana graphs directly from the user's
+  browser using an iframe. The Grafana instance is accessed directly without any
+  detour through Ceph Dashboard.
+
+Now, it might be the case that your environment makes it difficult for the
+user's browser to directly access the URL configured in Ceph Dashboard. To solve
+this issue, a separate URL can be configured which will solely be used to tell
+the frontend (the user's browser) which URL it should use to access Grafana.
+
+To change the URL that is returned to the frontend issue the following command::
+
+  $ ceph dashboard set-grafana-frontend-api-url <grafana-server-url>
+
+If no value is set for that option, it will simply fall back to the value of the
+GRAFANA_API_URL option. If set, it will instruct the browser to use this URL to
+access Grafana.
 
 .. _dashboard-sso-support:
 
@@ -622,7 +677,7 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Create User*::
 
-  $ ceph dashboard ac-user-create <username> [<password>] [<rolename>] [<name>] [<email>]
+  $ ceph dashboard ac-user-create <username> -i <file-containing-password> [<rolename>] [<name>] [<email>]
 
 - *Delete User*::
 
@@ -630,7 +685,7 @@ We provide a set of CLI commands to manage user accounts:
 
 - *Change Password*::
 
-  $ ceph dashboard ac-user-set-password <username> <password>
+  $ ceph dashboard ac-user-set-password <username> -i <file-containing-password>
 
 - *Modify User (name, and email)*::
 
@@ -757,7 +812,7 @@ view and create Ceph pools, and have read-only access to any other scopes.
 
 1. *Create the user*::
 
-   $ ceph dashboard ac-user-create bob mypassword
+   $ ceph dashboard ac-user-create bob -i <file-containing-password>
 
 2. *Create role and specify scope permissions*::
 
@@ -969,5 +1024,7 @@ Plug-ins
 
 Dashboard Plug-ins allow to extend the functionality of the dashboard in a modular
 and loosely coupled approach.
+
+.. _Grafana: https://grafana.com/
 
 .. include:: dashboard_plugins/feature_toggles.inc.rst

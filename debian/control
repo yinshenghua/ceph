@@ -51,6 +51,10 @@ Build-Depends: cmake (>= 3.5),
                libxml2-dev,
                librabbitmq-dev,
                librdkafka-dev,
+# Make-Check   libxmlsec1
+# Make-Check   libxmlsec1-nss
+# Make-Check   libxmlsec1-openssl
+# Make-Check   libxmlsec1-dev
                lsb-release,
                parted,
                patch,
@@ -366,6 +370,8 @@ Depends: ceph-base (= ${binary:Version}),
          ${shlibs:Depends},
 Replaces: ceph (<< 10), ceph-test (<< 12.2.2-14)
 Breaks: ceph (<< 10), ceph-test (<< 12.2.2-14)
+Recommends: nvme-cli,
+            smartmontools,
 Description: OSD server for the ceph storage system
  Ceph is a massively scalable, open-source, distributed
  storage system that runs on commodity hardware and delivers object,

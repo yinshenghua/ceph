@@ -547,7 +547,7 @@ int Image<I>::deep_copy(I *src, librados::IoCtx& dest_md_ctx,
       return -EBUSY;
     }
 
-    features = (src->features & ~RBD_FEATURES_IMPLICIT_ENABLE);
+    features = src->features;
     src_size = src->get_image_size(src->snap_id);
   }
   uint64_t format = 2;
@@ -680,7 +680,7 @@ int Image<I>::deep_copy(I *src, I *dest, bool flatten,
   C_SaferCond cond;
   SnapSeqs snap_seqs;
   auto req = DeepCopyRequest<I>::create(src, dest, snap_id_start, snap_id_end,
-                                        flatten, boost::none, op_work_queue,
+                                        0U, flatten, boost::none, op_work_queue,
                                         &snap_seqs, &prog_ctx, &cond);
   req->send();
   int r = cond.wait();

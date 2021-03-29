@@ -3349,7 +3349,8 @@ void PG::_update_calc_stats()
       // Primary should not be in the peer_info, skip if it is.
       if (peer.first == pg_whoami) continue;
       int64_t missing = 0;
-      int64_t peer_num_objects = peer.second.stats.stats.sum.num_objects;
+      int64_t peer_num_objects = 
+        std::max((int64_t)0, peer.second.stats.stats.sum.num_objects);
       // Backfill targets always track num_objects accurately
       // all other peers track missing accurately.
       if (is_backfill_targets(peer.first)) {
@@ -5344,24 +5345,6 @@ void PG::abort_scrub()
  */
 void PG::chunky_scrub(ThreadPool::TPHandle &handle)
 {
-  // Since repair is only by request and we need to scrub afterward
-  // treat the same as req_scrub.
-  if (!scrubber.req_scrub) {
-    if (state_test(PG_STATE_DEEP_SCRUB)) {
-      if (get_osdmap()->test_flag(CEPH_OSDMAP_NODEEP_SCRUB) ||
-         pool.info.has_flag(pg_pool_t::FLAG_NODEEP_SCRUB)) {
-           dout(10) << "nodeep_scrub set, aborting" << dendl;
-        abort_scrub();
-        return;
-      }
-    } else if (state_test(PG_STATE_SCRUBBING)) {
-      if (get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) || pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB)) {
-        dout(10) << "noscrub set, aborting" << dendl;
-        abort_scrub();
-        return;
-      }
-    }
-  }
   // check for map changes
   if (scrubber.is_chunky_scrub_active()) {
     if (scrubber.epoch_start != info.history.same_interval_since) {
@@ -5445,6 +5428,7 @@ void PG::chunky_scrub(ThreadPool::TPHandle &handle)
 	   * left end of the range if we are a tier because they may legitimately
 	   * not exist (see _scrub).
 	   */
+	  ceph_assert(scrubber.preempt_divisor > 0);
 	  int min = std::max<int64_t>(3, cct->_conf->osd_scrub_chunk_min /
 				      scrubber.preempt_divisor);
 	  int max = std::max<int64_t>(min, cct->_conf->osd_scrub_chunk_max /
@@ -5604,6 +5588,24 @@ void PG::chunky_scrub(ThreadPool::TPHandle &handle)
           done = true;
 	  break;
 	}
+        // Since repair is only by request and we need to scrub afterward
+        // treat the same as req_scrub.
+        if (!scrubber.req_scrub) {
+          if (state_test(PG_STATE_DEEP_SCRUB)) {
+            if (get_osdmap()->test_flag(CEPH_OSDMAP_NODEEP_SCRUB) ||
+               pool.info.has_flag(pg_pool_t::FLAG_NODEEP_SCRUB)) {
+                 dout(10) << "nodeep_scrub set, aborting" << dendl;
+              abort_scrub();
+              return;
+            }
+          } else if (state_test(PG_STATE_SCRUBBING)) {
+            if (get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) || pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB)) {
+              dout(10) << "noscrub set, aborting" << dendl;
+              abort_scrub();
+              return;
+            }
+          }
+        }
 	// end (possible) preemption window
 	scrub_can_preempt = false;
 	if (scrub_preempted) {
@@ -7092,7 +7094,8 @@ struct C_DeleteMore : public Context {
   }
 };
 
-void PG::_delete_some(ObjectStore::Transaction *t)
+ghobject_t PG::_delete_some(ObjectStore::Transaction *t,
+  ghobject_t _next)
 {
   dout(10) << __func__ << dendl;
 
@@ -7119,24 +7122,44 @@ void PG::_delete_some(ObjectStore::Transaction *t)
       osd->sleep_timer.add_event_at(delete_schedule_time,
 	                                        delete_requeue_callback);
       dout(20) << __func__ << " Delete scheduled at " << delete_schedule_time << dendl;
-      return;
+      return _next;
     }
   }
 
   delete_needs_sleep = true;
 
+  ghobject_t next;
+
   vector<ghobject_t> olist;
   int max = std::min(osd->store->get_ideal_list_max(),
 		     (int)cct->_conf->osd_target_transaction_size);
-  ghobject_t next;
+
   osd->store->collection_list(
     ch,
-    next,
+    _next,
     ghobject_t::get_max(),
     max,
     &olist,
     &next);
   dout(20) << __func__ << " " << olist << dendl;
+
+  // make sure we've removed everything
+  // by one more listing from the beginning
+  if (_next != ghobject_t() && olist.empty()) {
+    next = ghobject_t();
+    osd->store->collection_list(
+      ch,
+      next,
+      ghobject_t::get_max(),
+      max,
+      &olist,
+      &next);
+    if (!olist.empty()) {
+      dout(0) << __func__ << " additional unexpected onode list"
+              <<" (new onodes has appeared since PG removal started"
+              << olist << dendl;
+    }
+  }
 
   OSDriver::OSTransaction _t(osdriver.get_transaction(t));
   int64_t num = 0;
@@ -7197,6 +7220,7 @@ void PG::_delete_some(ObjectStore::Transaction *t)
       osd->logger->dec(l_osd_pg_removing);
     }
   }
+  return next;
 }
 
 // Compute pending backfill data
@@ -9239,7 +9263,10 @@ PG::RecoveryState::Deleting::Deleting(my_context ctx)
   : my_base(ctx),
     NamedState(context< RecoveryMachine >().pg, "Started/ToDelete/Deleting")
 {
+  start = ceph::mono_clock::now();
+  
   context< RecoveryMachine >().log_enter(state_name);
+  
   PG *pg = context< RecoveryMachine >().pg;
   pg->deleting = true;
   ObjectStore::Transaction* t = context<RecoveryMachine>().get_cur_transaction();
@@ -9251,7 +9278,8 @@ boost::statechart::result PG::RecoveryState::Deleting::react(
   const DeleteSome& evt)
 {
   PG *pg = context< RecoveryMachine >().pg;
-  pg->_delete_some(context<RecoveryMachine>().get_cur_transaction());
+  next = pg->_delete_some(context<RecoveryMachine>().get_cur_transaction(),
+    next);
   return discard_event();
 }
 
@@ -9261,6 +9289,9 @@ void PG::RecoveryState::Deleting::exit()
   PG *pg = context< RecoveryMachine >().pg;
   pg->deleting = false;
   pg->osd->local_reserver.cancel_reservation(pg->info.pgid);
+  ldout(pg->cct, 20) << "Deleting::" << __func__ << this <<" finished in "
+                     << ceph::mono_clock::now() - start
+                     << dendl;
 }
 
 /*--------GetInfo---------*/

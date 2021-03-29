@@ -303,11 +303,11 @@ static bool obj_has_expired(CephContext *cct, ceph::real_time mtime, int days, c
   utime_t base_time;
   if (cct->_conf->rgw_lc_debug_interval <= 0) {
     /* Normal case, run properly */
-    cmp = days*24*60*60;
+    cmp = double(days)*24*60*60;
     base_time = ceph_clock_now().round_to_day();
   } else {
     /* We're in debug mode; Treat each rgw_lc_debug_interval seconds as a day */
-    cmp = days*cct->_conf->rgw_lc_debug_interval;
+    cmp = double(days)*cct->_conf->rgw_lc_debug_interval;
     base_time = ceph_clock_now();
   }
   timediff = base_time - ceph::real_clock::to_time_t(mtime);
@@ -857,7 +857,7 @@ public:
 
     auto mtime = get_effective_mtime(oc);
     bool is_expired;
-    if (transition.days <= 0) {
+    if (transition.days < 0) {
       if (transition.date == boost::none) {
         ldout(oc.cct, 20) << __func__ << "(): key=" << o.key << ": no transition day/date set in rule, skipping" << dendl;
         return false;
@@ -1611,21 +1611,19 @@ std::string s3_expiration_header(
       const RGWObjTags& rule_tagset = filter.get_tags();
       for (auto& tag : rule_tagset.get_tags()) {
 	/* remember, S3 tags are {key,value} tuples */
-	auto ma1 = obj_tag_map.find(tag.first);
-	if (ma1 != obj_tag_map.end()) {
-	  if (tag.second == ma1->second) {
-	    ldpp_dout(dpp, 10) << "tag match obj_key=" << obj_key
-			       << " rule_id=" << id
-			       << " tag=" << tag
-			       << " (ma=" << *ma1 << ")"
-			       << dendl;
-	    tag_match = true;
-	    break;
-	  }
-	}
+        tag_match = true;
+        auto obj_tag = obj_tag_map.find(tag.first);
+        if (obj_tag == obj_tag_map.end() || obj_tag->second != tag.second) {
+	        ldpp_dout(dpp, 10) << "tag does not match obj_key=" << obj_key
+			         << " rule_id=" << id
+			         << " tag=" << tag
+			         << dendl;
+	        tag_match = false;
+	        break;
+	      }
       }
       if (! tag_match)
-	continue;
+	      continue;
     }
 
     // compute a uniform expiration date
@@ -1642,7 +1640,7 @@ std::string s3_expiration_header(
       if (rule_expiration.has_days()) {
 	rule_expiration_date =
 	  boost::optional<ceph::real_time>(
-	    mtime + make_timespan(rule_expiration.get_days()*24*60*60));
+	    mtime + make_timespan(double(rule_expiration.get_days())*24*60*60));
 	rule_id = id;
       }
     }

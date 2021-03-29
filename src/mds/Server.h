@@ -76,6 +76,7 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
+  l_mdss_cap_acquisition_throttle,
   l_mdss_last,
 };
 
@@ -351,10 +352,16 @@ public:
 
 private:
   void reply_client_request(MDRequestRef& mdr, const MClientReply::ref &reply);
-  void flush_session(Session *session, MDSGatherBuilder *gather);
+  void flush_session(Session *session, MDSGatherBuilder& gather);
 
   DecayCounter recall_throttle;
   time last_recall_state;
+
+  // Cache cap acquisition throttle configs
+  uint64_t max_caps_per_client;
+  uint64_t cap_acquisition_throttle;
+  double max_caps_throttle_ratio;
+  double caps_throttle_retry_request_timeout;
 };
 
 static inline constexpr auto operator|(Server::RecallFlags a, Server::RecallFlags b) {

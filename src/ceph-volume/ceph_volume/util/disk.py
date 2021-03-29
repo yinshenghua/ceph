@@ -603,6 +603,12 @@ class Size(object):
         _b = self._b / other
         return Size(b=_b)
 
+    def __bool__(self):
+        return self.b != 0
+
+    def __nonzero__(self):
+        return self.__bool__()
+
     def __getattr__(self, unit):
         """
         Calculate units on the fly, relies on the fact that ``bytes`` has been
@@ -754,7 +760,7 @@ def get_devices(_sys_block_path='/sys/block'):
 
         # If the mapper device is a logical volume it gets excluded
         if is_mapper_device(diskname):
-            if lvm.is_lv(diskname):
+            if lvm.get_device_lvs(diskname):
                 continue
 
         # all facts that have no defaults

@@ -1948,22 +1948,14 @@ bool RGWGetObj::prefetch_data()
     return false;
   }
 
-  bool prefetch_first_chunk = true;
   range_str = s->info.env->get("HTTP_RANGE");
-
+  // TODO: add range prefetch
   if (range_str) {
-    int r = parse_range();
-    /* error on parsing the range, stop prefetch and will fail in execute() */
-    if (r < 0) {
-      return false; /* range_parsed==false */
-    }
-    /* range get goes to shadow objects, stop prefetch */
-    if (ofs >= s->cct->_conf->rgw_max_chunk_size) {
-      prefetch_first_chunk = false;
-    }
+    parse_range();
+    return false;
   }
 
-  return get_data && prefetch_first_chunk;
+  return get_data;
 }
 
 void RGWGetObj::pre_exec()
@@ -2462,6 +2454,11 @@ void RGWGetBucketVersioning::pre_exec()
 
 void RGWGetBucketVersioning::execute()
 {
+  if (! s->bucket_exists) {
+    op_ret = -ERR_NO_SUCH_BUCKET;
+    return;
+  }
+
   versioned = s->bucket_info.versioned();
   versioning_enabled = s->bucket_info.versioning_enabled();
   mfa_enabled = s->bucket_info.mfa_enabled();
@@ -2482,6 +2479,11 @@ void RGWSetBucketVersioning::execute()
   op_ret = get_params();
   if (op_ret < 0)
     return;
+
+  if (! s->bucket_exists) {
+    op_ret = -ERR_NO_SUCH_BUCKET;
+    return;
+  }
 
   if (s->bucket_info.obj_lock_enabled() && versioning_status != VersioningEnabled) {
     op_ret = -ERR_INVALID_BUCKET_STATE;
@@ -7490,6 +7492,10 @@ void RGWDefaultResponseOp::send_response() {
 
 void RGWPutBucketPolicy::send_response()
 {
+  if (!op_ret) {
+    /* A successful Put Bucket Policy should return a 204 on success */
+    op_ret = STATUS_NO_CONTENT;
+  }
   if (op_ret) {
     set_req_state_err(s, op_ret);
   }

@@ -3,7 +3,8 @@ from __future__ import absolute_import
 
 import cherrypy
 
-from . import Controller, BaseController, Endpoint, ENDPOINT_MAP
+from . import Controller, BaseController, Endpoint, ENDPOINT_MAP, \
+    allow_empty_body
 from .. import logger, mgr
 
 from ..tools import str_to_bool
@@ -373,8 +374,11 @@ class Docs(BaseController):
             spec_url = "{}/docs/api.json".format(base)
 
         auth_header = cherrypy.request.headers.get('authorization')
+        auth_cookie = cherrypy.request.cookie['token']
         jwt_token = ""
-        if auth_header is not None:
+        if auth_cookie is not None:
+            jwt_token = auth_cookie.value
+        elif auth_header is not None:
             scheme, params = auth_header.split(' ', 1)
             if scheme.lower() == 'bearer':
                 jwt_token = params
@@ -444,5 +448,6 @@ class Docs(BaseController):
 
     @Endpoint('POST', path="/", json_response=False,
               query_params="{all_endpoints}")
+    @allow_empty_body
     def _with_token(self, token, all_endpoints=False):
         return self._swagger_ui_page(all_endpoints, token)

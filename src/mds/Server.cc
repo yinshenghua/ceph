@@ -112,6 +112,9 @@ void Server::create_logger()
                       PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdss_cap_revoke_eviction, "cap_revoke_eviction",
                       "Cap Revoke Client Eviction", "cre", PerfCountersBuilder::PRIO_INTERESTING);
+  plb.add_u64_counter(l_mdss_cap_acquisition_throttle,
+                      "cap_acquisition_throttle", "Cap acquisition throttle counter", "cat",
+                      PerfCountersBuilder::PRIO_INTERESTING);
 
   // fop latencies are useful
   plb.set_prio_default(PerfCountersBuilder::PRIO_USEFUL);
@@ -196,6 +199,10 @@ Server::Server(MDSRank *m) :
   max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
   replay_unsafe_with_closed_session = g_conf().get_val<bool>("mds_replay_unsafe_with_closed_session");
   cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
+  max_caps_per_client = g_conf().get_val<uint64_t>("mds_max_caps_per_client");
+  cap_acquisition_throttle = g_conf().get_val<uint64_t>("mds_session_cap_acquisition_throttle");
+  max_caps_throttle_ratio = g_conf().get_val<double>("mds_session_max_caps_throttle_ratio");
+  caps_throttle_retry_request_timeout = g_conf().get_val<double>("mds_cap_acquisition_throttle_retry_request_timeout");
   supported_features = feature_bitset_t(CEPHFS_FEATURES_MDS_SUPPORTED);
 }
 
@@ -679,24 +686,24 @@ void Server::handle_client_session(const MClientSession::const_ref &m)
 }
 
 
-void Server::flush_session(Session *session, MDSGatherBuilder *gather) {
+void Server::flush_session(Session *session, MDSGatherBuilder& gather) {
   if (!session->is_open() ||
       !session->get_connection() ||
       !session->get_connection()->has_feature(CEPH_FEATURE_EXPORT_PEER)) {
     return;
   }
 
-  version_t seq = session->wait_for_flush(gather->new_sub());
+  version_t seq = session->wait_for_flush(gather.new_sub());
   mds->send_message_client(
     MClientSession::create(CEPH_SESSION_FLUSHMSG, seq), session);
 }
 
 void Server::flush_client_sessions(set<client_t>& client_set, MDSGatherBuilder& gather)
 {
-  for (set<client_t>::iterator p = client_set.begin(); p != client_set.end(); ++p) {
-    Session *session = mds->sessionmap.get_session(entity_name_t::CLIENT(p->v));
+  for (const auto& client : client_set) {
+    Session *session = mds->sessionmap.get_session(entity_name_t::CLIENT(client.v));
     ceph_assert(session);
-    flush_session(session, &gather);
+    flush_session(session, gather);
   }
 }
 
@@ -744,11 +751,12 @@ void Server::_session_logged(Session *session, uint64_t state_seq, bool open, ve
   } else if (session->is_closing() ||
 	     session->is_killing()) {
     // kill any lingering capabilities, leases, requests
+    bool killing = session->is_killing();
     while (!session->caps.empty()) {
       Capability *cap = session->caps.front();
       CInode *in = cap->get_inode();
       dout(20) << " killing capability " << ccap_string(cap->issued()) << " on " << *in << dendl;
-      mds->locker->remove_client_cap(in, cap, true);
+      mds->locker->remove_client_cap(in, cap, killing);
     }
     while (!session->leases.empty()) {
       ClientLease *r = session->leases.front();
@@ -1115,6 +1123,18 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
     max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
     dout(20) << __func__ << " max snapshots per directory changed to "
             << max_snaps_per_dir << dendl;
+  }
+  if (changed.count("mds_max_caps_per_client")) {
+    max_caps_per_client = g_conf().get_val<uint64_t>("mds_max_caps_per_client");
+  }
+  if (changed.count("mds_session_cap_acquisition_throttle")) {
+    cap_acquisition_throttle = g_conf().get_val<uint64_t>("mds_session_cap_acquisition_throttle");
+  }
+  if (changed.count("mds_session_max_caps_throttle_ratio")) {
+    max_caps_throttle_ratio = g_conf().get_val<double>("mds_session_max_caps_throttle_ratio");
+  }
+  if (changed.count("mds_cap_acquisition_throttle_retry_request_timeout")) {
+    caps_throttle_retry_request_timeout = g_conf().get_val<double>("mds_cap_acquisition_throttle_retry_request_timeout");
   }
 }
 
@@ -1706,7 +1726,7 @@ std::pair<bool, uint64_t> Server::recall_client_state(MDSGatherBuilder* gather, 
       m->head.max_caps = newlim;
       mds->send_message_client(m, session);
       if (gather) {
-        flush_session(session, gather);
+        flush_session(session, *gather);
       }
       caps_recalled += session->notify_recall_sent(newlim);
       recall_throttle.hit(recall);
@@ -4259,6 +4279,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
 void Server::handle_client_readdir(MDRequestRef& mdr)
 {
   const MClientRequest::const_ref &req = mdr->client_request;
+  Session *session = mds->get_session(req);
   client_t client = req->get_source().num();
   MutationImpl::LockOpVec lov;
   CInode *diri = rdlock_path_pin_ref(mdr, 0, lov, false, true);
@@ -4270,6 +4291,19 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     dout(10) << "reply to " << *req << " readdir -ENOTDIR" << dendl;
     respond_to_request(mdr, -ENOTDIR);
     return;
+  }
+
+  auto num_caps = session->get_num_caps();
+  auto session_cap_acquisition = session->get_cap_acquisition();
+
+  if (num_caps > static_cast<uint64_t>(max_caps_per_client * max_caps_throttle_ratio) && session_cap_acquisition >= cap_acquisition_throttle) {
+      dout(20) << "readdir throttled. max_caps_per_client: " << max_caps_per_client << " num_caps: " << num_caps
+	       << " session_cap_acquistion: " << session_cap_acquisition << " cap_acquisition_throttle: " << cap_acquisition_throttle << dendl;
+      if (logger)
+          logger->inc(l_mdss_cap_acquisition_throttle);
+
+      mds->timer.add_event_after(caps_throttle_retry_request_timeout, new C_MDS_RetryRequest(mdcache, mdr));
+      return;
   }
 
   lov.add_rdlock(&diri->filelock);
@@ -4469,6 +4503,8 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     mdcache->lru.lru_touch(dn);
   }
   
+  session->touch_readdir_cap(numfiles);
+
   __u16 flags = 0;
   if (end) {
     flags = CEPH_READDIR_FRAG_END;
