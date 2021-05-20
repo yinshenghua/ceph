@@ -1709,6 +1709,22 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description("time before OSDs who do not report to the mons are marked down (seconds)"),
 
+    Option("mon_warn_on_insecure_global_id_reclaim", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("issue AUTH_INSECURE_GLOBAL_ID_RECLAIM health warning if any connected clients are insecurely reclaiming global_id")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim_allowed")
+    .add_see_also("auth_allow_insecure_global_id_reclaim")
+    .add_see_also("auth_expose_insecure_global_id_reclaim"),
+
+    Option("mon_warn_on_insecure_global_id_reclaim_allowed", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("issue AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED health warning if insecure global_id reclaim is allowed")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim")
+    .add_see_also("auth_allow_insecure_global_id_reclaim")
+    .add_see_also("auth_expose_insecure_global_id_reclaim"),
+
     Option("mon_warn_on_msgr2_not_enabled", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .add_service("mon")
@@ -2182,15 +2198,22 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description(""),
 
-    Option("paxos_service_trim_min", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    Option("paxos_service_trim_min", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(250)
     .add_service("mon")
     .set_description(""),
 
-    Option("paxos_service_trim_max", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    Option("paxos_service_trim_max", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(500)
     .add_service("mon")
     .set_description(""),
+
+    Option("paxos_service_trim_max_multiplier", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(20)
+    .set_min(0)
+    .add_service("mon")
+    .set_description("factor by which paxos_service_trim_max will be multiplied to get a new upper bound when trim sizes are high  (0 disables it)")
+    .set_flag(Option::FLAG_RUNTIME),
 
     Option("paxos_kill_at", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(0)
@@ -2258,12 +2281,28 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("auth_mon_ticket_ttl", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(12_hr)
+    .set_default(72_hr)
     .set_description(""),
 
     Option("auth_service_ticket_ttl", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(1_hr)
     .set_description(""),
+
+    Option("auth_allow_insecure_global_id_reclaim", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("Allow reclaiming global_id without presenting a valid ticket proving previous possession of that global_id")
+    .set_long_description("Allowing unauthorized global_id (re)use poses a security risk.  Unfortunately, older clients may omit their ticket on reconnects and therefore rely on this being allowed for preserving their global_id for the lifetime of the client instance.  Setting this value to false would immediately prevent new connections from those clients (assuming auth_expose_insecure_global_id_reclaim set to true) and eventually break existing sessions as well (regardless of auth_expose_insecure_global_id_reclaim setting).")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim_allowed")
+    .add_see_also("auth_expose_insecure_global_id_reclaim"),
+
+    Option("auth_expose_insecure_global_id_reclaim", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("Force older clients that may omit their ticket on reconnects to reconnect as part of establishing a session")
+    .set_long_description("In permissive mode (auth_allow_insecure_global_id_reclaim set to true), this helps with identifying clients that are not patched.  In enforcing mode (auth_allow_insecure_global_id_reclaim set to false), this is a fail-fast mechanism: don't establish a session that will almost inevitably be broken later.")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim_allowed")
+    .add_see_also("auth_allow_insecure_global_id_reclaim"),
 
     Option("auth_debug", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(false)
@@ -3899,6 +3938,12 @@ std::vector<Option> get_global_options() {
     .set_description("Fast, immediate shutdown")
     .set_long_description("Setting this to false makes the OSD do a slower teardown of all state when it receives a SIGINT or SIGTERM or when shutting down for any other reason.  That slow shutdown is primarilyy useful for doing memory leak checking with valgrind."),
 
+    Option("osd_fast_shutdown_notify_mon", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Tell mon about OSD shutdown on immediate shutdown")
+    .set_long_description("Tell the monitor the OSD is shutting down on immediate shutdown. This helps with cluster log messages from other OSDs reporting it immediately failed.")
+    .add_see_also({"osd_fast_shutdown", "osd_mon_shutdown_timeout"}),
+
     Option("osd_fast_fail_on_connection_refused", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .set_description(""),
@@ -4386,9 +4431,9 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("bluefs_buffered_io", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
-    .set_default(false)
+    .set_default(true)
     .set_description("Enabled buffered IO for bluefs reads.")
-    .set_long_description("When this option is enabled, bluefs will in some cases perform buffered reads.  This allows the kernel page cache to act as a secondary cache for things like RocksDB compaction.  For example, if the rocksdb block cache isn't large enough to hold blocks from the compressed SST files itself, they can be read from page cache instead of from the disk.  This option previously was enabled by default, however in some test cases it appears to cause excessive swap utilization by the linux kernel and a large negative performance impact after several hours of run time.  Please exercise caution when enabling."),
+    .set_long_description("When this option is enabled, bluefs will in some cases perform buffered reads.  This allows the kernel page cache to act as a secondary cache for things like RocksDB compaction.  For example, if the rocksdb block cache isn't large enough to hold blocks from the compressed SST files itself, they can be read from page cache instead of from the disk."),
 
     Option("bluefs_sync_write", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
@@ -4712,7 +4757,7 @@ std::vector<Option> get_global_options() {
     .set_description("How frequently we trim the bluestore cache"),
 
     Option("bluestore_cache_trim_max_skip_pinned", Option::TYPE_UINT, Option::LEVEL_DEV)
-    .set_default(64)
+    .set_default(1000)
     .set_description("Max pinned cache entries we consider before giving up"),
 
     Option("bluestore_cache_type", Option::TYPE_STR, Option::LEVEL_DEV)

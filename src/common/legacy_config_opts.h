@@ -341,6 +341,8 @@ OPTION(cephx_service_require_version, OPT_INT)
 OPTION(cephx_sign_messages, OPT_BOOL)  // Default to signing session messages if supported
 OPTION(auth_mon_ticket_ttl, OPT_DOUBLE)
 OPTION(auth_service_ticket_ttl, OPT_DOUBLE)
+OPTION(auth_allow_insecure_global_id_reclaim, OPT_BOOL)
+OPTION(auth_expose_insecure_global_id_reclaim, OPT_BOOL)
 OPTION(auth_debug, OPT_BOOL)          // if true, assert when weird things happen
 OPTION(mon_client_hunt_parallel, OPT_U32)   // how many mons to try to connect to in parallel during hunt
 OPTION(mon_client_hunt_interval, OPT_DOUBLE)   // try new mon every N seconds until we connect
@@ -799,6 +801,7 @@ OPTION(osd_op_history_slow_op_threshold, OPT_DOUBLE) // track the op if over thi
 OPTION(osd_target_transaction_size, OPT_INT)     // to adjust various transactions that batch smaller items
 OPTION(osd_failsafe_full_ratio, OPT_FLOAT) // what % full makes an OSD "full" (failsafe)
 OPTION(osd_fast_shutdown, OPT_BOOL)
+OPTION(osd_fast_shutdown_notify_mon, OPT_BOOL) // tell mon the OSD is shutting down on osd_fast_shutdown
 OPTION(osd_fast_fail_on_connection_refused, OPT_BOOL) // immediately mark OSDs as down once they refuse to accept connections
 
 OPTION(osd_pg_object_context_cache_count, OPT_INT)
