@@ -17,22 +17,16 @@ class DriveSelection(object):
     def __init__(self,
                  spec,  # type: DriveGroupSpec
                  disks,  # type: List[Device]
+                 existing_daemons=None,  # type: Optional[int]
                  ):
         self.disks = disks.copy()
         self.spec = spec
+        self.existing_daemons = existing_daemons or 0
 
-        if self.spec.data_devices.paths:  # type: ignore
-            # re: type: ignore there is *always* a path attribute assigned to DeviceSelection
-            # it's just None if actual drivegroups are used
-            self._data = self.spec.data_devices.paths  # type: ignore
-            self._db = []  # type: List
-            self._wal = []  # type: List
-            self._journal = []  # type: List
-        else:
-            self._data = self.assign_devices(self.spec.data_devices)
-            self._wal = self.assign_devices(self.spec.wal_devices)
-            self._db = self.assign_devices(self.spec.db_devices)
-            self._journal = self.assign_devices(self.spec.journal_devices)
+        self._data = self.assign_devices(self.spec.data_devices)
+        self._wal = self.assign_devices(self.spec.wal_devices)
+        self._db = self.assign_devices(self.spec.db_devices)
+        self._journal = self.assign_devices(self.spec.journal_devices)
 
     def data_devices(self):
         # type: () -> List[Device]
@@ -50,8 +44,7 @@ class DriveSelection(object):
         # type: () -> List[Device]
         return self._journal
 
-    @staticmethod
-    def _limit_reached(device_filter, len_devices,
+    def _limit_reached(self, device_filter, len_devices,
                        disk_path):
         # type: (DeviceSelection, int, str) -> bool
         """ Check for the <limit> property and apply logic
@@ -68,7 +61,7 @@ class DriveSelection(object):
         """
         limit = device_filter.limit or 0
 
-        if limit > 0 and len_devices >= limit:
+        if limit > 0 and (len_devices + self.existing_daemons >= limit):
             logger.info("Refuse to add {} due to limit policy of <{}>".format(
                 disk_path, limit))
             return True
@@ -110,14 +103,13 @@ class DriveSelection(object):
             logger.debug('data_devices is None')
             return []
 
+        if device_filter.paths:
+            logger.debug('device filter is using explicit paths')
+            return device_filter.paths
+
         devices = list()  # type: List[Device]
         for disk in self.disks:
             logger.debug("Processing disk {}".format(disk.path))
-
-            if not disk.available:
-                logger.debug(
-                    "Ignoring disk {}. Disk is not available".format(disk.path))
-                continue
 
             if not self._has_mandatory_idents(disk):
                 logger.debug(
@@ -134,11 +126,19 @@ class DriveSelection(object):
             if disk in devices:
                 continue
 
-            if not all(m.compare(disk) for m in FilterGenerator(device_filter)):
-                logger.debug(
-                    "Ignoring disk {}. Filter did not match".format(
-                        disk.path))
-                continue
+            if self.spec.filter_logic == 'AND':
+                if not all(m.compare(disk) for m in FilterGenerator(device_filter)):
+                    logger.debug(
+                        "Ignoring disk {}. Not all filter did match the disk".format(
+                            disk.path))
+                    continue
+
+            if self.spec.filter_logic == 'OR':
+                if not any(m.compare(disk) for m in FilterGenerator(device_filter)):
+                    logger.debug(
+                        "Ignoring disk {}. No filter matched the disk".format(
+                            disk.path))
+                    continue
 
             logger.debug('Adding disk {}'.format(disk.path))
             devices.append(disk)

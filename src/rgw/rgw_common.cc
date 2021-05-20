@@ -14,7 +14,6 @@
 #include "rgw_common.h"
 #include "rgw_acl.h"
 #include "rgw_string.h"
-#include "rgw_rados.h"
 #include "rgw_http_errors.h"
 #include "rgw_arn.h"
 #include "rgw_data_sync.h"
@@ -154,8 +153,12 @@ rgw_http_errors rgw_http_sts_errors({
 });
 
 rgw_http_errors rgw_http_iam_errors({
+    { EINVAL, {400, "InvalidInput" }},
+    { ENOENT, {404, "NoSuchEntity"}},
     { ERR_ROLE_EXISTS, {409, "EntityAlreadyExists"}},
     { ERR_DELETE_CONFLICT, {409, "DeleteConflict"}},
+    { EEXIST, {409, "EntityAlreadyExists"}},
+    { ERR_INTERNAL_ERROR, {500, "ServiceFailure" }},
 });
 
 using namespace ceph::crypto;
@@ -259,9 +262,8 @@ void req_info::rebuild_from(req_info& src)
 }
 
 
-req_state::req_state(CephContext* _cct, RGWEnv* e, rgw::sal::RGWUser* u, uint64_t id)
-  : cct(_cct), user(u),
-    info(_cct, e), id(id)
+req_state::req_state(CephContext* _cct, RGWEnv* e, uint64_t id)
+  : cct(_cct), info(_cct, e), id(id)
 {
   enable_ops_log = e->get_enable_ops_log();
   enable_usage_log = e->get_enable_usage_log();
@@ -385,7 +387,7 @@ struct str_len meta_prefixes[] = { STR_LEN_ENTRY("HTTP_X_AMZ"),
                                    STR_LEN_ENTRY("HTTP_X_ACCOUNT"),
                                    {NULL, 0} };
 
-void req_info::init_meta_info(bool *found_bad_meta)
+void req_info::init_meta_info(const DoutPrefixProvider *dpp, bool *found_bad_meta)
 {
   x_meta_map.clear();
 
@@ -397,7 +399,7 @@ void req_info::init_meta_info(bool *found_bad_meta)
       int len = meta_prefixes[prefix_num].len;
       const char *p = header_name.c_str();
       if (strncmp(p, prefix, len) == 0) {
-        dout(10) << "meta>> " << p << dendl;
+        ldpp_dout(dpp, 10) << "meta>> " << p << dendl;
         const char *name = p+len; /* skip the prefix */
         int name_len = header_name.size() - len;
 
@@ -429,7 +431,7 @@ void req_info::init_meta_info(bool *found_bad_meta)
     }
   }
   for (const auto& kv: x_meta_map) {
-    dout(10) << "x>> " << kv.first << ":" << rgw::crypt_sanitize::x_meta_map{kv.first, kv.second} << dendl;
+    ldpp_dout(dpp, 10) << "x>> " << kv.first << ":" << rgw::crypt_sanitize::x_meta_map{kv.first, kv.second} << dendl;
   }
 }
 
@@ -558,7 +560,7 @@ bool parse_iso8601(const char *s, struct tm *t, uint32_t *pns, bool extended_for
     dout(0) << "parse_iso8601 failed" << dendl;
     return false;
   }
-  const boost::string_view str = rgw_trim_whitespace(boost::string_view(p));
+  const std::string_view str = rgw_trim_whitespace(std::string_view(p));
   int len = str.size();
 
   if (len == 0 || (len == 1 && str[0] == 'Z'))
@@ -569,8 +571,8 @@ bool parse_iso8601(const char *s, struct tm *t, uint32_t *pns, bool extended_for
     return false;
 
   uint32_t ms;
-  boost::string_view nsstr = str.substr(1,  len - 2);
-  int r = stringtoul(nsstr.to_string(), &ms);
+  std::string_view nsstr = str.substr(1,  len - 2);
+  int r = stringtoul(std::string(nsstr), &ms);
   if (r < 0)
     return false;
 
@@ -619,12 +621,12 @@ int parse_key_value(string& in_str, string& key, string& val)
   return parse_key_value(in_str, "=", key,val);
 }
 
-boost::optional<std::pair<boost::string_view, boost::string_view>>
-parse_key_value(const boost::string_view& in_str,
-                const boost::string_view& delim)
+boost::optional<std::pair<std::string_view, std::string_view>>
+parse_key_value(const std::string_view& in_str,
+                const std::string_view& delim)
 {
   const size_t pos = in_str.find(delim);
-  if (pos == boost::string_view::npos) {
+  if (pos == std::string_view::npos) {
     return boost::none;
   }
 
@@ -634,8 +636,8 @@ parse_key_value(const boost::string_view& in_str,
   return std::make_pair(key, val);
 }
 
-boost::optional<std::pair<boost::string_view, boost::string_view>>
-parse_key_value(const boost::string_view& in_str)
+boost::optional<std::pair<std::string_view, std::string_view>>
+parse_key_value(const std::string_view& in_str)
 {
   return parse_key_value(in_str, "=");
 }
@@ -721,7 +723,7 @@ using ceph::crypto::SHA256;
 /*
  * calculate the sha256 hash value of a given msg
  */
-sha256_digest_t calc_hash_sha256(const boost::string_view& msg)
+sha256_digest_t calc_hash_sha256(const std::string_view& msg)
 {
   sha256_digest_t hash;
 
@@ -786,7 +788,7 @@ int NameVal::parse()
   return ret; 
 }
 
-int RGWHTTPArgs::parse()
+int RGWHTTPArgs::parse(const DoutPrefixProvider *dpp)
 {
   int pos = 0;
   bool end = false;
@@ -808,8 +810,17 @@ int RGWHTTPArgs::parse()
     int ret = nv.parse();
     if (ret >= 0) {
       string& name = nv.get_name();
+      if (name.find("X-Amz-") != string::npos) {
+        std::for_each(name.begin(),
+          name.end(),
+          [](char &c){
+            if (c != '-') {
+              c = ::tolower(static_cast<unsigned char>(c));
+            }
+        });
+      }
       string& val = nv.get_val();
-
+      ldpp_dout(dpp, 10) << "name: " << name << " val: " << val << dendl;
       append(name, val);
     }
 
@@ -1001,14 +1012,16 @@ namespace {
 
 struct perm_state_from_req_state : public perm_state_base {
   req_state * const s;
-  perm_state_from_req_state(req_state * const _s) : perm_state_base(_s->cct,
-                                                                    _s->env,
-                                                                    _s->auth.identity.get(),
-                                                                    _s->bucket_info,
-                                                                    _s->perm_mask,
-                                                                    _s->defer_to_bucket_acls,
-                                                                    _s->bucket_access_conf),
-                                                                    s(_s) {}
+  perm_state_from_req_state(req_state * const _s)
+    : perm_state_base(_s->cct,
+		      _s->env,
+		      _s->auth.identity.get(),
+		      _s->bucket.get() ? _s->bucket->get_info() : RGWBucketInfo(),
+		      _s->perm_mask,
+		      _s->defer_to_bucket_acls,
+		      _s->bucket_access_conf),
+      s(_s) {}
+
   std::optional<bool> get_request_payer() const override {
     const char *request_payer = s->info.env->get("HTTP_X_AMZ_REQUEST_PAYER");
     if (!request_payer) {
@@ -1245,7 +1258,7 @@ bool verify_bucket_permission(const DoutPrefixProvider* dpp, struct req_state * 
 
   return verify_bucket_permission(dpp, 
                                   &ps,
-                                  s->bucket,
+                                  s->bucket->get_key(),
                                   s->user_acl.get(),
                                   s->bucket_acl.get(),
                                   s->iam_policy,
@@ -1259,11 +1272,22 @@ bool verify_bucket_permission(const DoutPrefixProvider* dpp, struct req_state * 
 int verify_bucket_owner_or_policy(struct req_state* const s,
 				  const uint64_t op)
 {
+  auto usr_policy_res = eval_user_policies(s->iam_user_policies, s->env, boost::none, op, ARN(s->bucket->get_key()));
+  if (usr_policy_res == Effect::Deny) {
+    return -EACCES;
+  }
+
   auto e = eval_or_pass(s->iam_policy,
 			s->env, *s->auth.identity,
-			op, ARN(s->bucket));
+			op, ARN(s->bucket->get_key()));
+  if (e == Effect::Deny) {
+    return -EACCES;
+  }
+
   if (e == Effect::Allow ||
+      usr_policy_res == Effect::Allow ||
       (e == Effect::Pass &&
+       usr_policy_res == Effect::Pass &&
        s->auth.identity->is_owner_of(s->bucket_owner.get_id()))) {
     return 0;
   } else {
@@ -1459,7 +1483,7 @@ bool verify_object_permission(const DoutPrefixProvider* dpp, struct req_state *s
 
   return verify_object_permission(dpp,
                                   &ps,
-                                  rgw_obj(s->bucket, s->object),
+                                  rgw_obj(s->bucket->get_key(), s->object->get_key()),
                                   s->user_acl.get(),
                                   s->bucket_acl.get(),
                                   s->object_acl.get(),
@@ -1467,6 +1491,41 @@ bool verify_object_permission(const DoutPrefixProvider* dpp, struct req_state *s
                                   s->iam_user_policies,
                                   op);
 }
+
+
+int verify_object_lock(const DoutPrefixProvider* dpp, const rgw::sal::RGWAttrs& attrs, const bool bypass_perm, const bool bypass_governance_mode) {
+  auto aiter = attrs.find(RGW_ATTR_OBJECT_RETENTION);
+  if (aiter != attrs.end()) {
+    RGWObjectRetention obj_retention;
+    try {
+      decode(obj_retention, aiter->second);
+    } catch (buffer::error& err) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to decode RGWObjectRetention" << dendl;
+      return -EIO;
+    }
+    if (ceph::real_clock::to_time_t(obj_retention.get_retain_until_date()) > ceph_clock_now()) {
+      if (obj_retention.get_mode().compare("GOVERNANCE") != 0 || !bypass_perm || !bypass_governance_mode) {
+        return -EACCES;
+      }
+    }
+  }
+  aiter = attrs.find(RGW_ATTR_OBJECT_LEGAL_HOLD);
+  if (aiter != attrs.end()) {
+    RGWObjectLegalHold obj_legal_hold;
+    try {
+      decode(obj_legal_hold, aiter->second);
+    } catch (buffer::error& err) {
+      ldpp_dout(dpp, 0) << "ERROR: failed to decode RGWObjectLegalHold" << dendl;
+      return -EIO;
+    }
+    if (obj_legal_hold.is_enabled()) {
+      return -EACCES;
+    }
+  }
+  
+  return 0;
+}
+
 
 class HexTable
 {
@@ -1496,7 +1555,7 @@ static char hex_to_num(char c)
   return hex_table.to_num(c);
 }
 
-std::string url_decode(const boost::string_view& src_str, bool in_query)
+std::string url_decode(const std::string_view& src_str, bool in_query)
 {
   std::string dest_str;
   dest_str.reserve(src_str.length() + 1);
@@ -1590,6 +1649,27 @@ std::string url_encode(const std::string& src, bool encode_slash)
   return dst;
 }
 
+std::string url_remove_prefix(const std::string& url)
+{
+  std::string dst = url;
+  auto pos = dst.find("http://");
+  if (pos == std::string::npos) {
+    pos = dst.find("https://");
+    if (pos != std::string::npos) {
+      dst.erase(pos, 8);
+    } else {
+      pos = dst.find("www.");
+      if (pos != std::string::npos) {
+        dst.erase(pos, 4);
+      }
+    }
+  } else {
+    dst.erase(pos, 7);
+  }
+
+  return dst;
+}
+
 string rgw_trim_whitespace(const string& src)
 {
   if (src.empty()) {
@@ -1615,9 +1695,9 @@ string rgw_trim_whitespace(const string& src)
   return src.substr(start, end - start + 1);
 }
 
-boost::string_view rgw_trim_whitespace(const boost::string_view& src)
+std::string_view rgw_trim_whitespace(const std::string_view& src)
 {
-  boost::string_view res = src;
+  std::string_view res = src;
 
   while (res.size() > 0 && std::isspace(res.front())) {
     res.remove_prefix(1);
@@ -1841,7 +1921,9 @@ bool RGWUserCaps::is_valid_cap_type(const string& tp)
                                     "mdlog",
                                     "datalog",
                                     "roles",
-                                    "user-policy"};
+                                    "user-policy",
+                                    "amz-cache",
+                                    "oidc-provider"};
 
   for (unsigned int i = 0; i < sizeof(cap_type) / sizeof(char *); ++i) {
     if (tp.compare(cap_type[i]) == 0) {
@@ -1897,7 +1979,7 @@ int rgw_parse_op_type_list(const string& str, uint32_t *perm)
   return rgw_parse_list_of_flags(op_type_mapping, str, perm);
 }
 
-bool match_policy(boost::string_view pattern, boost::string_view input,
+bool match_policy(std::string_view pattern, std::string_view input,
                   uint32_t flag)
 {
   const uint32_t flag2 = flag & (MATCH_POLICY_ACTION|MATCH_POLICY_ARN) ?
@@ -1905,8 +1987,8 @@ bool match_policy(boost::string_view pattern, boost::string_view input,
   const bool colonblocks = !(flag & (MATCH_POLICY_RESOURCE |
 				     MATCH_POLICY_STRING));
 
-  const auto npos = boost::string_view::npos;
-  boost::string_view::size_type last_pos_input = 0, last_pos_pattern = 0;
+  const auto npos = std::string_view::npos;
+  std::string_view::size_type last_pos_input = 0, last_pos_pattern = 0;
   while (true) {
     auto cur_pos_input = colonblocks ? input.find(":", last_pos_input) : npos;
     auto cur_pos_pattern =
@@ -1990,7 +2072,7 @@ RGWBucketInfo::~RGWBucketInfo()
 }
 
 void RGWBucketInfo::encode(bufferlist& bl) const {
-  ENCODE_START(22, 4, bl);
+  ENCODE_START(23, 4, bl);
   encode(bucket, bl);
   encode(owner.id, bl);
   encode(flags, bl);
@@ -2023,11 +2105,12 @@ void RGWBucketInfo::encode(bufferlist& bl) const {
     encode(*sync_policy, bl);
   }
   encode(layout, bl);
+  encode(owner.ns, bl);
   ENCODE_FINISH(bl);
 }
 
 void RGWBucketInfo::decode(bufferlist::const_iterator& bl) {
-  DECODE_START_LEGACY_COMPAT_LEN_32(22, 4, 4, bl);
+  DECODE_START_LEGACY_COMPAT_LEN_32(23, 4, 4, bl);
   decode(bucket, bl);
   if (struct_v >= 2) {
     string s;
@@ -2101,7 +2184,9 @@ void RGWBucketInfo::decode(bufferlist::const_iterator& bl) {
   if (struct_v >= 22) {
     decode(layout, bl);
   }
-  
+  if (struct_v >= 23) {
+    decode(owner.ns, bl);
+  }
   DECODE_FINISH(bl);
 }
 

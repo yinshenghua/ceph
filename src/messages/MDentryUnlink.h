@@ -18,12 +18,12 @@
 
 #include <string_view>
 
-#include "msg/Message.h"
+#include "messages/MMDSOp.h"
 
-class MDentryUnlink : public SafeMessage {
+class MDentryUnlink final : public MMDSOp {
 private:
-  static const int HEAD_VERSION = 1;
-  static const int COMPAT_VERSION = 1;
+  static constexpr int HEAD_VERSION = 1;
+  static constexpr int COMPAT_VERSION = 1;
   
   dirfrag_t dirfrag;
   std::string dn;
@@ -37,12 +37,12 @@ private:
 
 protected:
   MDentryUnlink() :
-    SafeMessage(MSG_MDS_DENTRYUNLINK, HEAD_VERSION, COMPAT_VERSION) { }
+    MMDSOp(MSG_MDS_DENTRYUNLINK, HEAD_VERSION, COMPAT_VERSION) { }
   MDentryUnlink(dirfrag_t df, std::string_view n) :
-    SafeMessage(MSG_MDS_DENTRYUNLINK, HEAD_VERSION, COMPAT_VERSION),
+    MMDSOp(MSG_MDS_DENTRYUNLINK, HEAD_VERSION, COMPAT_VERSION),
     dirfrag(df),
     dn(n) {}
-  ~MDentryUnlink() override {}
+  ~MDentryUnlink() final {}
 
 public:
   std::string_view get_type_name() const override { return "dentry_unlink";}

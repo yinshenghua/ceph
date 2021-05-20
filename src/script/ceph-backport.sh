@@ -1,4 +1,5 @@
-#!/bin/bash -e
+#!/usr/bin/env bash 
+set -e
 #
 # ceph-backport.sh - Ceph backporting script
 #
@@ -21,7 +22,7 @@
 
 full_path="$0"
 
-SCRIPT_VERSION="15.1.1.389"
+SCRIPT_VERSION="16.0.0.6848"
 active_milestones=""
 backport_pr_labels=""
 backport_pr_number=""
@@ -1396,6 +1397,28 @@ if git status >/dev/null 2>&1 ; then
     debug "In a local git clone. Good."
 else
     error "This script must be run from inside a local git clone"
+    abort_due_to_setup_problem
+fi
+
+#
+# do we have jq available?
+#
+
+if type jq >/dev/null 2>&1 ; then
+    debug "jq is available. Good."
+else
+    error "This script uses jq, but it does not seem to be installed"
+    abort_due_to_setup_problem
+fi
+
+#
+# is jq available?
+#
+
+if command -v jq >/dev/null ; then
+    debug "jq is available. Good."
+else
+    error "This script needs \"jq\" in order to work, and it is not available"
     abort_due_to_setup_problem
 fi
 

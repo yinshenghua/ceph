@@ -8,7 +8,6 @@
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
-#include "BlockDevice.h"
 #include "Allocator.h"
 #include "include/ceph_assert.h"
 #include "common/admin_socket.h"
@@ -38,10 +37,10 @@ using ceph::Formatter;
 
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::File, bluefs_file, bluefs);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::Dir, bluefs_dir, bluefs);
-MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileWriter, bluefs_file_writer, bluefs);
+MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileWriter, bluefs_file_writer, bluefs_file_writer);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileReaderBuffer,
-			      bluefs_file_reader_buffer, bluefs);
-MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileReader, bluefs_file_reader, bluefs);
+			      bluefs_file_reader_buffer, bluefs_file_reader);
+MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileReader, bluefs_file_reader, bluefs_file_reader);
 MEMPOOL_DEFINE_OBJECT_FACTORY(BlueFS::FileLock, bluefs_file_lock, bluefs);
 
 static void wal_discard_cb(void *priv, void* priv2) {
@@ -71,11 +70,14 @@ public:
     AdminSocket* admin_socket = bluefs->cct->get_admin_socket();
     if (admin_socket) {
       hook = new BlueFS::SocketHook(bluefs);
-      int r = admin_socket->register_command("bluestore bluefs available "
+      int r = admin_socket->register_command("bluestore bluefs device info "
                                              "name=alloc_size,type=CephInt,req=false",
                                              hook,
-                                             "Report available space for bluefs. "
-                                             "If alloc_size set, make simulation.");
+                                             "Shows space report for bluefs devices. "
+                                             "This also includes an estimation for space "
+                                             "available to bluefs at main device. "
+                                             "alloc_size, if set, specifies the custom bluefs "
+                                             "allocation unit size for the estimation above.");
       if (r != 0) {
         ldout(bluefs->cct, 1) << __func__ << " cannot register SocketHook" << dendl;
         delete hook;
@@ -86,6 +88,12 @@ public:
                                            "Dump internal statistics for bluefs."
                                            "");
         ceph_assert(r == 0);
+	r = admin_socket->register_command("bluefs files list", hook,
+					   "print files in bluefs");
+	ceph_assert(r == 0);
+	r = admin_socket->register_command("bluefs debug_inject_read_zeros", hook,
+					   "Injects 8K zeros into next BlueFS read. Debug only.");
+	ceph_assert(r == 0);
       }
     }
     return hook;
@@ -102,7 +110,7 @@ private:
 	   Formatter *f,
 	   std::ostream& errss,
 	   bufferlist& out) override {
-    if (command == "bluestore bluefs available") {
+    if (command == "bluestore bluefs device info") {
       int64_t alloc_size = 0;
       cmd_getval(cmdmap, "alloc_size", alloc_size);
       if ((alloc_size & (alloc_size - 1)) != 0) {
@@ -110,28 +118,63 @@ private:
 	return -EINVAL;
       }
       if (alloc_size == 0)
-	alloc_size = bluefs->cct->_conf->bluefs_alloc_size;
-      f->open_object_section("bluefs_available_space");
+	alloc_size = bluefs->cct->_conf->bluefs_shared_alloc_size;
+      f->open_object_section("bluefs_device_info");
       for (unsigned dev = BDEV_WAL; dev <= BDEV_SLOW; dev++) {
 	if (bluefs->bdev[dev]) {
 	  f->open_object_section("dev");
 	  f->dump_string("device", bluefs->get_device_name(dev));
 	  ceph_assert(bluefs->alloc[dev]);
-	  f->dump_int("free", bluefs->alloc[dev]->get_free());
-	  f->close_section();
-	}
+          auto total = bluefs->get_total(dev);
+          auto free = bluefs->get_free(dev);
+          auto used = bluefs->get_used(dev);
+
+          f->dump_int("total", total);
+          f->dump_int("free", free);
+          f->dump_int("bluefs_used", used);
+          if (bluefs->is_shared_alloc(dev)) {
+            size_t avail = bluefs->probe_alloc_avail(dev, alloc_size);
+            f->dump_int("bluefs max available", avail);
+          }
+          f->close_section();
+        }
       }
-      size_t extra_space = 0;
-      if (bluefs->slow_dev_expander) {
-	extra_space = bluefs->slow_dev_expander->available_freespace(alloc_size);
-      }
-      f->dump_int("available_from_bluestore", extra_space);
+
       f->close_section();
     } else if (command == "bluefs stats") {
       std::stringstream ss;
       bluefs->dump_block_extents(ss);
       bluefs->dump_volume_selector(ss);
       out.append(ss);
+    } else if (command == "bluefs files list") {
+      const char* devnames[3] = {"wal","db","slow"};
+      std::lock_guard l(bluefs->lock);
+      f->open_array_section("files");
+      for (auto &d : bluefs->dir_map) {
+        std::string dir = d.first;
+        for (auto &r : d.second->file_map) {
+          f->open_object_section("file");
+          f->dump_string("name", (dir + "/" + r.first).c_str());
+          std::vector<size_t> sizes;
+          sizes.resize(bluefs->bdev.size());
+          for(auto& i : r.second->fnode.extents) {
+            sizes[i.bdev] += i.length;
+          }
+          for (size_t i = 0; i < sizes.size(); i++) {
+            if (sizes[i]>0) {
+	      if (i < sizeof(devnames) / sizeof(*devnames))
+		f->dump_int(devnames[i], sizes[i]);
+	      else
+		f->dump_int(("dev-"+to_string(i)).c_str(), sizes[i]);
+	    }
+          }
+          f->close_section();
+        }
+      }
+      f->close_section();
+      f->flush(out);
+    } else if (command == "bluefs debug_inject_read_zeros") {
+      bluefs->inject_read_zeros++;
     } else {
       errss << "Invalid command" << std::endl;
       return -ENOSYS;
@@ -144,12 +187,16 @@ BlueFS::BlueFS(CephContext* cct)
   : cct(cct),
     bdev(MAX_BDEV),
     ioc(MAX_BDEV),
-    block_all(MAX_BDEV)
+    block_reserved(MAX_BDEV),
+    alloc(MAX_BDEV),
+    alloc_size(MAX_BDEV, 0),
+    pending_release(MAX_BDEV)
 {
   discard_cb[BDEV_WAL] = wal_discard_cb;
   discard_cb[BDEV_DB] = db_discard_cb;
   discard_cb[BDEV_SLOW] = slow_discard_cb;
   asok_hook = SocketHook::create(this);
+
 }
 
 BlueFS::~BlueFS()
@@ -174,10 +221,6 @@ void BlueFS::_init_logger()
 {
   PerfCountersBuilder b(cct, "bluefs",
                         l_bluefs_first, l_bluefs_last);
-  b.add_u64_counter(l_bluefs_gift_bytes, "gift_bytes",
-		    "Bytes gifted from BlueStore", NULL, 0, unit_t(UNIT_BYTES));
-  b.add_u64_counter(l_bluefs_reclaim_bytes, "reclaim_bytes",
-		    "Bytes reclaimed by BlueStore", NULL, 0, unit_t(UNIT_BYTES));
   b.add_u64(l_bluefs_db_total_bytes, "db_total_bytes",
 	    "Total bytes (main db device)",
 	    "b", PerfCountersBuilder::PRIO_USEFUL, unit_t(UNIT_BYTES));
@@ -252,6 +295,10 @@ void BlueFS::_init_logger()
   b.add_u64_counter(l_bluefs_read_prefetch_bytes, "read_prefetch_bytes",
 		    "Bytes requested in prefetch read mode", NULL,
 		    PerfCountersBuilder::PRIO_USEFUL, unit_t(UNIT_BYTES));
+  b.add_u64(l_bluefs_read_zeros_candidate, "read_zeros_candidate",
+	    "How many times bluefs read found page with all 0s");
+  b.add_u64(l_bluefs_read_zeros_errors, "read_zeros_errors",
+	    "How many times bluefs read found transient page with all 0s");
 
   logger = b.create_perf_counters();
   cct->get_perfcounters_collection()->add(logger);
@@ -270,31 +317,31 @@ void BlueFS::_update_logger_stats()
   logger->set(l_bluefs_log_bytes, log_writer->file->fnode.size);
 
   if (alloc[BDEV_WAL]) {
-    logger->set(l_bluefs_wal_total_bytes, block_all[BDEV_WAL].size());
-    logger->set(l_bluefs_wal_used_bytes,
-		block_all[BDEV_WAL].size() - alloc[BDEV_WAL]->get_free());
+    logger->set(l_bluefs_wal_total_bytes, _get_total(BDEV_WAL));
+    logger->set(l_bluefs_wal_used_bytes, _get_used(BDEV_WAL));
   }
   if (alloc[BDEV_DB]) {
-    logger->set(l_bluefs_db_total_bytes, block_all[BDEV_DB].size());
-    logger->set(l_bluefs_db_used_bytes,
-		block_all[BDEV_DB].size() - alloc[BDEV_DB]->get_free());
+    logger->set(l_bluefs_db_total_bytes, _get_total(BDEV_DB));
+    logger->set(l_bluefs_db_used_bytes, _get_used(BDEV_DB));
   }
   if (alloc[BDEV_SLOW]) {
-    logger->set(l_bluefs_slow_total_bytes, block_all[BDEV_SLOW].size());
-    logger->set(l_bluefs_slow_used_bytes,
-		block_all[BDEV_SLOW].size() - alloc[BDEV_SLOW]->get_free());
+    logger->set(l_bluefs_slow_total_bytes, _get_total(BDEV_SLOW));
+    logger->set(l_bluefs_slow_used_bytes, _get_used(BDEV_SLOW));
   }
 }
 
 int BlueFS::add_block_device(unsigned id, const string& path, bool trim,
-			     bool shared_with_bluestore)
+                             uint64_t reserved,
+                             bluefs_shared_alloc_context_t* _shared_alloc)
 {
-  dout(10) << __func__ << " bdev " << id << " path " << path << dendl;
+  dout(10) << __func__ << " bdev " << id << " path " << path << " "
+           << reserved << dendl;
   ceph_assert(id < bdev.size());
   ceph_assert(bdev[id] == NULL);
   BlockDevice *b = BlockDevice::create(cct, path, NULL, NULL,
 				       discard_cb[id], static_cast<void*>(this));
-  if (shared_with_bluestore) {
+  block_reserved[id] = reserved;
+  if (_shared_alloc) {
     b->set_no_exclusive_lock();
   }
   int r = b->open(path);
@@ -310,6 +357,12 @@ int BlueFS::add_block_device(unsigned id, const string& path, bool trim,
 	  << " size " << byte_u_t(b->get_size()) << dendl;
   bdev[id] = b;
   ioc[id] = new IOContext(cct, NULL);
+  if (_shared_alloc) {
+    ceph_assert(!shared_alloc);
+    shared_alloc = _shared_alloc;
+    alloc[id] = shared_alloc->a;
+    shared_alloc_id = id;
+  }
   return 0;
 }
 
@@ -320,88 +373,10 @@ bool BlueFS::bdev_support_label(unsigned id)
   return bdev[id]->supported_bdev_label();
 }
 
-uint64_t BlueFS::get_block_device_size(unsigned id)
+uint64_t BlueFS::get_block_device_size(unsigned id) const
 {
   if (id < bdev.size() && bdev[id])
     return bdev[id]->get_size();
-  return 0;
-}
-
-void BlueFS::_add_block_extent(unsigned id, uint64_t offset, uint64_t length,
-                               bool skip)
-{
-  dout(1) << __func__ << " bdev " << id
-	  << " 0x" << std::hex << offset << "~" << length << std::dec
-	  << " skip " << skip
-	  << dendl;
-
-  ceph_assert(id < bdev.size());
-  ceph_assert(bdev[id]);
-  ceph_assert(bdev[id]->get_size() >= offset + length);
-  block_all[id].insert(offset, length);
-
-  if (id < alloc.size() && alloc[id]) {
-    if (!skip)
-      log_t.op_alloc_add(id, offset, length);
-
-    alloc[id]->init_add_free(offset, length);
-  }
-
-  if (logger)
-    logger->inc(l_bluefs_gift_bytes, length);
-  dout(10) << __func__ << " done" << dendl;
-}
-
-int BlueFS::reclaim_blocks(unsigned id, uint64_t want,
-			   PExtentVector *extents)
-{
-  std::unique_lock l(lock);
-  dout(1) << __func__ << " bdev " << id
-          << " want 0x" << std::hex << want << std::dec << dendl;
-  ceph_assert(id < alloc.size());
-  ceph_assert(alloc[id]);
-  int64_t got = 0;
-
-  interval_set<uint64_t> granular;
-  while (want > 0 && !block_unused_too_granular[id].empty()) {
-    auto p = block_unused_too_granular[id].begin();
-    dout(20) << __func__ << " unused " << (int)id << ":"
-	     << std::hex << p.get_start() << "~" << p.get_len() << dendl;
-    extents->push_back({p.get_start(), p.get_len()});
-    granular.insert(p.get_start(), p.get_len());
-    if (want >= p.get_len()) {
-      want -= p.get_len();
-    } else {
-      want = 0;
-    }
-    got += p.get_len();
-    block_unused_too_granular[id].erase(p);
-  }
-
-  if (want > 0) {
-    got += alloc[id]->allocate(want, alloc_size[id], 0, extents);
-    ceph_assert(got != 0);
-    if (got < 0) {
-      derr << __func__ << " failed to allocate space to return to bluestore"
-	   << dendl;
-      alloc[id]->dump();
-      block_unused_too_granular[id].insert(granular);
-      return got;
-    }
-
-    for (auto& p : *extents) {
-      block_all[id].erase(p.offset, p.length);
-      log_t.op_alloc_rm(id, p.offset, p.length);
-    }
-
-    flush_bdev();
-    int r = _flush_and_sync_log(l);
-    ceph_assert(r == 0);
-  }
-
-  logger->inc(l_bluefs_reclaim_bytes, got);
-  dout(1) << __func__ << " bdev " << id << " want 0x" << std::hex << want
-	  << " got " << *extents << dendl;
   return 0;
 }
 
@@ -410,6 +385,9 @@ void BlueFS::handle_discard(unsigned id, interval_set<uint64_t>& to_release)
   dout(10) << __func__ << " bdev " << id << dendl;
   ceph_assert(alloc[id]);
   alloc[id]->release(to_release);
+  if (is_shared_alloc(id)) {
+    shared_alloc->bluefs_used -= to_release.size();
+  }
 }
 
 uint64_t BlueFS::get_used()
@@ -417,18 +395,44 @@ uint64_t BlueFS::get_used()
   std::lock_guard l(lock);
   uint64_t used = 0;
   for (unsigned id = 0; id < MAX_BDEV; ++id) {
-    if (alloc[id]) {
-      used += block_all[id].size() - alloc[id]->get_free();
-    }
+    used += _get_used(id);
   }
   return used;
+}
+
+uint64_t BlueFS::_get_used(unsigned id) const
+{
+  uint64_t used = 0;
+  if (!alloc[id])
+     return 0;
+
+  if (is_shared_alloc(id)) {
+    used = shared_alloc->bluefs_used;
+  } else {
+    used = _get_total(id) - alloc[id]->get_free();
+  }
+  return used;
+}
+
+uint64_t BlueFS::get_used(unsigned id)
+{
+  ceph_assert(id < alloc.size());
+  ceph_assert(alloc[id]);
+  std::lock_guard l(lock);
+  return _get_used(id);
+}
+
+uint64_t BlueFS::_get_total(unsigned id) const
+{
+  ceph_assert(id < bdev.size());
+  ceph_assert(id < block_reserved.size());
+  return get_block_device_size(id) - block_reserved[id];
 }
 
 uint64_t BlueFS::get_total(unsigned id)
 {
   std::lock_guard l(lock);
-  ceph_assert(id < block_all.size());
-  return block_all[id].size();
+  return _get_total(id);
 }
 
 uint64_t BlueFS::get_free(unsigned id)
@@ -451,46 +455,13 @@ void BlueFS::dump_block_extents(ostream& out)
     if (!bdev[i]) {
       continue;
     }
-    auto owned = get_total(i);
+    auto total = get_total(i);
     auto free = get_free(i);
 
-    out << i << " : device size 0x" << std::hex << bdev[i]->get_size()
-        << " : own 0x" << block_all[i]
-        << " = 0x" << owned
-        << " : using 0x" << owned - free
-	<< std::dec << "(" << byte_u_t(owned - free) << ")";
-    if (i == _get_slow_device_id()) {
-      ceph_assert(slow_dev_expander);
-      ceph_assert(alloc[i]);
-      free = slow_dev_expander->available_freespace(alloc_size[i]);
-      out << std::hex
-          << " : bluestore has 0x" << free
-          << std::dec << "(" << byte_u_t(free) << ") available";
-    }
+    out << i << " : device size 0x" << std::hex << total
+        << " : using 0x" << total - free
+	<< std::dec << "(" << byte_u_t(total - free) << ")";
     out << "\n";
-  }
-}
-
-void BlueFS::get_usage(vector<pair<uint64_t,uint64_t>> *usage)
-{
-  std::lock_guard l(lock);
-  usage->resize(bdev.size());
-  for (unsigned id = 0; id < bdev.size(); ++id) {
-    if (!bdev[id]) {
-      (*usage)[id] = make_pair(0, 0);
-      continue;
-    }
-    (*usage)[id].first = alloc[id]->get_free();
-    (*usage)[id].second = block_all[id].size();
-    uint64_t used =
-      (block_all[id].size() - (*usage)[id].first) * 100 / block_all[id].size();
-    dout(10) << __func__ << " bdev " << id
-	     << " free " << (*usage)[id].first
-	     << " (" << byte_u_t((*usage)[id].first) << ")"
-	     << " / " << (*usage)[id].second
-	     << " (" << byte_u_t((*usage)[id].second) << ")"
-	     << ", used " << used << "%"
-	     << dendl;
   }
 }
 
@@ -498,9 +469,14 @@ int BlueFS::get_block_extents(unsigned id, interval_set<uint64_t> *extents)
 {
   std::lock_guard l(lock);
   dout(10) << __func__ << " bdev " << id << dendl;
-  if (id >= block_all.size())
-    return -EINVAL;
-  *extents = block_all[id];
+  ceph_assert(id < alloc.size());
+  for (auto& p : file_map) {
+    for (auto& q : p.second->fnode.extents) {
+      if (q.bdev == id) {
+        extents->insert(q.offset, q.length);
+      }
+    }
+  }
   return 0;
 }
 
@@ -543,17 +519,6 @@ int BlueFS::mkfs(uuid_d osd_uuid, const bluefs_layout_t& layout)
 
   // initial txn
   log_t.op_init();
-  for (unsigned bdev = 0; bdev < MAX_BDEV; ++bdev) {
-    interval_set<uint64_t>& p = block_all[bdev];
-    if (p.empty())
-      continue;
-    for (interval_set<uint64_t>::iterator q = p.begin(); q != p.end(); ++q) {
-      dout(20) << __func__ << " op_alloc_add " << bdev << " 0x"
-               << std::hex << q.get_start() << "~" << q.get_len() << std::dec
-               << dendl;
-      log_t.op_alloc_add(bdev, q.get_start(), q.get_len());
-    }
-  }
   _flush_and_sync_log(l);
 
   // write supers
@@ -566,10 +531,13 @@ int BlueFS::mkfs(uuid_d osd_uuid, const bluefs_layout_t& layout)
   super = bluefs_super_t();
   _close_writer(log_writer);
   log_writer = NULL;
-  block_all.clear();
   vselector.reset(nullptr);
   _stop_alloc();
   _shutdown_logger();
+  if (shared_alloc) {
+    ceph_assert(shared_alloc->need_init);
+    shared_alloc->need_init = false;
+  }
 
   dout(10) << __func__ << " success" << dendl;
   return 0;
@@ -578,10 +546,6 @@ int BlueFS::mkfs(uuid_d osd_uuid, const bluefs_layout_t& layout)
 void BlueFS::_init_alloc()
 {
   dout(20) << __func__ << dendl;
-  alloc.resize(MAX_BDEV);
-  alloc_size.resize(MAX_BDEV, 0);
-  pending_release.resize(MAX_BDEV);
-  block_unused_too_granular.resize(MAX_BDEV);
 
   if (bdev[BDEV_WAL]) {
     alloc_size[BDEV_WAL] = cct->_conf->bluefs_alloc_size;
@@ -605,22 +569,31 @@ void BlueFS::_init_alloc()
       continue;
     }
     ceph_assert(bdev[id]->get_size());
-    std::string name = "bluefs-";
-    const char* devnames[] = {"wal","db","slow"};
-    if (id <= BDEV_SLOW)
-      name += devnames[id];
-    else
-      name += to_string(uintptr_t(this));
     ceph_assert(alloc_size[id]);
-    dout(1) << __func__ << " id " << id
-	     << " alloc_size 0x" << std::hex << alloc_size[id]
-	     << " size 0x" << bdev[id]->get_size() << std::dec << dendl;
-    alloc[id] = Allocator::create(cct, cct->_conf->bluefs_allocator,
-				  bdev[id]->get_size(),
-				  alloc_size[id], name);
-    interval_set<uint64_t>& p = block_all[id];
-    for (interval_set<uint64_t>::iterator q = p.begin(); q != p.end(); ++q) {
-      alloc[id]->init_add_free(q.get_start(), q.get_len());
+    if (is_shared_alloc(id)) {
+      dout(1) << __func__ << " shared, id " << id << std::hex
+              << ", capacity 0x" << bdev[id]->get_size()
+              << ", block size 0x" << alloc_size[id]
+              << std::dec << dendl;
+    } else {
+      std::string name = "bluefs-";
+      const char* devnames[] = { "wal","db","slow" };
+      if (id <= BDEV_SLOW)
+        name += devnames[id];
+      else
+        name += to_string(uintptr_t(this));
+      dout(1) << __func__ << " new, id " << id << std::hex
+              << ", allocator name " << name
+              << ", allocator type " << cct->_conf->bluefs_allocator
+              << ", capacity 0x" << bdev[id]->get_size()
+              << ", block size 0x" << alloc_size[id]
+              << std::dec << dendl;
+      alloc[id] = Allocator::create(cct, cct->_conf->bluefs_allocator,
+				    bdev[id]->get_size(),
+				    alloc_size[id], name);
+      alloc[id]->init_add_free(
+        block_reserved[id],
+        _get_total(id));
     }
   }
 }
@@ -633,14 +606,153 @@ void BlueFS::_stop_alloc()
       p->discard_drain();
   }
 
-  for (auto p : alloc) {
-    if (p != nullptr)  {
-      p->shutdown();
-      delete p;
+  for (size_t i = 0; i < alloc.size(); ++i) {
+    if (alloc[i] && !is_shared_alloc(i)) {
+      alloc[i]->shutdown();
+      delete alloc[i];
+      alloc[i] = nullptr;
     }
   }
-  alloc.clear();
-  block_unused_too_granular.clear();
+}
+
+int BlueFS::read(uint8_t ndev, uint64_t off, uint64_t len,
+		 ceph::buffer::list *pbl, IOContext *ioc, bool buffered)
+{
+  dout(10) << __func__ << " dev " << int(ndev)
+           << ": 0x" << std::hex << off << "~" << len << std::dec
+	   << (buffered ? " buffered" : "")
+	   << dendl;
+  int r;
+  bufferlist bl;
+  r = bdev[ndev]->read(off, len, &bl, ioc, buffered);
+  if (r != 0) {
+    return r;
+  }
+  uint64_t block_size = bdev[ndev]->get_block_size();
+  if (inject_read_zeros) {
+    if (len >= block_size * 2) {
+      derr << __func__ << " injecting error, zeros at "
+	   << int(ndev) << ": 0x" << std::hex << (off + len / 2)
+	   << "~" << (block_size * 2) << std::dec << dendl;
+      //use beginning, replace 8K in the middle with zeros, use tail
+      bufferlist temp;
+      bl.splice(0, len / 2 - block_size, &temp);
+      temp.append(buffer::create(block_size * 2, 0));
+      bl.splice(block_size * 2, len / 2 - block_size, &temp);
+      bl = temp;
+      inject_read_zeros--;
+    }
+  }
+  //make a check if there is a block with all 0
+  uint64_t to_check_len = len;
+  uint64_t skip = p2nphase(off, block_size);
+  if (skip >= to_check_len) {
+    return r;
+  }
+  auto it = bl.begin(skip);
+  to_check_len -= skip;
+  bool all_zeros = false;
+  while (all_zeros == false && to_check_len >= block_size) {
+    // checking 0s step
+    unsigned block_left = block_size;
+    unsigned avail;
+    const char* data;
+    all_zeros = true;
+    while (all_zeros && block_left > 0) {
+      avail = it.get_ptr_and_advance(block_left, &data);
+      block_left -= avail;
+      all_zeros = mem_is_zero(data, avail);
+    }
+    // skipping step
+    while (block_left > 0) {
+      avail = it.get_ptr_and_advance(block_left, &data);
+      block_left -= avail;
+    }
+    to_check_len -= block_size;
+  }
+  if (all_zeros) {
+    logger->inc(l_bluefs_read_zeros_candidate, 1);
+    bufferlist bl_reread;
+    r = bdev[ndev]->read(off, len, &bl_reread, ioc, buffered);
+    if (r != 0) {
+      return r;
+    }
+    // check if both read gave the same
+    if (!bl.contents_equal(bl_reread)) {
+      // report problems to log, but continue, maybe it will be good now...
+      derr << __func__ << " initial read of " << int(ndev)
+	   << ": 0x" << std::hex << off << "~" << len
+	   << std::dec << ": different then re-read " << dendl;
+      logger->inc(l_bluefs_read_zeros_errors, 1);
+    }
+    // use second read will be better if is different
+    pbl->append(bl_reread);
+  } else {
+    pbl->append(bl);
+  }
+  return r;
+}
+
+int BlueFS::read_random(uint8_t ndev, uint64_t off, uint64_t len, char *buf, bool buffered)
+{
+  dout(10) << __func__ << " dev " << int(ndev)
+           << ": 0x" << std::hex << off << "~" << len << std::dec
+	   << (buffered ? " buffered" : "")
+	   << dendl;
+  int r;
+  r = bdev[ndev]->read_random(off, len, buf, buffered);
+  if (r != 0) {
+    return r;
+  }
+  uint64_t block_size = bdev[ndev]->get_block_size();
+  if (inject_read_zeros) {
+    if (len >= block_size * 2) {
+      derr << __func__ << " injecting error, zeros at "
+	   << int(ndev) << ": 0x" << std::hex << (off + len / 2)
+	   << "~" << (block_size * 2) << std::dec << dendl;
+      //zero middle 8K
+      memset(buf + len / 2 - block_size, 0, block_size * 2);
+      inject_read_zeros--;
+    }
+  }
+  //make a check if there is a block with all 0
+  uint64_t to_check_len = len;
+  const char* data = buf;
+  uint64_t skip = p2nphase(off, block_size);
+  if (skip >= to_check_len) {
+    return r;
+  }
+  to_check_len -= skip;
+  data += skip;
+
+  bool all_zeros = false;
+  while (all_zeros == false && to_check_len >= block_size) {
+    if (mem_is_zero(data, block_size)) {
+      // at least one block is all zeros
+      all_zeros = true;
+      break;
+    }
+    data += block_size;
+    to_check_len -= block_size;
+  }
+  if (all_zeros) {
+    logger->inc(l_bluefs_read_zeros_candidate, 1);
+    std::unique_ptr<char[]> data_reread(new char[len]);
+    r = bdev[ndev]->read_random(off, len, &data_reread[0], buffered);
+    if (r != 0) {
+      return r;
+    }
+    // check if both read gave the same
+    if (memcmp(buf, &data_reread[0], len) != 0) {
+      derr << __func__ << " initial read of " << int(ndev)
+	   << ": 0x" << std::hex << off << "~" << len
+	   << std::dec << ": different then re-read " << dendl;
+      logger->inc(l_bluefs_read_zeros_errors, 1);
+      // second read is probably better
+      memcpy(buf, &data_reread[0], len);
+    }
+  }
+  return r;
 }
 
 int BlueFS::mount()
@@ -662,8 +774,6 @@ int BlueFS::mount()
         get_block_device_size(BlueFS::BDEV_SLOW) * 95 / 100));
   }
 
-  block_all.clear();
-  block_all.resize(MAX_BDEV);
   _init_alloc();
   _init_logger();
 
@@ -678,8 +788,23 @@ int BlueFS::mount()
   for (auto& p : file_map) {
     dout(30) << __func__ << " noting alloc for " << p.second->fnode << dendl;
     for (auto& q : p.second->fnode.extents) {
-      alloc[q.bdev]->init_rm_free(q.offset, q.length);
+      bool is_shared = is_shared_alloc(q.bdev);
+      ceph_assert(!is_shared || (is_shared && shared_alloc));
+      if (is_shared && shared_alloc->need_init && shared_alloc->a) {
+        shared_alloc->bluefs_used += q.length;
+        alloc[q.bdev]->init_rm_free(q.offset, q.length);
+      } else if (!is_shared) {
+        alloc[q.bdev]->init_rm_free(q.offset, q.length);
+      }
     }
+  }
+  if (shared_alloc) {
+    shared_alloc->need_init = false;
+    dout(1) << __func__ << " shared_bdev_used = "
+            << shared_alloc->bluefs_used << dendl;
+  } else {
+    dout(1) << __func__ << " shared bdev not used"
+            << dendl;
   }
 
   // set up the log for future writes
@@ -844,7 +969,6 @@ int BlueFS::_open_super()
 
 int BlueFS::_check_new_allocations(const bluefs_fnode_t& fnode,
   size_t dev_count,
-  boost::dynamic_bitset<uint64_t>* owned_blocks,
   boost::dynamic_bitset<uint64_t>* used_blocks)
 {
   auto& fnode_extents = fnode.extents;
@@ -852,21 +976,6 @@ int BlueFS::_check_new_allocations(const bluefs_fnode_t& fnode,
     auto id = e.bdev;
     bool fail = false;
     ceph_assert(id < dev_count);
-    apply_for_bitset_range(e.offset, e.length, alloc_size[id], owned_blocks[id],
-      [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-        if (!bs.test(pos)) {
-          fail = true;
-        }
-      }
-    );
-    if (fail) {
-      derr << __func__ << " invalid extent " << int(id)
-        << ": 0x" << std::hex << e.offset << "~" << e.length
-        << std::dec
-        << ": wasn't given but allocated for ino " << fnode.ino
-        << dendl;
-      return -EFAULT;
-    }
 
     apply_for_bitset_range(e.offset, e.length, alloc_size[id], used_blocks[id],
       [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
@@ -883,51 +992,6 @@ int BlueFS::_check_new_allocations(const bluefs_fnode_t& fnode,
         << dendl;
       return -EFAULT;
     }
-  }
-  return 0;
-}
-
-int BlueFS::_adjust_granularity(
-  __u8 id, uint64_t *offset, uint64_t *length, bool alloc)
-{
-  const char *op = alloc ? "op_alloc_add" : "op_alloc_rm";
-  auto oldo = *offset;
-  auto oldl = *length;
-  if (*offset & (alloc_size[id] - 1)) {
-    *offset &= ~(alloc_size[id] - 1);
-    *offset += alloc_size[id];
-    if (*length > *offset - oldo) {
-      if (alloc) {
-	block_unused_too_granular[id].insert(oldo, *offset - oldo);
-      } else {
-	block_unused_too_granular[id].erase(oldo, *offset - oldo);
-      }
-      *length -= (*offset - oldo);
-    } else {
-      if (alloc) {
-	block_unused_too_granular[id].insert(oldo, *length);
-      } else {
-	block_unused_too_granular[id].erase(oldo, *length);
-      }
-      *length = 0;
-    }
-  }
-  if (*length & (alloc_size[id] - 1)) {
-    *length &= ~(alloc_size[id] - 1);
-    if (alloc) {
-      block_unused_too_granular[id].insert(
-	*offset + *length,
-	oldo + oldl - *offset - *length);
-    } else {
-      block_unused_too_granular[id].erase(
-	*offset + *length,
-	oldo + oldl - *offset - *length);
-    }
-  }
-  if (oldo != *offset || oldl != *length) {
-    dout(10) << __func__ << " " << op << " "
-	     << (int)id << ":" << std::hex << oldo << "~" << oldl
-	     << " -> " << (int)id << ":" << *offset << "~" << *length << dendl;
   }
   return 0;
 }
@@ -972,13 +1036,8 @@ int BlueFS::_replay(bool noop, bool to_stdout)
   FileRef log_file;
   log_file = _get_file(1);
 
-  // sanity check
-  for (auto& a : block_unused_too_granular) {
-    ceph_assert(a.empty());
-  }
-
+  log_file->fnode = super.log_fnode;
   if (!noop) {
-    log_file->fnode = super.log_fnode;
     log_file->vselector_hint =
       vselector->get_hint_for_log();
   } else {
@@ -1000,13 +1059,13 @@ int BlueFS::_replay(bool noop, bool to_stdout)
   bool seen_recs = false;
 
   boost::dynamic_bitset<uint64_t> used_blocks[MAX_BDEV];
-  boost::dynamic_bitset<uint64_t> owned_blocks[MAX_BDEV];
 
-  if (cct->_conf->bluefs_log_replay_check_allocations) {
-    for (size_t i = 0; i < MAX_BDEV; ++i) {
-      if (alloc_size[i] != 0 && bdev[i] != nullptr) {
-        used_blocks[i].resize(round_up_to(bdev[i]->get_size(), alloc_size[i]) / alloc_size[i]);
-        owned_blocks[i].resize(round_up_to(bdev[i]->get_size(), alloc_size[i]) / alloc_size[i]);
+  if (!noop) {
+    if (cct->_conf->bluefs_log_replay_check_allocations) {
+      for (size_t i = 0; i < MAX_BDEV; ++i) {
+	if (alloc_size[i] != 0 && bdev[i] != nullptr) {
+	  used_blocks[i].resize(round_up_to(bdev[i]->get_size(), alloc_size[i]) / alloc_size[i]);
+	}
       }
     }
   }
@@ -1021,7 +1080,10 @@ int BlueFS::_replay(bool noop, bool to_stdout)
     {
       int r = _read(log_reader, read_pos, super.block_size,
 		    &bl, NULL);
-      ceph_assert(r == (int)super.block_size);
+      if (r != (int)super.block_size && cct->_conf->bluefs_replay_recovery) {
+	r += do_replay_recovery_read(log_reader, pos, read_pos + r, super.block_size - r, &bl);
+      }
+      assert(r == (int)super.block_size);
       read_pos += r;
     }
     uint64_t more = 0;
@@ -1074,10 +1136,17 @@ int BlueFS::_replay(bool noop, bool to_stdout)
       bufferlist t;
       int r = _read(log_reader, read_pos, more, &t, NULL);
       if (r < (int)more) {
-	derr  << __func__ << " 0x" << std::hex << pos
-              << ": stop: len is 0x" << bl.length() + more << std::dec
-              << ", which is past eof" << dendl;
-	break;
+	dout(10) << __func__ << " 0x" << std::hex << pos
+                 << ": stop: len is 0x" << bl.length() + more << std::dec
+                 << ", which is past eof" << dendl;
+	if (cct->_conf->bluefs_replay_recovery) {
+	  //try to search for more data
+	  r += do_replay_recovery_read(log_reader, pos, read_pos + r, more - r, &t);
+	  if (r < (int)more) {
+	    //in normal mode we must read r==more, for recovery it is too strict
+	    break;
+	  }
+	}
       }
       ceph_assert(r == (int)more);
       bl.claim_append(t);
@@ -1171,122 +1240,26 @@ int BlueFS::_replay(bool noop, bool to_stdout)
 	break;
 
       case bluefs_transaction_t::OP_ALLOC_ADD:
+	// LEGACY, do nothing but read params
         {
-	  __u8 id;
-	  uint64_t offset, length;
-	  decode(id, p);
-	  decode(offset, p);
-	  decode(length, p);
-	  dout(20) << __func__ << " 0x" << std::hex << pos << std::dec
-                   << ":  op_alloc_add " << " " << (int)id
-                   << ":0x" << std::hex << offset << "~" << length << std::dec
-                   << dendl;
-          if (unlikely(to_stdout)) {
-            std::cout << " 0x" << std::hex << pos << std::dec
-                      << ":  op_alloc_add " << " " << (int)id
-                      << ":0x" << std::hex << offset << "~" << length << std::dec
-                      << std::endl;
-          }
-	  if (!noop) {
-	    block_all[id].insert(offset, length);
-	    _adjust_granularity(id, &offset, &length, true);
-	    if (length) {
-	      alloc[id]->init_add_free(offset, length);
-	    }
-
-            if (cct->_conf->bluefs_log_replay_check_allocations) {
-              bool fail = false;
-              apply_for_bitset_range(offset, length, alloc_size[id], owned_blocks[id],
-                [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                  if (bs.test(pos)) {
-                    fail = true;
-                  } else {
-                    bs.set(pos);
-                  }
-                }
-              );
-              if (fail) {
-                derr << __func__ << " invalid extent " << (int)id
-                  << ": 0x" << std::hex << offset << "~" << length
-                  << std::dec << ": already given" << dendl;
-                return -EFAULT;
-              }
-              apply_for_bitset_range(offset, length, alloc_size[id], used_blocks[id],
-                [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                  if (bs.test(pos)) {
-                    fail = true;
-                  }
-                }
-              );
-              if (fail) {
-                derr << __func__ << " invalid extent " << int(id)
-                  << ": 0x" << std::hex << offset << "~" << length
-                  << std::dec << ": already in use" << dendl;
-                return -EFAULT;
-              }
-            }
-	  }
-	}
+          __u8 id;
+          uint64_t offset, length;
+          decode(id, p);
+          decode(offset, p);
+          decode(length, p);
+        }
 	break;
 
       case bluefs_transaction_t::OP_ALLOC_RM:
+	// LEGACY, do nothing but read params
         {
-	  __u8 id;
-	  uint64_t offset, length;
-	  decode(id, p);
-	  decode(offset, p);
-	  decode(length, p);
-	  dout(20) << __func__ << " 0x" << std::hex << pos << std::dec
-                   << ":  op_alloc_rm " << " " << (int)id
-                   << ":0x" << std::hex << offset << "~" << length << std::dec
-                   << dendl;
-          if (unlikely(to_stdout)) {
-            std::cout << " 0x" << std::hex << pos << std::dec
-                      << ":  op_alloc_rm " << " " << (int)id
-                      << ":0x" << std::hex << offset << "~" << length << std::dec
-                      << std::endl;
-          }
-	  if (!noop) {
-	    block_all[id].erase(offset, length);
-	    _adjust_granularity(id, &offset, &length, false);
-	    if (length) {
-	      alloc[id]->init_rm_free(offset, length);
-	    }
-            if (cct->_conf->bluefs_log_replay_check_allocations) {
-              bool fail = false;
-              apply_for_bitset_range(offset, length, alloc_size[id], owned_blocks[id],
-                [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                  if (!bs.test(pos)) {
-                    fail = true;
-                  } else {
-                    bs.reset(pos);
-                  }
-                }
-              );
-              if (fail) {
-                derr << __func__ << " invalid extent " << int(id)
-                  << ": 0x" << std::hex << offset << "~" << length
-                  << std::dec << ": wasn't given" << dendl;
-                return -EFAULT;
-              }
-
-              apply_for_bitset_range(offset, length, alloc_size[id], used_blocks[id],
-                [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                  if (bs.test(pos)) {
-                    fail = true;
-                  }
-                }
-              );
-              if (fail) {
-                derr << __func__ << " invalid extent " << (int)id
-                   << ": 0x" << std::hex << offset << "~" << length
-                  << std::dec << ": still in use" << dendl;
-                return -EFAULT;
-              }
-            }
-          }
-	}
-	break;
+          __u8 id;
+          uint64_t offset, length;
+          decode(id, p);
+          decode(offset, p);
+          decode(length, p);
+        }
+        break;
 
       case bluefs_transaction_t::OP_DIR_LINK:
         {
@@ -1407,7 +1380,7 @@ int BlueFS::_replay(bool noop, bool to_stdout)
               if (first_log_check) {
                 first_log_check = false;
                 int r = _check_new_allocations(log_file->fnode,
-                  MAX_BDEV, owned_blocks, used_blocks);
+                  MAX_BDEV, used_blocks);
                 if (r < 0) {
                   return r;
                 }
@@ -1443,7 +1416,7 @@ int BlueFS::_replay(bool noop, bool to_stdout)
 	    }
             if (cct->_conf->bluefs_log_replay_check_allocations) {
               int r = _check_new_allocations(f->fnode,
-                MAX_BDEV, owned_blocks, used_blocks);
+                MAX_BDEV, used_blocks);
               if (r < 0) {
                 return r;
               }
@@ -1472,21 +1445,6 @@ int BlueFS::_replay(bool noop, bool to_stdout)
               for (auto e : fnode_extents) {
                 auto id = e.bdev;
                 bool fail = false;
-                apply_for_bitset_range(e.offset, e.length, alloc_size[id], owned_blocks[id],
-                  [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
-                    if (!bs.test(pos)) {
-                      fail = true;
-                    }
-                  }
-                );
-                if (fail) {
-                  derr << __func__ << " invalid extent " << int(id)
-                    << ": 0x" << std::hex << e.offset << "~" << e.length
-                    << std::dec
-                    << ": wasn't given but is allocated for removed ino " << ino
-                    << dendl;
-                  return -EFAULT;
-                }
 
                 apply_for_bitset_range(e.offset, e.length, alloc_size[id], used_blocks[id],
                   [&](uint64_t pos, boost::dynamic_bitset<uint64_t> &bs) {
@@ -1524,12 +1482,13 @@ int BlueFS::_replay(bool noop, bool to_stdout)
     ++log_seq;
     log_file->fnode.size = log_reader->buf.pos;
   }
-  vselector->add_usage(log_file->vselector_hint, log_file->fnode);
-
+  if (!noop) {
+    vselector->add_usage(log_file->vselector_hint, log_file->fnode);
+  }
   if (!noop && first_log_check &&
         cct->_conf->bluefs_log_replay_check_allocations) {
     int r = _check_new_allocations(log_file->fnode,
-      MAX_BDEV, owned_blocks, used_blocks);
+      MAX_BDEV, used_blocks);
     if (r < 0) {
       return r;
     }
@@ -1556,10 +1515,6 @@ int BlueFS::_replay(bool noop, bool to_stdout)
     }
   }
 
-  for (unsigned id = 0; id < MAX_BDEV; ++id) {
-    dout(10) << __func__ << " block_unused_too_granular " << id << ": "
-	     << block_unused_too_granular[id] << dendl;
-  }
   dout(10) << __func__ << " done" << dendl;
   return 0;
 }
@@ -1567,13 +1522,20 @@ int BlueFS::_replay(bool noop, bool to_stdout)
 int BlueFS::log_dump()
 {
   // only dump log file's content
-  int r = _replay(true, true);
+  ceph_assert(log_writer == nullptr && "cannot log_dump on mounted BlueFS");
+  int r = _open_super();
   if (r < 0) {
-    derr << __func__ << " failed to replay log: " << cpp_strerror(r) << dendl;
+    derr << __func__ << " failed to open super: " << cpp_strerror(r) << dendl;
     return r;
   }
-
-  return 0;
+  _init_logger();
+  r = _replay(true, true);
+  if (r < 0) {
+    derr << __func__ << " failed to replay log: " << cpp_strerror(r) << dendl;
+  }
+  _shutdown_logger();
+  super = bluefs_super_t();
+  return r;
 }
 
 int BlueFS::device_migrate_to_existing(
@@ -1664,6 +1626,9 @@ int BlueFS::device_migrate_to_existing(
 	PExtentVector to_release;
 	to_release.emplace_back(old_ext.offset, old_ext.length);
 	alloc[old_ext.bdev]->release(to_release);
+        if (is_shared_alloc(old_ext.bdev)) {
+          shared_alloc->bluefs_used -= to_release.size();
+        }
       }
 
       // update fnode
@@ -1802,6 +1767,9 @@ int BlueFS::device_migrate_to_new(
 	PExtentVector to_release;
 	to_release.emplace_back(old_ext.offset, old_ext.length);
 	alloc[old_ext.bdev]->release(to_release);
+        if (is_shared_alloc(old_ext.bdev)) {
+          shared_alloc->bluefs_used -= to_release.size();
+        }
       }
 
       // update fnode
@@ -1918,19 +1886,27 @@ int64_t BlueFS::_read_random(
   logger->inc(l_bluefs_read_random_bytes, len);
 
   std::shared_lock s_lock(h->lock);
+  buf->bl.reassign_to_mempool(mempool::mempool_bluefs_file_reader);
   while (len > 0) {
     if (off < buf->bl_off || off >= buf->get_buf_end()) {
       s_lock.unlock();
       uint64_t x_off = 0;
       auto p = h->file->fnode.seek(off, &x_off);
+      ceph_assert(p != h->file->fnode.extents.end());
       uint64_t l = std::min(p->length - x_off, len);
       //hard cap to 1GB
       l = std::min(l, uint64_t(1) << 30);
       dout(20) << __func__ << " read random 0x"
 	       << std::hex << x_off << "~" << l << std::dec
 	       << " of " << *p << dendl;
-      int r = bdev[p->bdev]->read_random(p->offset + x_off, l, out,
-					 cct->_conf->bluefs_buffered_io);
+      int r;
+      if (!cct->_conf->bluefs_check_for_zeros) {
+	r = bdev[p->bdev]->read_random(p->offset + x_off, l, out,
+				       cct->_conf->bluefs_buffered_io);
+      } else {
+	r = read_random(p->bdev, p->offset + x_off, l, out,
+			cct->_conf->bluefs_buffered_io);
+      }
       ceph_assert(r == 0);
       off += l;
       len -= l;
@@ -1951,8 +1927,9 @@ int64_t BlueFS::_read_random(
 	      << " 0x" << off << "~" << len << std::dec
 	      << dendl;
 
-      // NOTE: h->bl is normally a contiguous buffer so c_str() is free.
-      memcpy(out, buf->bl.c_str() + off - buf->bl_off, r);
+      auto p = buf->bl.begin();
+      p.seek(off - buf->bl_off);
+      p.copy(r, out);
       out += r;
 
       dout(30) << __func__ << " result chunk (0x"
@@ -2017,12 +1994,19 @@ int64_t BlueFS::_read(
     if (off < buf->bl_off || off >= buf->get_buf_end()) {
       s_lock.unlock();
       std::unique_lock u_lock(h->lock);
+      buf->bl.reassign_to_mempool(mempool::mempool_bluefs_file_reader);
       if (off < buf->bl_off || off >= buf->get_buf_end()) {
         // if precondition hasn't changed during locking upgrade.
         buf->bl.clear();
         buf->bl_off = off & super.block_mask();
         uint64_t x_off = 0;
         auto p = h->file->fnode.seek(buf->bl_off, &x_off);
+	if (p == h->file->fnode.extents.end()) {
+	  dout(5) << __func__ << " reading less then required "
+		  << ret << "<" << ret + len << dendl;
+	  break;
+	}
+
         uint64_t want = round_up_to(len + (off & ~super.block_mask()),
 				    super.block_size);
         want = std::max(want, buf->max_prefetch);
@@ -2037,8 +2021,14 @@ int64_t BlueFS::_read(
         dout(20) << __func__ << " fetching 0x"
                  << std::hex << x_off << "~" << l << std::dec
                  << " of " << *p << dendl;
-        int r = bdev[p->bdev]->read(p->offset + x_off, l, &buf->bl, ioc[p->bdev],
-				    cct->_conf->bluefs_buffered_io);
+	int r;
+	if (!cct->_conf->bluefs_check_for_zeros) {
+	  r = bdev[p->bdev]->read(p->offset + x_off, l, &buf->bl, ioc[p->bdev],
+				  cct->_conf->bluefs_buffered_io);
+	} else {
+	  r = read(p->bdev, p->offset + x_off, l, &buf->bl, ioc[p->bdev],
+		   cct->_conf->bluefs_buffered_io);
+	}
         ceph_assert(r == 0);
       }
       u_lock.unlock();
@@ -2057,8 +2047,9 @@ int64_t BlueFS::_read(
       outbl->claim_append(t);
     }
     if (out) {
-      // NOTE: h->bl is normally a contiguous buffer so c_str() is free.
-      memcpy(out, buf->bl.c_str() + off - buf->bl_off, r);
+      auto p = buf->bl.begin();
+      p.seek(off - buf->bl_off);
+      p.copy(r, out);
       out += r;
     }
 
@@ -2074,6 +2065,7 @@ int64_t BlueFS::_read(
     ret += r;
     buf->pos += r;
   }
+
   dout(20) << __func__ << " got " << ret << dendl;
   ceph_assert(!outbl || (int)outbl->length() == ret);
   --h->file->num_reading;
@@ -2107,8 +2099,6 @@ uint64_t BlueFS::_estimate_log_size()
   int avg_file_size = 12;
   uint64_t size = 4096 * 2;
   size += file_map.size() * (1 + sizeof(bluefs_fnode_t));
-  for (auto& p : block_all)
-    size += p.num_intervals() * (1 + 1 + sizeof(uint64_t) * 2);
   size += dir_map.size() + (1 + avg_dir_size);
   size += file_map.size() * (1 + avg_dir_size + avg_file_size);
   return round_up_to(size, super.block_size);
@@ -2116,11 +2106,13 @@ uint64_t BlueFS::_estimate_log_size()
 
 void BlueFS::compact_log()
 {
-  std::unique_lock l(lock);
-  if (cct->_conf->bluefs_compact_log_sync) {
-     _compact_log_sync();
-  } else {
-    _compact_log_async(l);
+  std::unique_lock<ceph::mutex> l(lock);
+  if (!cct->_conf->bluefs_replay_recovery_disable_compact) {
+    if (cct->_conf->bluefs_compact_log_sync) {
+      _compact_log_sync();
+    } else {
+      _compact_log_async(l);
+    }
   }
 }
 
@@ -2150,38 +2142,6 @@ void BlueFS::_compact_log_dump_metadata(bluefs_transaction_t *t,
   dout(20) << __func__ << " op_init" << dendl;
 
   t->op_init();
-  for (unsigned bdev = 0; bdev < MAX_BDEV; ++bdev) {
-    interval_set<uint64_t>& p = block_all[bdev];
-    for (interval_set<uint64_t>::iterator q = p.begin(); q != p.end(); ++q) {
-      auto bdev_new = bdev;
-      if ((flags & REMOVE_WAL) && bdev == BDEV_WAL) {
-	continue;
-      }
-      if ((flags & REMOVE_DB) && bdev == BDEV_DB) {
-	continue;
-      }
-      if ((flags & RENAME_SLOW2DB) && bdev == BDEV_SLOW) {
-	bdev_new = BDEV_DB;
-      }
-      if ((flags & RENAME_DB2SLOW) && bdev == BDEV_DB) {
-	bdev_new = BDEV_SLOW;
-      }
-      if (bdev == BDEV_NEWDB) {
-	// REMOVE_DB xor RENAME_DB
-	ceph_assert(!(flags & REMOVE_DB) != !(flags & RENAME_DB2SLOW));
-	ceph_assert(!(flags & RENAME_SLOW2DB));
-	bdev_new = BDEV_DB;
-      }
-      if (bdev == BDEV_NEWWAL) {
-	ceph_assert(flags & REMOVE_WAL);
-	bdev_new = BDEV_WAL;
-      }
-      dout(20) << __func__ << " op_alloc_add " << bdev_new << " 0x"
-               << std::hex << q.get_start() << "~" << q.get_len() << std::dec
-               << dendl;
-      t->op_alloc_add(bdev_new, q.get_start(), q.get_len());
-    }
-  }
   for (auto& [ino, file_ref] : file_map) {
     if (ino == 1)
       continue;
@@ -2563,8 +2523,10 @@ int BlueFS::_flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
   ceph_assert(!log_t.empty());
 
   // allocate some more space (before we run out)?
+  // BTW: this triggers `flush()` in the `page_aligned_appender` of `log_writer`.
   int64_t runway = log_writer->file->fnode.get_allocated() -
     log_writer->get_effective_write_pos();
+  bool just_expanded_log = false;
   if (runway < (int64_t)cct->_conf->bluefs_min_log_runway) {
     dout(10) << __func__ << " allocating more log runway (0x"
 	     << std::hex << runway << std::dec  << " remaining)" << dendl;
@@ -2580,6 +2542,7 @@ int BlueFS::_flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
     ceph_assert(r == 0);
     vselector->add_usage(log_writer->file->vselector_hint, log_writer->file->fnode);
     log_t.op_file_update(log_writer->file->fnode);
+    just_expanded_log = true;
   }
 
   bufferlist bl;
@@ -2591,6 +2554,10 @@ int BlueFS::_flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
     bl.append_zero(realign);
 
   logger->inc(l_bluefs_logged_bytes, bl.length());
+
+  if (just_expanded_log) {
+    ceph_assert(bl.length() <= runway); // if we write this, we will have an unrecoverable data loss
+  }
 
   log_writer->append(bl);
 
@@ -2660,6 +2627,9 @@ int BlueFS::_flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
 	}
       }
       alloc[i]->release(to_release[i]);
+      if (is_shared_alloc(i)) {
+        shared_alloc->bluefs_used -= to_release[i].size();
+      }
     }
   }
 
@@ -2668,15 +2638,59 @@ int BlueFS::_flush_and_sync_log(std::unique_lock<ceph::mutex>& l,
   return 0;
 }
 
+ceph::bufferlist BlueFS::FileWriter::flush_buffer(
+  CephContext* const cct,
+  const bool partial,
+  const unsigned length,
+  const bluefs_super_t& super)
+{
+  ceph::bufferlist bl;
+  if (partial) {
+    tail_block.splice(0, tail_block.length(), &bl);
+  }
+  const auto remaining_len = length - bl.length();
+  buffer.splice(0, remaining_len, &bl);
+  if (buffer.length()) {
+    dout(20) << " leaving 0x" << std::hex << buffer.length() << std::dec
+             << " unflushed" << dendl;
+  }
+  if (const unsigned tail = bl.length() & ~super.block_mask(); tail) {
+    const auto padding_len = super.block_size - tail;
+    dout(20) << __func__ << " caching tail of 0x"
+             << std::hex << tail
+             << " and padding block with 0x" << padding_len
+             << " buffer.length() " << buffer.length()
+             << std::dec << dendl;
+    // We need to go through the `buffer_appender` to get a chance to
+    // preserve in-memory contiguity and not mess with the alignment.
+    // Otherwise a costly rebuild could happen in e.g. `KernelDevice`.
+    buffer_appender.append_zero(padding_len);
+    buffer.splice(buffer.length() - padding_len, padding_len, &bl);
+    // Deep copy the tail here. This allows to avoid costlier copy on
+    // bufferlist rebuild in e.g. `KernelDevice` and minimizes number
+    // of memory allocations.
+    // The alternative approach would be to place the entire tail and
+    // padding on a dedicated, 4 KB long memory chunk. This shouldn't
+    // trigger the rebuild while still being less expensive.
+    buffer_appender.substr_of(bl, bl.length() - padding_len - tail, tail);
+    buffer.splice(buffer.length() - tail, tail, &tail_block);
+  } else {
+    tail_block.clear();
+  }
+  return bl;
+}
+
 int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
 {
   dout(10) << __func__ << " " << h << " pos 0x" << std::hex << h->pos
 	   << " 0x" << offset << "~" << length << std::dec
 	   << " to " << h->file->fnode << dendl;
-  ceph_assert(!h->file->deleted);
-  ceph_assert(h->file->num_readers.load() == 0);
+  if (h->file->deleted) {
+    dout(10) << __func__ << "  deleted, no-op" << dendl;
+    return 0;
+  }
 
-  h->buffer_appender.flush();
+  ceph_assert(h->file->num_readers.load() == 0);
 
   bool buffered;
   if (h->file->fnode.ino == 1)
@@ -2700,7 +2714,6 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
   // do not bother to dirty the file if we are overwriting
   // previously allocated extents.
   bool must_dirty = false;
-  uint64_t clear_upto = 0;
   if (allocated < offset + length) {
     // we should never run out of log space here; see the min runway check
     // in _flush_and_sync_log.
@@ -2715,18 +2728,6 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
       vselector->add_usage(h->file->vselector_hint, h->file->fnode); // undo
       ceph_abort_msg("bluefs enospc");
       return r;
-    }
-    if (cct->_conf->bluefs_preextend_wal_files &&
-	h->writer_type == WRITER_WAL) {
-      // NOTE: this *requires* that rocksdb also has log recycling
-      // enabled and is therefore doing robust CRCs on the log
-      // records.  otherwise, we will fail to reply the rocksdb log
-      // properly due to garbage on the device.
-      h->file->fnode.size = h->file->fnode.get_allocated();
-      clear_upto = h->file->fnode.size;
-      dout(10) << __func__ << " extending WAL size to 0x" << std::hex
-	       << h->file->fnode.size << std::dec << " to include allocated"
-	       << dendl;
     }
     must_dirty = true;
   }
@@ -2772,12 +2773,9 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
            << std::hex << x_off << std::dec << dendl;
 
   unsigned partial = x_off & ~super.block_mask();
-  bufferlist bl;
   if (partial) {
     dout(20) << __func__ << " using partial tail 0x"
              << std::hex << partial << std::dec << dendl;
-    ceph_assert(h->tail_block.length() == partial);
-    bl.claim_append_piecewise(h->tail_block);
     x_off -= partial;
     offset -= partial;
     length += partial;
@@ -2788,44 +2786,11 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
       }
     }
   }
-  if (length == partial + h->buffer.length() || clear_upto != 0) {
-    /* in case of inital allocation and need to zero, limited flush is unacceptable */
-    bl.claim_append_piecewise(h->buffer);
-  } else {
-    bufferlist t;
-    h->buffer.splice(0, length, &t);
-    bl.claim_append_piecewise(t);
-    t.substr_of(h->buffer, length, h->buffer.length() - length);
-    h->buffer.swap(t);
-    dout(20) << " leaving 0x" << std::hex << h->buffer.length() << std::dec
-             << " unflushed" << dendl;
-  }
-  ceph_assert(bl.length() == length);
 
+  auto bl = h->flush_buffer(cct, partial, length, super);
+  ceph_assert(bl.length() >= length);
   h->pos = offset + length;
-
-  unsigned tail = bl.length() & ~super.block_mask();
-  if (tail) {
-    dout(20) << __func__ << " caching tail of 0x"
-             << std::hex << tail
-             << " and padding block with 0x" << (super.block_size - tail)
-             << std::dec << dendl;
-    h->tail_block.substr_of(bl, bl.length() - tail, tail);
-    bl.append_zero(super.block_size - tail);
-    length += super.block_size - tail;
-  } else {
-    h->tail_block.clear();
-  }
-  if (clear_upto != 0) {
-    if (offset + length < clear_upto) {
-      dout(20) << __func__ << " zeroing WAL log up to 0x"
-               << std::hex << clear_upto
-               << std::dec << dendl;
-      bl.append_zero(clear_upto - (offset + length));
-      length += clear_upto - (offset + length);
-    } 
-  } 
-  ceph_assert(bl.length() == length);
+  length = bl.length();
 
   switch (h->writer_type) {
   case WRITER_WAL:
@@ -2861,7 +2826,9 @@ int BlueFS::_flush_range(FileWriter *h, uint64_t offset, uint64_t length)
     ++p;
     x_off = 0;
   }
-  logger->inc(l_bluefs_bytes_written_slow, bytes_written_slow);
+  if (bytes_written_slow) {
+    logger->inc(l_bluefs_bytes_written_slow, bytes_written_slow);
+  }
   for (unsigned i = 0; i < MAX_BDEV; ++i) {
     if (bdev[i]) {
       if (h->iocv[i] && h->iocv[i]->has_pending_aios()) {
@@ -2892,8 +2859,10 @@ void BlueFS::wait_for_aio(FileWriter *h)
 {
   // NOTE: this is safe to call without a lock, as long as our reference is
   // stable.
-  dout(10) << __func__ << " " << h << dendl;
-  utime_t start = ceph_clock_now();
+  utime_t start;
+  lgeneric_subdout(cct, bluefs, 10) << __func__;
+  start = ceph_clock_now();
+  *_dout << " " << h << dendl;
   for (auto p : h->iocv) {
     if (p) {
       p->aio_wait();
@@ -2903,11 +2872,23 @@ void BlueFS::wait_for_aio(FileWriter *h)
 }
 #endif
 
-int BlueFS::_flush(FileWriter *h, bool force)
+int BlueFS::_flush(FileWriter *h, bool force, std::unique_lock<ceph::mutex>& l)
 {
-  h->buffer_appender.flush();
-  uint64_t length = h->buffer.length();
+  bool flushed = false;
+  int r = _flush(h, force, &flushed);
+  if (r == 0 && flushed) {
+    _maybe_compact_log(l);
+  }
+  return r;
+}
+
+int BlueFS::_flush(FileWriter *h, bool force, bool *flushed)
+{
+  uint64_t length = h->get_buffer_length();
   uint64_t offset = h->pos;
+  if (flushed) {
+    *flushed = false;
+  }
   if (!force &&
       length < cct->_conf->bluefs_min_flush_size) {
     dout(10) << __func__ << " " << h << " ignoring, length " << length
@@ -2924,7 +2905,11 @@ int BlueFS::_flush(FileWriter *h, bool force)
            << std::hex << offset << "~" << length << std::dec
 	   << " to " << h->file->fnode << dendl;
   ceph_assert(h->pos <= h->file->fnode.size);
-  return _flush_range(h, offset, length);
+  int r = _flush_range(h, offset, length);
+  if (flushed) {
+    *flushed = true;
+  }
+  return r;
 }
 
 int BlueFS::_truncate(FileWriter *h, uint64_t offset)
@@ -2939,19 +2924,14 @@ int BlueFS::_truncate(FileWriter *h, uint64_t offset)
   // we never truncate internal log files
   ceph_assert(h->file->fnode.ino > 1);
 
-  h->buffer_appender.flush();
-
   // truncate off unflushed data?
   if (h->pos < offset &&
-      h->pos + h->buffer.length() > offset) {
-    bufferlist t;
+      h->pos + h->get_buffer_length() > offset) {
     dout(20) << __func__ << " tossing out last " << offset - h->pos
 	     << " unflushed bytes" << dendl;
-    t.substr_of(h->buffer, 0, offset - h->pos);
-    h->buffer.swap(t);
     ceph_abort_msg("actually this shouldn't happen");
   }
-  if (h->buffer.length()) {
+  if (h->get_buffer_length()) {
     int r = _flush(h, true);
     if (r < 0)
       return r;
@@ -3027,9 +3007,12 @@ void BlueFS::flush_bdev()
 {
   // NOTE: this is safe to call without a lock.
   dout(20) << __func__ << dendl;
-  for (auto p : bdev) {
-    if (p)
-      p->flush();
+  for (unsigned i = 0; i < MAX_BDEV; i++) {
+    // alloc space from BDEV_SLOW is unexpected.
+    // So most cases we don't alloc from BDEV_SLOW and so avoiding flush not-used device.
+    if (bdev[i] && (i != BDEV_SLOW || _get_used(i))) {
+      bdev[i]->flush();
+    }
   }
 }
 
@@ -3038,27 +3021,6 @@ const char* BlueFS::get_device_name(unsigned id)
   if (id >= MAX_BDEV) return "BDEV_INV";
   const char* names[] = {"BDEV_WAL", "BDEV_DB", "BDEV_SLOW", "BDEV_NEWWAL", "BDEV_NEWDB"};
   return names[id];
-}
-
-int BlueFS::_expand_slow_device(uint64_t need, PExtentVector& extents)
-{
-  int r = -ENOSPC;
-  if (slow_dev_expander) {
-    auto id = _get_slow_device_id();
-    auto min_alloc_size = alloc_size[id];
-    ceph_assert(id <= alloc.size() && alloc[id]);
-    auto min_need = round_up_to(need, min_alloc_size);
-    need = std::max(need,
-      slow_dev_expander->get_recommended_expansion_delta(
-        alloc[id]->get_free(), block_all[id].size()));
-
-    need = round_up_to(need, min_alloc_size);
-    dout(10) << __func__ << " expanding slow device by 0x"
-             << std::hex << need << std::dec
-	     << dendl;
-    r = slow_dev_expander->allocate_freespace(min_need, need, extents);
-  }
-  return r;
 }
 
 int BlueFS::_allocate_without_fallback(uint8_t id, uint64_t len,
@@ -3071,23 +3033,27 @@ int BlueFS::_allocate_without_fallback(uint8_t id, uint64_t len,
     return -ENOENT;
   }
   extents->reserve(4);  // 4 should be (more than) enough for most allocations
-  uint64_t min_alloc_size = alloc_size[id];
-  uint64_t left = round_up_to(len, min_alloc_size);
-  int64_t alloc_len = alloc[id]->allocate(left, min_alloc_size, 0, extents);
-  if (alloc_len < 0 || alloc_len < (int64_t)left) {
+  int64_t need = round_up_to(len, alloc_size[id]);
+  int64_t alloc_len = alloc[id]->allocate(need, alloc_size[id], 0, extents);
+  if (alloc_len < 0 || alloc_len < need) {
     if (alloc_len > 0) {
       alloc[id]->release(*extents);
     }
-    if (bdev[id])
-      derr << __func__ << " failed to allocate 0x" << std::hex << left
-	   << " on bdev " << (int)id
-	   << ", free 0x" << alloc[id]->get_free() << std::dec << dendl;
-    else
-      derr << __func__ << " failed to allocate 0x" << std::hex << left
-	   << " on bdev " << (int)id << ", dne" << std::dec << dendl;
-    if (alloc[id])
-      alloc[id]->dump();
+    derr << __func__ << " unable to allocate 0x" << std::hex << need
+	 << " on bdev " << (int)id
+         << ", allocator name " << alloc[id]->get_name()
+         << ", allocator type " << alloc[id]->get_type()
+         << ", capacity 0x" << alloc[id]->get_capacity()
+         << ", block size 0x" << alloc[id]->get_block_size()
+         << ", free 0x" << alloc[id]->get_free()
+         << ", fragmentation " << alloc[id]->get_fragmentation()
+         << ", allocated 0x" << (alloc_len > 0 ? alloc_len : 0)
+	 << std::dec << dendl;
+    alloc[id]->dump();
     return -ENOSPC;
+  }
+  if (is_shared_alloc(id)) {
+    shared_alloc->bluefs_used += alloc_len;
   }
 
   return 0;
@@ -3102,68 +3068,50 @@ int BlueFS::_allocate(uint8_t id, uint64_t len,
   int64_t alloc_len = 0;
   PExtentVector extents;
   uint64_t hint = 0;
+  int64_t need = len;
   if (alloc[id]) {
+    need = round_up_to(len, alloc_size[id]);
     if (!node->extents.empty() && node->extents.back().bdev == id) {
       hint = node->extents.back().end();
     }   
     extents.reserve(4);  // 4 should be (more than) enough for most allocations
-    alloc_len = alloc[id]->allocate(round_up_to(len, alloc_size[id]),
-				    alloc_size[id], hint, &extents);
+    alloc_len = alloc[id]->allocate(need, alloc_size[id], hint, &extents);
   }
-  if (!alloc[id] ||
-      alloc_len < 0 ||
-      alloc_len < (int64_t)round_up_to(len, alloc_size[id])) {
-    if (alloc_len > 0) {
-      alloc[id]->release(extents);
-    }
-    if (id != BDEV_SLOW) {
-      if (bdev[id]) {
-	dout(1) << __func__ << " failed to allocate 0x" << std::hex << len
-		<< " on bdev " << (int)id
-		<< ", free 0x" << alloc[id]->get_free()
-		<< "; fallback to bdev " << (int)id + 1
-		<< std::dec << dendl;
+  if (alloc_len < 0 || alloc_len < need) {
+    if (alloc[id]) {
+      if (alloc_len > 0) {
+        alloc[id]->release(extents);
       }
-      return _allocate(id + 1, len, node);
-    }
-    dout(1) << __func__ << " unable to allocate 0x" << std::hex << len
-	    << " on bdev " << (int)id << ", free 0x"
-	    << (alloc[id] ? alloc[id]->get_free() : (uint64_t)-1)
-	    << "; fallback to slow device expander "
-	    << std::dec << dendl;
-    extents.clear();
-    if (_expand_slow_device(len, extents) == 0) {
-      id = _get_slow_device_id();
-      for (auto& e : extents) {
-	_add_block_extent(id, e.offset, e.length);
-      }
-      extents.clear();
-      auto* last_alloc = alloc[id];
-      ceph_assert(last_alloc);
-      // try again
-      alloc_len = last_alloc->allocate(round_up_to(len, alloc_size[id]),
-				       alloc_size[id], hint, &extents);
-      if (alloc_len < 0 || alloc_len < (int64_t)len) {
-	if (alloc_len > 0) {
-	  last_alloc->release(extents);
-	}
-	derr << __func__ << " failed to allocate 0x" << std::hex << len
+      dout(1) << __func__ << " unable to allocate 0x" << std::hex << need
 	      << " on bdev " << (int)id
-	      << ", free 0x" << last_alloc->get_free() << std::dec << dendl;
-        return -ENOSPC;
-      }
-    } else {
-      derr << __func__ << " failed to expand slow device to fit +0x"
-	   << std::hex << len << std::dec
-	   << dendl;
-      return -ENOSPC;
+              << ", allocator name " << alloc[id]->get_name()
+              << ", allocator type " << alloc[id]->get_type()
+              << ", capacity 0x" << alloc[id]->get_capacity()
+              << ", block size 0x" << alloc[id]->get_block_size()
+              << ", free 0x" << alloc[id]->get_free()
+              << ", fragmentation " << alloc[id]->get_fragmentation()
+              << ", allocated 0x" << (alloc_len > 0 ? alloc_len : 0)
+	      << std::dec << dendl;
     }
+
+    if (id != BDEV_SLOW) {
+      dout(20) << __func__ << " fallback to bdev "
+               << (int)id + 1
+	       << dendl;
+      return _allocate(id + 1, len, node);
+    } else {
+      derr << __func__ << " allocation failed, needed 0x" << std::hex << need
+           << dendl;
+    }
+    return -ENOSPC;
   } else {
-    uint64_t total_allocated =
-      block_all[id].size() - alloc[id]->get_free();
-    if (max_bytes[id] < total_allocated) {
-      logger->set(max_bytes_pcounters[id], total_allocated);
-      max_bytes[id] = total_allocated;
+    uint64_t used = _get_used(id);
+    if (max_bytes[id] < used) {
+      logger->set(max_bytes_pcounters[id], used);
+      max_bytes[id] = used;
+    }
+    if (is_shared_alloc(id)) {
+      shared_alloc->bluefs_used += alloc_len;
     }
   }
 
@@ -3205,14 +3153,24 @@ void BlueFS::sync_metadata(bool avoid_compact)
   if (log_t.empty() && dirty_files.empty()) {
     dout(10) << __func__ << " - no pending log events" << dendl;
   } else {
-    dout(10) << __func__ << dendl;
-    utime_t start = ceph_clock_now();
+    utime_t start;
+    lgeneric_subdout(cct, bluefs, 10) << __func__;
+    start = ceph_clock_now();
+    *_dout <<  dendl;
     flush_bdev(); // FIXME?
     _flush_and_sync_log(l);
     dout(10) << __func__ << " done in " << (ceph_clock_now() - start) << dendl;
   }
 
-  if (!avoid_compact && _should_compact_log()) {
+  if (!avoid_compact) {
+    _maybe_compact_log(l);
+  }
+}
+
+void BlueFS::_maybe_compact_log(std::unique_lock<ceph::mutex>& l)
+{
+  if (!cct->_conf->bluefs_replay_recovery_disable_compact &&
+      _should_compact_log()) {
     if (cct->_conf->bluefs_compact_log_sync) {
       _compact_log_sync();
     } else {
@@ -3326,6 +3284,7 @@ BlueFS::FileWriter *BlueFS::_create_writer(FileRef f)
 void BlueFS::_close_writer(FileWriter *h)
 {
   dout(10) << __func__ << " " << h << " type " << h->writer_type << dendl;
+  //h->buffer.reassign_to_mempool(mempool::mempool_bluefs_file_writer);
   for (unsigned i=0; i<MAX_BDEV; ++i) {
     if (bdev[i]) {
       if (h->iocv[i]) {
@@ -3602,16 +3561,212 @@ bool BlueFS::wal_is_rotational()
   return bdev[BDEV_SLOW]->is_rotational();
 }
 
-void BlueFS::debug_inject_duplicate_gift(unsigned id,
-  uint64_t offset,
-  uint64_t len)
-{
-  dout(0) << __func__ << dendl;
-  if (id < alloc.size() && alloc[id]) {
-    alloc[id]->init_add_free(offset, len);
+/*
+  Algorithm.
+  do_replay_recovery_read is used when bluefs log abruptly ends, but it seems that more data should be there.
+  Idea is to search disk for definiton of extents that will be accompanied with bluefs log in future,
+  and try if using it will produce healthy bluefs transaction.
+  We encode already known bluefs log extents and search disk for these bytes.
+  When we find it, we decode following bytes as extent.
+  We read that whole extent and then check if merged with existing log part gives a proper bluefs transaction.
+ */
+int BlueFS::do_replay_recovery_read(FileReader *log_reader,
+				    size_t replay_pos,
+				    size_t read_offset,
+				    size_t read_len,
+				    bufferlist* bl) {
+  dout(1) << __func__ << " replay_pos=0x" << std::hex << replay_pos <<
+    " needs 0x" << read_offset << "~" << read_len << std::dec << dendl;
+
+  bluefs_fnode_t& log_fnode = log_reader->file->fnode;
+  bufferlist bin_extents;
+  ::encode(log_fnode.extents, bin_extents);
+  dout(2) << __func__ << " log file encoded extents length = " << bin_extents.length() << dendl;
+
+  // cannot process if too small to effectively search
+  ceph_assert(bin_extents.length() >= 32);
+  bufferlist last_32;
+  last_32.substr_of(bin_extents, bin_extents.length() - 32, 32);
+
+  //read fixed part from replay_pos to end of bluefs_log extents
+  bufferlist fixed;
+  uint64_t e_off = 0;
+  auto e = log_fnode.seek(replay_pos, &e_off);
+  ceph_assert(e != log_fnode.extents.end());
+  int r = bdev[e->bdev]->read(e->offset + e_off, e->length - e_off, &fixed, ioc[e->bdev],
+				  cct->_conf->bluefs_buffered_io);
+  ceph_assert(r == 0);
+  //capture dev of last good extent
+  uint8_t last_e_dev = e->bdev;
+  uint64_t last_e_off = e->offset;
+  ++e;
+  while (e != log_fnode.extents.end()) {
+    r = bdev[e->bdev]->read(e->offset, e->length, &fixed, ioc[e->bdev],
+				  cct->_conf->bluefs_buffered_io);
+    ceph_assert(r == 0);
+    last_e_dev = e->bdev;
+    ++e;
   }
+  ceph_assert(replay_pos + fixed.length() == read_offset);
+
+  dout(2) << __func__ << " valid data in log = " << fixed.length() << dendl;
+
+  struct compare {
+    bool operator()(const bluefs_extent_t& a, const bluefs_extent_t& b) const {
+      if (a.bdev < b.bdev) return true;
+      if (a.offset < b.offset) return true;
+      return a.length < b.length;
+    }
+  };
+  std::set<bluefs_extent_t, compare> extents_rejected;
+  for (int dcnt = 0; dcnt < 3; dcnt++) {
+    uint8_t dev = (last_e_dev + dcnt) % MAX_BDEV;
+    if (bdev[dev] == nullptr) continue;
+    dout(2) << __func__ << " processing " << get_device_name(dev) << dendl;
+    interval_set<uint64_t> disk_regions;
+    disk_regions.insert(0, bdev[dev]->get_size());
+    for (auto f : file_map) {
+      auto& e = f.second->fnode.extents;
+      for (auto& p : e) {
+	if (p.bdev == dev) {
+	  disk_regions.erase(p.offset, p.length);
+	}
+      }
+    }
+    size_t disk_regions_count = disk_regions.num_intervals();
+    dout(5) << __func__ << " " << disk_regions_count << " regions to scan on " << get_device_name(dev) << dendl;
+
+    auto reg = disk_regions.lower_bound(last_e_off);
+    //for all except first, start from beginning
+    last_e_off = 0;
+    if (reg == disk_regions.end()) {
+      reg = disk_regions.begin();
+    }
+    const uint64_t chunk_size = 4 * 1024 * 1024;
+    const uint64_t page_size = 4096;
+    const uint64_t max_extent_size = 16;
+    uint64_t overlay_size = last_32.length() + max_extent_size;
+    for (size_t i = 0; i < disk_regions_count; reg++, i++) {
+      if (reg == disk_regions.end()) {
+	reg = disk_regions.begin();
+      }
+      uint64_t pos = reg.get_start();
+      uint64_t len = reg.get_len();
+
+      std::unique_ptr<char[]> raw_data_p{new char[page_size + chunk_size]};
+      char* raw_data = raw_data_p.get();
+      memset(raw_data, 0, page_size);
+
+      while (len > last_32.length()) {
+	uint64_t chunk_len = len > chunk_size ? chunk_size : len;
+	dout(5) << __func__ << " read "
+		<< get_device_name(dev) << ":0x" << std::hex << pos << "+" << chunk_len << std::dec << dendl;
+	r = bdev[dev]->read_random(pos, chunk_len, raw_data + page_size, cct->_conf->bluefs_buffered_io);
+	ceph_assert(r == 0);
+
+	//search for fixed_last_32
+	char* chunk_b = raw_data + page_size;
+	char* chunk_e = chunk_b + chunk_len;
+
+	char* search_b = chunk_b - overlay_size;
+	char* search_e = chunk_e;
+
+	for (char* sp = search_b; ; sp += last_32.length()) {
+	  sp = (char*)memmem(sp, search_e - sp, last_32.c_str(), last_32.length());
+	  if (sp == nullptr) {
+	    break;
+	  }
+
+	  char* n = sp + last_32.length();
+	  dout(5) << __func__ << " checking location 0x" << std::hex << pos + (n - chunk_b) << std::dec << dendl;
+	  bufferlist test;
+	  test.append(n, std::min<size_t>(max_extent_size, chunk_e - n));
+	  bluefs_extent_t ne;
+	  try {
+	    bufferlist::const_iterator p = test.begin();
+	    ::decode(ne, p);
+	  } catch (buffer::error& e) {
+	    continue;
+	  }
+	  if (extents_rejected.count(ne) != 0) {
+	    dout(5) << __func__ << " extent " << ne << " already refected" <<dendl;
+	    continue;
+	  }
+	  //insert as rejected already. if we succeed, it wouldn't make difference.
+	  extents_rejected.insert(ne);
+
+	  if (ne.bdev >= MAX_BDEV ||
+	      bdev[ne.bdev] == nullptr ||
+	      ne.length > 16 * 1024 * 1024 ||
+	      (ne.length & 4095) != 0 ||
+	      ne.offset + ne.length > bdev[ne.bdev]->get_size() ||
+	      (ne.offset & 4095) != 0) {
+	    dout(5) << __func__ << " refusing extent " << ne << dendl;
+	    continue;
+	  }
+	  dout(5) << __func__ << " checking extent " << ne << dendl;
+
+	  //read candidate extent - whole
+	  bufferlist candidate;
+	  candidate.append(fixed);
+	  r = bdev[ne.bdev]->read(ne.offset, ne.length, &candidate, ioc[ne.bdev],
+				cct->_conf->bluefs_buffered_io);
+	  ceph_assert(r == 0);
+
+	  //check if transaction & crc is ok
+	  bluefs_transaction_t t;
+	  try {
+	    bufferlist::const_iterator p = candidate.begin();
+	    ::decode(t, p);
+	  }
+	  catch (buffer::error& e) {
+	    dout(5) << __func__ << " failed match" << dendl;
+	    continue;
+	  }
+
+	  //success, it seems a probable candidate
+	  uint64_t l = std::min<uint64_t>(ne.length, read_len);
+	  //trim to required size
+	  bufferlist requested_read;
+	  requested_read.substr_of(candidate, fixed.length(), l);
+	  bl->append(requested_read);
+	  dout(5) << __func__ << " successful extension of log " << l << "/" << read_len << dendl;
+	  log_fnode.append_extent(ne);
+	  log_fnode.recalc_allocated();
+	  log_reader->buf.pos += l;
+	  return l;
+	}
+	//save overlay for next search
+	memcpy(search_b, chunk_e - overlay_size, overlay_size);
+	pos += chunk_len;
+	len -= chunk_len;
+      }
+    }
+  }
+  return 0;
 }
 
+size_t BlueFS::probe_alloc_avail(int dev, uint64_t alloc_size)
+{
+  size_t total = 0;
+  auto iterated_allocation = [&](size_t off, size_t len) {
+    //only count in size that is alloc_size aligned
+    size_t dist_to_alignment;
+    size_t offset_in_block = off & (alloc_size - 1);
+    if (offset_in_block == 0)
+      dist_to_alignment = 0;
+    else
+      dist_to_alignment = alloc_size - offset_in_block;
+    if (dist_to_alignment >= len)
+      return;
+    len -= dist_to_alignment;
+    total += p2align(len, alloc_size);
+  };
+  if (alloc[dev]) {
+    alloc[dev]->dump(iterated_allocation);
+  }
+  return total;
+}
 // ===============================================
 // OriginalVolumeSelector
 
@@ -3654,4 +3809,11 @@ void OriginalVolumeSelector::dump(ostream& sout) {
     << ", db_total:" << db_total
     << ", slow_total:" << slow_total
     << std::endl;
+}
+
+// ===============================================
+// FitToFastVolumeSelector
+
+void FitToFastVolumeSelector::get_paths(const std::string& base, paths& res) const {
+  res.emplace_back(base, 1);  // size of the last db_path has no effect
 }

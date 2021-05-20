@@ -7,6 +7,7 @@ roles:
   - osd.2
   - osd.3
   - client.0
+  - ceph.rgw.foo.a
   - node-exporter.a
   - alertmanager.a
 - - mon.b
@@ -19,6 +20,7 @@ roles:
   - prometheus.a
   - grafana.a
   - node-exporter.b
+  - ceph.iscsi.iscsi.a
 openstack:
 - volumes: # attached to each instance
     count: 4

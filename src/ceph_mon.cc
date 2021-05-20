@@ -101,7 +101,7 @@ int obtain_monmap(MonitorDBStore &store, bufferlist &bl)
 	if (b.get_epoch() > latest_ver) {
 	  dout(10) << __func__ << " using stashed monmap " << b.get_epoch()
 		   << " instead" << dendl;
-	  bl.claim(bl2);
+	  bl = std::move(bl2);
 	} else {
 	  dout(10) << __func__ << " ignoring stashed monmap " << b.get_epoch()
 		   << dendl;
@@ -210,6 +210,8 @@ static void usage()
        << "        extract the monmap from the local monitor store and exit\n"
        << "  --mon-data <directory>\n"
        << "        where the mon store and keyring are located\n"
+       << "  --set-crush-location <bucket>=<foo>"
+       << "        sets monitor's crush bucket location (only for stretch mode)"
        << std::endl;
   generic_server_usage();
 }
@@ -248,7 +250,7 @@ int main(int argc, const char **argv)
   bool compact = false;
   bool force_sync = false;
   bool yes_really = false;
-  std::string osdmapfn, inject_monmap, extract_monmap;
+  std::string osdmapfn, inject_monmap, extract_monmap, crush_loc;
 
   vector<const char*> args;
   argv_to_vec(argc, argv, args);
@@ -310,7 +312,7 @@ int main(int argc, const char **argv)
 
   auto cct = global_init(&defaults, args,
 			 CEPH_ENTITY_TYPE_MON, CODE_ENVIRONMENT_DAEMON,
-			 flags, "mon_data");
+			 flags);
   ceph_heap_profiler_init();
 
   std::string val;
@@ -331,6 +333,8 @@ int main(int argc, const char **argv)
       inject_monmap = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--extract-monmap", (char*)NULL)) {
       extract_monmap = val;
+    } else if (ceph_argparse_witharg(args, i, &val, "--set-crush-location", (char*)NULL)) {
+      crush_loc = val;
     } else {
       ++i;
     }
@@ -738,8 +742,7 @@ int main(int argc, const char **argv)
     ipaddrs = monmap.get_addrs(g_conf()->name.get_id());
 
     // print helpful warning if the conf file doesn't match
-    std::vector <std::string> my_sections;
-    g_conf().get_my_sections(my_sections);
+    std::vector<std::string> my_sections = g_conf().get_my_sections();
     std::string mon_addr_str;
     if (g_conf().get_val_from_conf_file(my_sections, "mon addr",
 				       mon_addr_str, true) == 0) {
@@ -791,9 +794,7 @@ int main(int argc, const char **argv)
   int rank = monmap.get_rank(g_conf()->name.get_id());
   std::string public_msgr_type = g_conf()->ms_public_type.empty() ? g_conf().get_val<std::string>("ms_type") : g_conf()->ms_public_type;
   Messenger *msgr = Messenger::create(g_ceph_context, public_msgr_type,
-				      entity_name_t::MON(rank), "mon",
-				      0,  // zero nonce
-				      Messenger::HAS_MANY_CONNECTIONS);
+				      entity_name_t::MON(rank), "mon", 0);
   if (!msgr)
     exit(1);
   msgr->set_cluster_protocol(CEPH_MON_PROTOCOL);
@@ -844,8 +845,7 @@ int main(int argc, const char **argv)
 
   Messenger *mgr_msgr = Messenger::create(g_ceph_context, public_msgr_type,
 					  entity_name_t::MON(rank), "mon-mgrc",
-					  Messenger::get_pid_nonce(),
-					  0);
+					  Messenger::get_pid_nonce());
   if (!mgr_msgr) {
     derr << "unable to create mgr_msgr" << dendl;
     prefork.exit(1);
@@ -900,6 +900,7 @@ int main(int argc, const char **argv)
   msgr->start();
   mgr_msgr->start();
 
+  mon->set_mon_crush_location(crush_loc);
   mon->init();
 
   register_async_signal_handler_oneshot(SIGINT, handle_mon_signal);

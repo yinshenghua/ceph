@@ -139,6 +139,14 @@ if(WITH_BLUESTORE)
     )
   add_ceph_unittest(unittest_bluestore_types)
   target_link_libraries(unittest_bluestore_types os global)
+
+  # unittest_bdev
+  add_executable(unittest_bdev
+    test_bdev.cc
+    )
+  add_ceph_unittest(unittest_bdev)
+  target_link_libraries(unittest_bdev os global)
+
 endif(WITH_BLUESTORE)
 
 # unittest_transaction
@@ -155,9 +163,9 @@ add_ceph_unittest(unittest_memstore_clone)
 target_link_libraries(unittest_memstore_clone os global)
 
 if(WITH_BLUESTORE)
-  add_executable(ceph_test_bmap_alloc_replay
-    bmap_allocator_replay_test.cc)
-  target_link_libraries(ceph_test_bmap_alloc_replay os global ${UNITTEST_LIBS})
-  install(TARGETS ceph_test_bmap_alloc_replay
+  add_executable(ceph_test_alloc_replay
+    allocator_replay_test.cc)
+  target_link_libraries(ceph_test_alloc_replay os global ${UNITTEST_LIBS})
+  install(TARGETS ceph_test_alloc_replay
     DESTINATION bin)
 endif()

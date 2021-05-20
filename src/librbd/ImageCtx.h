@@ -8,6 +8,7 @@
 #include <atomic>
 #include <list>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -35,13 +36,17 @@
 #include <boost/lockfree/policies.hpp>
 #include <boost/lockfree/queue.hpp>
 
-class ContextWQ;
-class Finisher;
-class ThreadPool;
 class SafeTimer;
+
+namespace neorados {
+class IOContext;
+class RADOS;
+} // namespace neorados
 
 namespace librbd {
 
+  struct AsioEngine;
+  template <typename> class ConfigWatcher;
   template <typename> class ExclusiveLock;
   template <typename> class ImageState;
   template <typename> class ImageWatcher;
@@ -49,17 +54,17 @@ namespace librbd {
   class LibrbdAdminSocketHook;
   template <typename> class ObjectMap;
   template <typename> class Operations;
+  template <typename> class PluginRegistry;
 
-  namespace cache {
-  template <typename> class ImageCache;
-  }
+  namespace asio { struct ContextWQ; }
+  namespace crypto { class CryptoInterface; }
   namespace exclusive_lock { struct Policy; }
   namespace io {
   class AioCompletion;
   class AsyncOperation;
   template <typename> class CopyupRequest;
-  template <typename> class ImageRequestWQ;
-  template <typename> class ObjectDispatcher;
+  struct ImageDispatcherInterface;
+  struct ObjectDispatcherInterface;
   }
   namespace journal { struct Policy; }
 
@@ -108,7 +113,17 @@ namespace librbd {
     std::string name;
     cls::rbd::SnapshotNamespace snap_namespace;
     std::string snap_name;
-    IoCtx data_ctx, md_ctx;
+
+    std::shared_ptr<AsioEngine> asio_engine;
+
+    // New ASIO-style RADOS API
+    neorados::RADOS& rados_api;
+
+    // Legacy RADOS API
+    librados::IoCtx data_ctx;
+    librados::IoCtx md_ctx;
+
+    ConfigWatcher<ImageCtx> *config_watcher = nullptr;
     ImageWatcher<ImageCtx> *image_watcher;
     Journal<ImageCtx> *journal;
 
@@ -136,7 +151,7 @@ namespace librbd {
     ceph::mutex async_ops_lock; // protects async_ops and async_requests
     ceph::mutex copyup_list_lock; // protects copyup_waiting_list
 
-    unsigned extra_read_flags;
+    unsigned extra_read_flags;  // librados::OPERATION_*
 
     bool old_format;
     uint8_t order;
@@ -161,8 +176,6 @@ namespace librbd {
 
     file_layout_t layout;
 
-    cache::ImageCache<ImageCtx> *image_cache = nullptr;
-
     Readahead readahead;
     std::atomic<uint64_t> total_bytes_read = {0};
 
@@ -180,17 +193,16 @@ namespace librbd {
 
     xlist<operation::ResizeRequest<ImageCtx>*> resize_reqs;
 
-    io::ImageRequestWQ<ImageCtx> *io_work_queue;
-    io::ObjectDispatcher<ImageCtx> *io_object_dispatcher = nullptr;
+    io::ImageDispatcherInterface *io_image_dispatcher = nullptr;
+    io::ObjectDispatcherInterface *io_object_dispatcher = nullptr;
 
-    ContextWQ *op_work_queue;
+    asio::ContextWQ *op_work_queue;
+
+    PluginRegistry<ImageCtx>* plugin_registry;
 
     typedef boost::lockfree::queue<
       io::AioCompletion*,
       boost::lockfree::allocator<ceph::allocator<void>>> Completions;
-
-    Completions external_callback_completions;
-    std::atomic<bool> external_callback_in_progress = {false};
 
     Completions event_socket_completions;
     EventSocket event_socket;
@@ -203,12 +215,12 @@ namespace librbd {
     bool non_blocking_aio;
     bool cache;
     uint64_t sparse_read_threshold_bytes;
-    uint64_t readahead_max_bytes;
-    uint64_t readahead_disable_after_bytes;
+    uint64_t readahead_max_bytes = 0;
+    uint64_t readahead_disable_after_bytes = 0;
     bool clone_copy_on_read;
     bool enable_alloc_hint;
     uint32_t alloc_hint_flags = 0U;
-    uint32_t read_flags = 0U;
+    uint32_t read_flags = 0U;  // librados::OPERATION_*
     uint32_t discard_granularity_bytes = 0;
     bool blkin_trace_all;
     uint64_t mirroring_replay_delay;
@@ -222,6 +234,8 @@ namespace librbd {
 
     ZTracer::Endpoint trace_endpoint;
 
+    crypto::CryptoInterface* crypto = nullptr;
+
     // unit test mock helpers
     static ImageCtx* create(const std::string &image_name,
                             const std::string &image_id,
@@ -233,9 +247,6 @@ namespace librbd {
                             librados::snap_t snap_id, IoCtx& p,
                             bool read_only) {
       return new ImageCtx(image_name, image_id, snap_id, p, read_only);
-    }
-    void destroy() {
-      delete this;
     }
 
     /**
@@ -293,6 +304,7 @@ namespace librbd {
 		 std::string in_snap_name,
 		 librados::snap_t id);
     uint64_t get_image_size(librados::snap_t in_snap_id) const;
+    uint64_t get_effective_image_size(librados::snap_t in_snap_id) const;
     uint64_t get_object_count(librados::snap_t in_snap_id) const;
     bool test_features(uint64_t test_features) const;
     bool test_features(uint64_t test_features,
@@ -339,11 +351,15 @@ namespace librbd {
     journal::Policy *get_journal_policy() const;
     void set_journal_policy(journal::Policy *policy);
 
-    static void get_thread_pool_instance(CephContext *cct,
-                                         ThreadPool **thread_pool,
-                                         ContextWQ **op_work_queue);
+    void rebuild_data_io_context();
+    IOContext get_data_io_context() const;
+    IOContext duplicate_data_io_context() const;
+
     static void get_timer_instance(CephContext *cct, SafeTimer **timer,
                                    ceph::mutex **timer_lock);
+
+  private:
+    std::shared_ptr<neorados::IOContext> data_io_context;
   };
 }
 

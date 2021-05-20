@@ -49,6 +49,9 @@ public:
   void operator()(const std::chrono::seconds v) const {
     out << v.count();
   }
+  void operator()(const std::chrono::milliseconds v) const {
+    out << v.count();
+  }
 };
 }
 
@@ -166,16 +169,11 @@ int Option::parse_value(
       *out = f;
     }
   } else if (type == Option::TYPE_BOOL) {
-    if (strcasecmp(val.c_str(), "false") == 0) {
-      *out = false;
-    } else if (strcasecmp(val.c_str(), "true") == 0) {
-      *out = true;
+    bool b = strict_strtob(val.c_str(), error_message);
+    if (!error_message->empty()) {
+      return -EINVAL;
     } else {
-      int b = strict_strtol(val.c_str(), 10, error_message);
-      if (!error_message->empty()) {
-	return -EINVAL;
-      }
-      *out = (bool)!!b;
+      *out = b;
     }
   } else if (type == Option::TYPE_ADDR) {
     entity_addr_t addr;
@@ -205,6 +203,13 @@ int Option::parse_value(
     try {
       *out = parse_timespan(val);
     } catch (const std::invalid_argument& e) {
+      *error_message = e.what();
+      return -EINVAL;
+    }
+  } else if (type == Option::TYPE_MILLISECS) {
+    try {
+      *out = boost::lexical_cast<uint64_t>(val);
+    } catch (const boost::bad_lexical_cast& e) {
       *error_message = e.what();
       return -EINVAL;
     }
@@ -434,6 +439,12 @@ std::vector<Option> get_global_options() {
     .set_flag(Option::FLAG_STARTUP)
     .add_service("common"),
 
+    Option("mon_host_override", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_description("monitor(s) to use overriding the MonMap")
+    .set_flag(Option::FLAG_NO_MON_UPDATE)
+    .set_flag(Option::FLAG_STARTUP)
+    .add_service("common"),
+
     Option("mon_dns_srv_name", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("ceph-mon")
     .set_description("name of DNS SRV record to check for monitor addresses")
@@ -445,7 +456,7 @@ std::vector<Option> get_global_options() {
     Option("container_image", Option::TYPE_STR, Option::LEVEL_BASIC)
     .set_description("container image (used by cephadm orchestrator)")
     .set_flag(Option::FLAG_STARTUP)
-    .set_default("docker.io/ceph/daemon-base:latest-master-devel"),
+    .set_default("docker.io/ceph/daemon-base:latest-pacific-devel"),
 
     Option("no_config_file", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
@@ -791,6 +802,11 @@ std::vector<Option> get_global_options() {
     .set_default(5)
     .set_description("Zlib compression level to use"),
 
+    Option("compressor_zlib_winsize", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_default(-15)
+    .set_min_max(-15,32)
+    .set_description("Zlib compression winsize to use"),
+
     Option("compressor_zstd_level", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("Zstd compression level to use"),
@@ -802,6 +818,12 @@ std::vector<Option> get_global_options() {
     Option("plugin_crypto_accelerator", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("crypto_isal")
     .set_description("Crypto accelerator library to use"),
+
+    Option("openssl_engine_opts", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_flag(Option::FLAG_STARTUP)
+    .set_description("Use engine for specific openssl algorithm")
+    .set_long_description("Pass opts in this way: engine_id=engine1,dynamic_path=/some/path/engine1.so,default_algorithms=DIGESTS:engine_id=engine2,dynamic_path=/some/path/engine2.so,default_algorithms=CIPHERS,other_ctrl=other_value"),
 
     Option("mempool_debug", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(false)
@@ -1080,10 +1102,6 @@ std::vector<Option> get_global_options() {
     .set_default("")
     .set_description("Entity type to inject delays for")
     .set_flag(Option::FLAG_RUNTIME),
-
-    Option("ms_inject_delay_msg_type", Option::TYPE_STR, Option::LEVEL_DEV)
-    .set_default("")
-    .set_description("Message type to inject delays for"),
 
     Option("ms_inject_delay_max", Option::TYPE_FLOAT, Option::LEVEL_DEV)
     .set_default(1)
@@ -1511,6 +1529,11 @@ std::vector<Option> get_global_options() {
     .add_service("mgr")
     .set_description("issue REQUEST_SLOW health warning if OSD ops are slower than this age (seconds)"),
 
+    Option("mon_osd_warn_num_repaired", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(10)
+    .add_service("mon")
+    .set_description("issue OSD_TOO_MANY_REPAIRS health warning if an OSD has more than this many read repairs"),
+
     Option("mon_osd_err_op_age_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(128)
     .add_service("mgr")
@@ -1542,6 +1565,11 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description("maximum time for a mon election (seconds)"),
 
+    Option("mon_election_default_strategy", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min_max(1, 3)
+    .set_description("The election strategy to set when constructing the first monmap."),
+
     Option("mon_lease", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(5)
     .add_service("mon")
@@ -1568,6 +1596,64 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description("multiple of mon_lease for follower mons to accept proposed state changes before calling a new election")
     .add_see_also("mon_lease"),
+
+    Option("mon_elector_ping_timeout", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(2.0)
+    .add_service("mon")
+    .set_description("The time after which a ping 'times out' and a connection is considered down")
+    .add_see_also("mon_elector_ping_divisor"),
+
+    Option("mon_elector_ping_divisor", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .add_service("mon")
+    .set_description("We will send a ping up to this many times per timeout per")
+    .add_see_also("mon_elector_ping_timeout"),
+
+    Option("mon_con_tracker_persist_interval", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(10)
+    .set_min_max(1, 100000)
+    .add_service("mon")
+    .set_description("how many updates the ConnectionTracker takes before it persists to disk"),
+
+    Option("mon_con_tracker_score_halflife", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(12*60*60)
+    .set_min(60)
+    .add_service("mon")
+    .set_description("The 'halflife' used when updating/calculating peer connection scores"),
+
+    Option("mon_elector_ignore_propose_margin", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(0.0005)
+    .add_service("mon")
+    .set_description("The difference in connection score allowed before a peon stops ignoring out-of-quorum PROPOSEs"),
+
+    Option("mon_warn_on_degraded_stretch_mode", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("Issue a health warning if we are in degraded stretch mode"),
+
+    Option("mon_stretch_cluster_recovery_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(0.6)
+    .add_service("mon")
+    .set_description("the ratio of up OSDs at which a degraded stretch cluster enters recovery")
+    .set_min_max(0.51, 1.0),
+
+    Option("mon_stretch_recovery_min_wait", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(15.0)
+    .add_service("mon")
+    .set_description("how long the monitors wait before considering fully-healthy PGs as evidence the stretch mode is repaired")
+    .set_min(1.0),
+
+    Option("mon_stretch_pool_size", Option::TYPE_UINT, Option::LEVEL_DEV)
+    .set_default(4)
+    .add_service("mon")
+    .set_description("")
+    .set_min_max(3, 6),
+
+    Option("mon_stretch_pool_min_size", Option::TYPE_UINT, Option::LEVEL_DEV)
+    .set_default(2)
+    .add_service("mon")
+    .set_description("")
+    .set_min_max(2, 4),
 
     Option("mon_clock_drift_allowed", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(.050)
@@ -1693,6 +1779,22 @@ std::vector<Option> get_global_options() {
     .set_default(900)
     .add_service("mon")
     .set_description("time before OSDs who do not report to the mons are marked down (seconds)"),
+
+    Option("mon_warn_on_insecure_global_id_reclaim", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("issue AUTH_INSECURE_GLOBAL_ID_RECLAIM health warning if any connected clients are insecurely reclaiming global_id")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim_allowed")
+    .add_see_also("auth_allow_insecure_global_id_reclaim")
+    .add_see_also("auth_expose_insecure_global_id_reclaim"),
+
+    Option("mon_warn_on_insecure_global_id_reclaim_allowed", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("issue AUTH_INSECURE_GLOBAL_ID_RECLAIM_ALLOWED health warning if insecure global_id reclaim is allowed")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim")
+    .add_see_also("auth_allow_insecure_global_id_reclaim")
+    .add_see_also("auth_expose_insecure_global_id_reclaim"),
 
     Option("mon_warn_on_msgr2_not_enabled", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -1861,7 +1963,7 @@ std::vector<Option> get_global_options() {
     .set_description("log monitor health to cluster log"),
 
     Option("mon_health_to_clog_interval", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(1_hr)
+    .set_default(10_min)
     .add_service("mon")
     .set_description("frequency to log monitor health to cluster log")
     .add_see_also("mon_health_to_clog"),
@@ -1870,6 +1972,10 @@ std::vector<Option> get_global_options() {
     .set_default(60.0)
     .add_service("mon")
     .set_description(""),
+
+    Option("mon_health_detail_to_clog", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(true)
+    .set_description("log health detail to cluster log"),
 
     Option("mon_health_max_detail", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(50)
@@ -1912,7 +2018,7 @@ std::vector<Option> get_global_options() {
     .set_long_description("")
     .add_see_also("osd_deep_scrub_interval"),
 
-    Option("mon_scrub_interval", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    Option("mon_scrub_interval", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
     .set_default(1_day)
     .add_service("mon")
     .set_description("frequency for scrubbing mon database"),
@@ -2107,25 +2213,25 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description(""),
 
-    Option("mon_osd_blacklist_default_expire", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    Option("mon_osd_blocklist_default_expire", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(1_hr)
     .add_service("mon")
-    .set_description("Duration in seconds that blacklist entries for clients "
+    .set_description("Duration in seconds that blocklist entries for clients "
                      "remain in the OSD map"),
 
-    Option("mon_mds_blacklist_interval", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    Option("mon_mds_blocklist_interval", Option::TYPE_FLOAT, Option::LEVEL_DEV)
     .set_default(1_day)
     .set_min(1_hr)
     .add_service("mon")
-    .set_description("Duration in seconds that blacklist entries for MDS "
+    .set_description("Duration in seconds that blocklist entries for MDS "
                      "daemons remain in the OSD map")
     .set_flag(Option::FLAG_RUNTIME),
 
-    Option("mon_mgr_blacklist_interval", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    Option("mon_mgr_blocklist_interval", Option::TYPE_FLOAT, Option::LEVEL_DEV)
     .set_default(1_day)
     .set_min(1_hr)
     .add_service("mon")
-    .set_description("Duration in seconds that blacklist entries for mgr "
+    .set_description("Duration in seconds that blocklist entries for mgr "
                      "daemons remain in the OSD map")
     .set_flag(Option::FLAG_RUNTIME),
 
@@ -2139,6 +2245,24 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description("Timeout (in seconds) for smarctl to run, default is set to 5"),
 
+    Option("mon_auth_validate_all_caps", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("Whether to parse non-monitor capabilities set by the "
+		     "'ceph auth ...' commands. Disabling this saves CPU on the "
+		     "monitor, but allows invalid capabilities to be set, and "
+		     "only be rejected later, when they are used.")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("mon_warn_on_older_version", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .add_service("mon")
+    .set_description("issue DAEMON_OLD_VERSION health warning if daemons are not all running the same version"),
+
+    Option("mon_warn_older_version_delay", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(7_day)
+    .add_service("mon")
+    .set_description("issue DAEMON_OLD_VERSION health warning after this amount of time has elapsed"),
 
     // PAXOS
 
@@ -2177,15 +2301,22 @@ std::vector<Option> get_global_options() {
     .add_service("mon")
     .set_description(""),
 
-    Option("paxos_service_trim_min", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    Option("paxos_service_trim_min", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(250)
     .add_service("mon")
     .set_description(""),
 
-    Option("paxos_service_trim_max", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    Option("paxos_service_trim_max", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(500)
     .add_service("mon")
     .set_description(""),
+
+    Option("paxos_service_trim_max_multiplier", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(20)
+    .set_min(0)
+    .add_service("mon")
+    .set_description("factor by which paxos_service_trim_max will be multiplied to get a new upper bound when trim sizes are high  (0 disables it)")
+    .set_flag(Option::FLAG_RUNTIME),
 
     Option("paxos_kill_at", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(0)
@@ -2229,7 +2360,7 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("cephx_require_version", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(1)
+    .set_default(2)
     .set_description("Cephx version required (1 = pre-mimic, 2 = mimic+)"),
 
     Option("cephx_cluster_require_signatures", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -2237,7 +2368,7 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("cephx_cluster_require_version", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(1)
+    .set_default(2)
     .set_description("Cephx version required by the cluster from clients (1 = pre-mimic, 2 = mimic+)"),
 
     Option("cephx_service_require_signatures", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -2245,7 +2376,7 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("cephx_service_require_version", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(1)
+    .set_default(2)
     .set_description("Cephx version required from ceph services (1 = pre-mimic, 2 = mimic+)"),
 
     Option("cephx_sign_messages", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -2253,12 +2384,28 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("auth_mon_ticket_ttl", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(12_hr)
+    .set_default(72_hr)
     .set_description(""),
 
     Option("auth_service_ticket_ttl", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(1_hr)
     .set_description(""),
+
+    Option("auth_allow_insecure_global_id_reclaim", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("Allow reclaiming global_id without presenting a valid ticket proving previous possession of that global_id")
+    .set_long_description("Allowing unauthorized global_id (re)use poses a security risk.  Unfortunately, older clients may omit their ticket on reconnects and therefore rely on this being allowed for preserving their global_id for the lifetime of the client instance.  Setting this value to false would immediately prevent new connections from those clients (assuming auth_expose_insecure_global_id_reclaim set to true) and eventually break existing sessions as well (regardless of auth_expose_insecure_global_id_reclaim setting).")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim_allowed")
+    .add_see_also("auth_expose_insecure_global_id_reclaim"),
+
+    Option("auth_expose_insecure_global_id_reclaim", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("Force older clients that may omit their ticket on reconnects to reconnect as part of establishing a session")
+    .set_long_description("In permissive mode (auth_allow_insecure_global_id_reclaim set to true), this helps with identifying clients that are not patched.  In enforcing mode (auth_allow_insecure_global_id_reclaim set to false), this is a fail-fast mechanism: don't establish a session that will almost inevitably be broken later.")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim")
+    .add_see_also("mon_warn_on_insecure_global_id_reclaim_allowed")
+    .add_see_also("auth_allow_insecure_global_id_reclaim"),
 
     Option("auth_debug", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(false)
@@ -2302,7 +2449,7 @@ std::vector<Option> get_global_options() {
 
     Option("mon_client_directed_command_retry", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(2)
-    .set_description("Number of times to try sending a comamnd directed at a specific monitor"),
+    .set_description("Number of times to try sending a command directed at a specific monitor"),
 
     Option("mon_max_pool_pg_num", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(65536)
@@ -2429,6 +2576,7 @@ std::vector<Option> get_global_options() {
 
     Option("osd_max_backfills", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Maximum number of concurrent local and remote backfills or recoveries per OSD ")
     .set_long_description("There can be osd_max_backfills local reservations AND the same remote reservations per OSD. So a value of 1 lets this OSD participate as 1 PG primary in recovery and 1 shard of another recovering PG."),
 
@@ -2503,6 +2651,10 @@ std::vector<Option> get_global_options() {
     .set_default(true)
     .set_description("flush FileStore journal contents during clean OSD shutdown"),
 
+    Option("osd_compact_on_start", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("compact OSD's object store's OMAP on start"),
+
     Option("osd_os_flags", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(0)
     .set_description("flags to skip filestore omap or journal initialization"),
@@ -2526,7 +2678,7 @@ std::vector<Option> get_global_options() {
     .set_long_description("If this value is exceeded, the OSD will not read any new client data off of the network until memory is freed."),
 
     Option("osd_client_message_cap", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
-    .set_default(100)
+    .set_default(0)
     .set_description("maximum number of in-flight client requests"),
 
     Option("osd_crush_update_weight_set", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -2616,7 +2768,7 @@ std::vector<Option> get_global_options() {
 
     Option("osd_erasure_code_plugins", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("jerasure lrc"
-  #if defined(HAVE_BETTER_YASM_ELF64) || defined(HAVE_ARMV8_SIMD)
+  #if defined(HAVE_NASM_X64_AVX2) || defined(HAVE_ARMV8_SIMD)
          " isa"
   #endif
         )
@@ -2858,13 +3010,10 @@ std::vector<Option> get_global_options() {
 
     Option("osd_op_queue", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("wpq")
-    .set_enum_allowed( { "wpq", "prioritized",
-	  "mclock_opclass", "mclock_client", "mclock_scheduler",
-	  "debug_random" } )
+    .set_enum_allowed( { "wpq", "mclock_scheduler", "debug_random" } )
     .set_description("which operation priority queue algorithm to use")
     .set_long_description("which operation priority queue algorithm to use; "
-			  "mclock_opclass mclock_client, and "
-			  "mclock_client_profile are currently experimental")
+			  "mclock_scheduler is currently experimental")
     .add_see_also("osd_op_queue_cut_off"),
 
     Option("osd_op_queue_cut_off", Option::TYPE_STR, Option::LEVEL_ADVANCED)
@@ -2877,61 +3026,123 @@ std::vector<Option> get_global_options() {
     Option("osd_mclock_scheduler_client_res", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("IO proportion reserved for each client (default)")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_client_wgt", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("IO share for each client (default) over reservation")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_client_lim", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(999999)
     .set_description("IO limit for each client (default) over reservation")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_background_recovery_res", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("IO proportion reserved for background recovery (default)")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_background_recovery_wgt", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("IO share for each background recovery over reservation")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_background_recovery_lim", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(999999)
     .set_description("IO limit for background recovery over reservation")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_background_best_effort_res", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("IO proportion reserved for background best_effort (default)")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_background_best_effort_wgt", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1)
     .set_description("IO share for each background best_effort over reservation")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_background_best_effort_lim", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(999999)
     .set_description("IO limit for background best_effort over reservation")
-    .set_long_description("Only considered for osd_op_queue = mClockScheduler")
+    .set_long_description("Only considered for osd_op_queue = mclock_scheduler")
     .add_see_also("osd_op_queue"),
 
     Option("osd_mclock_scheduler_anticipation_timeout", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0.0)
     .set_description("mclock anticipation timeout in seconds")
     .set_long_description("the amount of time that mclock waits until the unused resource is forfeited"),
+
+    Option("osd_mclock_cost_per_io_usec", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(0.0)
+    .set_description("Cost per IO in microseconds to consider per OSD (overrides _ssd and _hdd if non-zero)")
+    .set_long_description("This option specifies the cost factor to consider in usec per OSD. This is considered by the mclock scheduler to set an additional cost factor in QoS calculations. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_cost_per_io_usec_hdd", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(25000.0)
+    .set_description("Cost per IO in microseconds to consider per OSD (for rotational media)")
+    .set_long_description("This option specifies the cost factor to consider in usec per OSD for rotational device type. This is considered by the mclock_scheduler to set an additional cost factor in QoS calculations. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_cost_per_io_usec_ssd", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(50.0)
+    .set_description("Cost per IO in microseconds to consider per OSD (for solid state media)")
+    .set_long_description("This option specifies the cost factor to consider in usec per OSD for solid state device type. This is considered by the mclock_scheduler to set an additional cost factor in QoS calculations. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_cost_per_byte_usec", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(0.0)
+    .set_description("Cost per byte in microseconds to consider per OSD (overrides _ssd and _hdd if non-zero)")
+    .set_long_description("This option specifies the cost per byte to consider in microseconds per OSD. This is considered by the mclock scheduler to set an additional cost factor in QoS calculations. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_cost_per_byte_usec_hdd", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(5.2)
+    .set_description("Cost per byte in microseconds to consider per OSD (for rotational media)")
+    .set_long_description("This option specifies the cost per byte to consider in microseconds per OSD for rotational device type. This is considered by the mclock_scheduler to set an additional cost factor in QoS calculations. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_cost_per_byte_usec_ssd", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(0.011)
+    .set_description("Cost per byte in microseconds to consider per OSD (for solid state media)")
+    .set_long_description("This option specifies the cost per byte to consider in microseconds per OSD for solid state device type. This is considered by the mclock_scheduler to set an additional cost factor in QoS calculations. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_max_capacity_iops", Option::TYPE_FLOAT, Option::LEVEL_BASIC)
+    .set_default(0.0)
+    .set_description("Max IOPs capacity (at 4KiB block size) to consider per OSD (overrides _ssd and _hdd if non-zero)")
+    .set_long_description("This option specifies the max osd capacity in iops per OSD. Helps in QoS calculations when enabling a dmclock profile. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_max_capacity_iops_hdd", Option::TYPE_FLOAT, Option::LEVEL_BASIC)
+    .set_default(315.0)
+    .set_description("Max IOPs capacity (at 4KiB block size) to consider per OSD (for rotational media)")
+    .set_long_description("This option specifies the max OSD capacity in iops per OSD. Helps in QoS calculations when enabling a dmclock profile. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_max_capacity_iops_ssd", Option::TYPE_FLOAT, Option::LEVEL_BASIC)
+    .set_default(21500.0)
+    .set_description("Max IOPs capacity (at 4KiB block size) to consider per OSD (for solid state media)")
+    .set_long_description("This option specifies the max OSD capacity in iops per OSD. Helps in QoS calculations when enabling a dmclock profile. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME),
+
+    Option("osd_mclock_profile", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("high_client_ops")
+    .set_enum_allowed( { "balanced", "high_recovery_ops", "high_client_ops", "custom" } )
+    .set_description("Which mclock profile to use")
+    .set_long_description("This option specifies the mclock profile to enable - one among the set of built-in profiles or a custom profile. Only considered for osd_op_queue = mclock_scheduler")
+    .set_flag(Option::FLAG_RUNTIME)
+    .add_see_also("osd_op_queue"),
 
     Option("osd_ignore_stale_divergent_priors", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
@@ -2971,19 +3182,23 @@ std::vector<Option> get_global_options() {
 
     Option("osd_recovery_sleep", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next recovery or backfill op"),
 
     Option("osd_recovery_sleep_hdd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0.1)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next recovery or backfill op for HDDs"),
 
     Option("osd_recovery_sleep_ssd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next recovery or backfill op for SSDs")
     .add_see_also("osd_recovery_sleep"),
 
     Option("osd_recovery_sleep_hybrid", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0.025)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next recovery or backfill op when data is on HDD and journal is on SSD")
     .add_see_also("osd_recovery_sleep"),
 
@@ -3080,18 +3295,6 @@ std::vector<Option> get_global_options() {
     .set_default(500)
     .set_description(""),
 
-    Option("osd_mon_ack_timeout", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(30.0)
-    .set_description(""),
-
-    Option("osd_stats_ack_timeout_factor", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(2.0)
-    .set_description(""),
-
-    Option("osd_stats_ack_timeout_decay", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(.9)
-    .set_description(""),
-
     Option("osd_max_snap_prune_intervals_per_epoch", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(512)
     .set_description("Max number of snap intervals to report to mgr in pg_stat_t"),
@@ -3110,19 +3313,22 @@ std::vector<Option> get_global_options() {
 
     Option("osd_recovery_max_active", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Number of simultaneous active recovery operations per OSD (overrides _ssd and _hdd if non-zero)")
     .add_see_also("osd_recovery_max_active_hdd")
     .add_see_also("osd_recovery_max_active_ssd"),
 
     Option("osd_recovery_max_active_hdd", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(3)
-    .set_description("Number of simultaneous active recovery oeprations per OSD (for rotational devices)")
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("Number of simultaneous active recovery operations per OSD (for rotational devices)")
     .add_see_also("osd_recovery_max_active")
     .add_see_also("osd_recovery_max_active_ssd"),
 
     Option("osd_recovery_max_active_ssd", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(10)
-    .set_description("Number of simultaneous active recovery oeprations per OSD (for non-rotational solid state devices)")
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("Number of simultaneous active recovery operations per OSD (for non-rotational solid state devices)")
     .add_see_also("osd_recovery_max_active")
     .add_see_also("osd_recovery_max_active_hdd"),
 
@@ -3168,24 +3374,30 @@ std::vector<Option> get_global_options() {
 
     Option("osd_scrub_begin_hour", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_min_max(0, 23)
     .set_description("Restrict scrubbing to this hour of the day or later")
+    .set_long_description("Use osd_scrub_begin_hour=0 and osd_scrub_end_hour=0 for the entire day.")
     .add_see_also("osd_scrub_end_hour"),
 
     Option("osd_scrub_end_hour", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(24)
+    .set_default(0)
+    .set_min_max(0, 23)
     .set_description("Restrict scrubbing to hours of the day earlier than this")
+    .set_long_description("Use osd_scrub_begin_hour=0 and osd_scrub_end_hour=0 for the entire day.")
     .add_see_also("osd_scrub_begin_hour"),
 
     Option("osd_scrub_begin_week_day", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_min_max(0, 6)
     .set_description("Restrict scrubbing to this day of the week or later")
-    .set_long_description("0 or 7 = Sunday, 1 = Monday, etc.")
+    .set_long_description("0 = Sunday, 1 = Monday, etc. Use osd_scrub_begin_week_day=0 osd_scrub_end_week_day=0 for the entire week.")
     .add_see_also("osd_scrub_end_week_day"),
 
     Option("osd_scrub_end_week_day", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(7)
+    .set_default(0)
+    .set_min_max(0, 6)
     .set_description("Restrict scrubbing to days of the week earlier than this")
-    .set_long_description("0 or 7 = Sunday, 1 = Monday, etc.")
+    .set_long_description("0 = Sunday, 1 = Monday, etc. Use osd_scrub_begin_week_day=0 osd_scrub_end_week_day=0 for the entire week.")
     .add_see_also("osd_scrub_begin_week_day"),
 
     Option("osd_scrub_load_threshold", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
@@ -3246,6 +3458,7 @@ std::vector<Option> get_global_options() {
 
     Option("osd_scrub_max_preemptions", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(5)
+    .set_min_max(0, 30)
     .set_description("Set the maximum number of times we will preempt a deep scrub due to a client operation before blocking client IO to complete the scrub"),
 
     Option("osd_deep_scrub_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
@@ -3290,11 +3503,11 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("osd_class_load_list", Option::TYPE_STR, Option::LEVEL_ADVANCED)
-    .set_default("cephfs hello journal lock log numops " "otp rbd refcount rgw rgw_gc timeindex user version cas cmpomap queue 2pc_queue")
+    .set_default("cephfs hello journal lock log numops " "otp rbd refcount rgw rgw_gc timeindex user version cas cmpomap queue 2pc_queue fifo")
     .set_description(""),
 
     Option("osd_class_default_list", Option::TYPE_STR, Option::LEVEL_ADVANCED)
-    .set_default("cephfs hello journal lock log numops " "otp rbd refcount rgw rgw_gc timeindex user version cas cmpomap queue 2pc_queue")
+    .set_default("cephfs hello journal lock log numops " "otp rbd refcount rgw rgw_gc timeindex user version cas cmpomap queue 2pc_queue fifo")
     .set_description(""),
 
     Option("osd_check_for_log_corruption", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -3321,34 +3534,36 @@ std::vector<Option> get_global_options() {
     .set_default(40)
     .set_description(""),
 
-    Option("osd_target_pg_log_entries_per_osd", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("osd_target_pg_log_entries_per_osd", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(3000 * 100)
-    .set_description("target number of PG entries total on an OSD")
+    .set_description("target number of PG entries total on an OSD - limited per pg by the min and max options below")
     .add_see_also("osd_max_pg_log_entries")
     .add_see_also("osd_min_pg_log_entries"),
 
-    Option("osd_min_pg_log_entries", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("osd_min_pg_log_entries", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(250)
     .set_description("minimum number of entries to maintain in the PG log")
     .add_service("osd")
     .add_see_also("osd_max_pg_log_entries")
-    .add_see_also("osd_pg_log_dups_tracked"),
+    .add_see_also("osd_pg_log_dups_tracked")
+    .add_see_also("osd_target_pg_log_entries_per_osd"),
 
-    Option("osd_max_pg_log_entries", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("osd_max_pg_log_entries", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(10000)
-    .set_description("maximum number of entries to maintain in the PG log when degraded before we trim")
+    .set_description("maximum number of entries to maintain in the PG log")
     .add_service("osd")
     .add_see_also("osd_min_pg_log_entries")
-    .add_see_also("osd_pg_log_dups_tracked"),
+    .add_see_also("osd_pg_log_dups_tracked")
+    .add_see_also("osd_target_pg_log_entries_per_osd"),
 
-    Option("osd_pg_log_dups_tracked", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("osd_pg_log_dups_tracked", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(3000)
     .set_description("how many versions back to track in order to detect duplicate ops; this is combined with both the regular pg log entries and additional minimal dup detection entries")
     .add_service("osd")
     .add_see_also("osd_min_pg_log_entries")
     .add_see_also("osd_max_pg_log_entries"),
 
-    Option("osd_object_clean_region_max_num_intervals", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    Option("osd_object_clean_region_max_num_intervals", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(10)
     .set_description("number of intervals in clean_offsets")
     .set_long_description("partial recovery uses multiple intervals to record the clean part of the object"
@@ -3356,13 +3571,15 @@ std::vector<Option> get_global_options() {
         "(0 will recovery the entire object data interval)")
     .add_service("osd"),
 
-    Option("osd_force_recovery_pg_log_entries_factor", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    Option("osd_force_recovery_pg_log_entries_factor", Option::TYPE_FLOAT, Option::LEVEL_DEV)
     .set_default(1.3)
     .set_description(""),
 
-    Option("osd_pg_log_trim_min", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("osd_pg_log_trim_min", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(100)
-    .set_description(""),
+    .set_description("Minimum number of log entries to trim at once. This lets us trim in larger batches rather than with each write.")
+    .add_see_also("osd_max_pg_log_entries")
+    .add_see_also("osd_min_pg_log_entries"),
 
     Option("osd_force_auth_primary_missing_objects", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(100)
@@ -3370,6 +3587,7 @@ std::vector<Option> get_global_options() {
 
     Option("osd_async_recovery_min_cost", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(100)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("A mixture measure of number of current log entries difference "
                      "and historical missing objects,  above which we switch to use "
                      "asynchronous recovery when appropriate"),
@@ -3534,11 +3752,11 @@ std::vector<Option> get_global_options() {
     .set_description("Time in seconds to sleep before next removal transaction for HDDs"),
 
     Option("osd_delete_sleep_ssd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(0)
+    .set_default(1)
     .set_description("Time in seconds to sleep before next removal transaction for SSDs"),
 
     Option("osd_delete_sleep_hybrid", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(2)
+    .set_default(1)
     .set_description("Time in seconds to sleep before next removal transaction when data is on HDD and journal is on SSD"),
 
     Option("osd_failsafe_full_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
@@ -3549,6 +3767,12 @@ std::vector<Option> get_global_options() {
     .set_default(true)
     .set_description("Fast, immediate shutdown")
     .set_long_description("Setting this to false makes the OSD do a slower teardown of all state when it receives a SIGINT or SIGTERM or when shutting down for any other reason.  That slow shutdown is primarilyy useful for doing memory leak checking with valgrind."),
+
+    Option("osd_fast_shutdown_notify_mon", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Tell mon about OSD shutdown on immediate shutdown")
+    .set_long_description("Tell the monitor the OSD is shutting down on immediate shutdown. This helps with cluster log messages from other OSDs reporting it immediately failed.")
+    .add_see_also({"osd_fast_shutdown", "osd_mon_shutdown_timeout"}),
 
     Option("osd_fast_fail_on_connection_refused", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -3682,7 +3906,7 @@ std::vector<Option> get_global_options() {
     .set_long_description("By default RocksDB will load an SST file's index and bloom filters into memory when it is opened and remove them from memory when an SST file is closed.  Thus, memory consumption by indices and bloom filters is directly tied to the number of concurrent SST files allowed to be kept open.  This option instead stores cached indicies and filters in the block cache where they directly compete with other cached data.  By default we set this option to true to better account for and bound rocksdb memory usage and keep filters in memory even when an SST file is closed."),
 
     Option("rocksdb_cache_index_and_filter_blocks_with_high_priority", Option::TYPE_BOOL, Option::LEVEL_DEV)
-    .set_default(true)
+    .set_default(false)
     .set_description("Whether to cache indices and filters in the block cache with high priority")
     .set_long_description("A downside of setting rocksdb_cache_index_and_filter_blocks to true is that regular data can push indices and filters out of memory.  Setting this option to true means they are cached with higher priority than other data and should typically stay in the block cache."),
 
@@ -3961,10 +4185,6 @@ std::vector<Option> get_global_options() {
     .set_default(false)
     .set_description(""),
 
-    Option("bdev_nvme_retry_count", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-    .set_default(-1)
-    .set_description(""),
-
     Option("bdev_enable_discard", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
     .set_description(""),
@@ -3972,6 +4192,18 @@ std::vector<Option> get_global_options() {
     Option("bdev_async_discard", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
     .set_description(""),
+    
+    Option("bdev_flock_retry_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(0.1)
+    .set_description("interval to retry the flock"),
+    
+    Option("bdev_flock_retry", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(3)
+    .set_description("times to retry the flock")
+    .set_long_description(
+        "The number of times to retry on getting the block device lock. "
+        "Programs such as systemd-udevd may compete with Ceph for this lock. "
+        "0 means 'unlimited'."),
 
     Option("bluefs_alloc_size", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
     .set_default(1_M)
@@ -4010,9 +4242,9 @@ std::vector<Option> get_global_options() {
     .set_description(""),
 
     Option("bluefs_buffered_io", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
-    .set_default(false)
+    .set_default(true)
     .set_description("Enabled buffered IO for bluefs reads.")
-    .set_long_description("When this option is enabled, bluefs will in some cases perform buffered reads.  This allows the kernel page cache to act as a secondary cache for things like RocksDB compaction.  For example, if the rocksdb block cache isn't large enough to hold blocks from the compressed SST files itself, they can be read from page cache instead of from the disk.  This option previously was enabled by default, however in some test cases it appears to cause excessive swap utilization by the linux kernel and a large negative performance impact after several hours of run time.  Please exercise caution when enabling."),
+    .set_long_description("When this option is enabled, bluefs will in some cases perform buffered reads.  This allows the kernel page cache to act as a secondary cache for things like RocksDB compaction.  For example, if the rocksdb block cache isn't large enough to hold blocks from the compressed SST files itself, they can be read from page cache instead of from the disk."),
 
     Option("bluefs_sync_write", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
@@ -4023,13 +4255,28 @@ std::vector<Option> get_global_options() {
     .set_enum_allowed({"bitmap", "stupid", "avl", "hybrid"})
     .set_description(""),
 
-    Option("bluefs_preextend_wal_files", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
-    .set_default(true)
-    .set_description("Preextent rocksdb wal files on mkfs to avoid performance penalty"),
-
     Option("bluefs_log_replay_check_allocations", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
       .set_default(true)
       .set_description("Enables checks for allocations consistency during log replay"),
+
+    Option("bluefs_replay_recovery", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_description("Attempt to read bluefs log so large that it became unreadable.")
+    .set_long_description("If BlueFS log grows to extreme sizes (200GB+) it is likely that it becames unreadable. "
+			  "This options enables heuristics that scans devices for missing data. "
+			  "DO NOT ENABLE BY DEFAULT"),
+
+    Option("bluefs_replay_recovery_disable_compact", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description(""),
+
+    Option("bluefs_check_for_zeros", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("Check data read for suspicious pages")
+    .set_long_description("Looks into data read to check if there is a 4K block entirely filled with zeros. "
+			  "If this happens, we re-read data. If there is difference, we print error to log.")
+    .add_see_also("bluestore_retry_disk_reads"),
 
     Option("bluestore_bluefs", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(true)
@@ -4042,48 +4289,10 @@ std::vector<Option> get_global_options() {
     .set_flag(Option::FLAG_CREATE)
     .set_description("Mirror bluefs data to file system for testing/validation"),
 
-    Option("bluestore_bluefs_min", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(1_G)
-    .set_description("minimum disk space allocated to BlueFS (e.g., at mkfs)"),
-
-    Option("bluestore_bluefs_min_free", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(1_G)
-    .set_description("minimum free space allocated to BlueFS"),
-
-    Option("bluestore_bluefs_max_free", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(10_G)
-    .set_description("Maximum free space allocated to BlueFS"),
-
-    Option("bluestore_bluefs_min_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(.02)
-    .set_description("Minimum fraction of free space devoted to BlueFS"),
-
-    Option("bluestore_bluefs_max_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(.90)
-    .set_description("Maximum fraction of free storage devoted to BlueFS"),
-
-    Option("bluestore_bluefs_gift_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(.02)
-    .set_description("Maximum fraction of free space to give to BlueFS at once"),
-
-    Option("bluestore_bluefs_reclaim_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(.20)
-    .set_description("Maximum fraction of free space to reclaim from BlueFS at once"),
-
-    Option("bluestore_bluefs_balance_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(1)
-    .set_description("How frequently (in seconds) to balance free space between BlueFS and BlueStore"),
-
     Option("bluestore_bluefs_alloc_failure_dump_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
     .set_description("How frequently (in seconds) to dump allocator on"
       "BlueFS space allocation failure"),
-
-    Option("bluestore_bluefs_db_compatibility", Option::TYPE_BOOL, Option::LEVEL_DEV)
-    .set_default(true)
-    .set_description("Sync db with legacy bluefs extents info")
-    .set_long_description("Enforces db sync with legacy bluefs extents information on close."
-                          " Enables downgrades to pre-nautilus releases"),
 
     Option("bluestore_spdk_mem", Option::TYPE_SIZE, Option::LEVEL_DEV)
     .set_default(512)
@@ -4325,7 +4534,7 @@ std::vector<Option> get_global_options() {
     .set_description("How frequently we trim the bluestore cache"),
 
     Option("bluestore_cache_trim_max_skip_pinned", Option::TYPE_UINT, Option::LEVEL_DEV)
-    .set_default(64)
+    .set_default(1000)
     .set_description("Max pinned cache entries we consider before giving up"),
 
     Option("bluestore_cache_type", Option::TYPE_STR, Option::LEVEL_DEV)
@@ -4357,14 +4566,19 @@ std::vector<Option> get_global_options() {
     .add_see_also("bluestore_cache_size"),
 
     Option("bluestore_cache_meta_ratio", Option::TYPE_FLOAT, Option::LEVEL_DEV)
-    .set_default(.4)
+    .set_default(.45)
     .add_see_also("bluestore_cache_size")
     .set_description("Ratio of bluestore cache to devote to metadata"),
 
     Option("bluestore_cache_kv_ratio", Option::TYPE_FLOAT, Option::LEVEL_DEV)
-    .set_default(.4)
+    .set_default(.45)
     .add_see_also("bluestore_cache_size")
     .set_description("Ratio of bluestore cache to devote to kv database (rocksdb)"),
+
+    Option("bluestore_cache_kv_onode_ratio", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(.04)
+    .add_see_also("bluestore_cache_size")
+    .set_description("Ratio of bluestore cache to devote to kv onode column family (rocksdb)"),
 
     Option("bluestore_cache_autotune", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(true)
@@ -4388,7 +4602,7 @@ std::vector<Option> get_global_options() {
 
     Option("bluestore_allocator", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("hybrid")
-    .set_enum_allowed({"bitmap", "stupid", "avl", "hybrid"})
+    .set_enum_allowed({"bitmap", "stupid", "avl", "hybrid", "zoned"})
     .set_description("Allocator policy")
     .set_long_description("Allocator to use for bluestore.  Stupid should only be used for testing."),
 
@@ -4413,15 +4627,35 @@ std::vector<Option> get_global_options() {
     .set_description("max duration to force deferred submit"),
 
     Option("bluestore_rocksdb_options", Option::TYPE_STR, Option::LEVEL_ADVANCED)
-    .set_default("compression=kNoCompression,max_write_buffer_number=4,min_write_buffer_number_to_merge=1,recycle_log_file_num=4,write_buffer_size=268435456,writable_file_max_buffer_size=0,compaction_readahead_size=2097152,max_background_compactions=2")
-    .set_description("Rocksdb options"),
+    .set_default("compression=kNoCompression,max_write_buffer_number=4,min_write_buffer_number_to_merge=1,recycle_log_file_num=4,write_buffer_size=268435456,writable_file_max_buffer_size=0,compaction_readahead_size=2097152,max_background_compactions=2,max_total_wal_size=1073741824")
+    .set_description("Full set of rocksdb settings to override"),
+
+    Option("bluestore_rocksdb_options_annex", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("An addition to bluestore_rocksdb_options. Allows setting rocksdb options without repeating the existing defaults."),
 
     Option("bluestore_rocksdb_cf", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
+#ifdef WITH_SEASTAR
+    // This is necessary as the Seastar's allocator imposes restrictions
+    // on the number of threads that entered malloc/free/*. Unfortunately,
+    // RocksDB sharding in BlueStore dramatically lifted the number of
+    // threads spawn during RocksDB's init.
+    .set_validator([](std::string *value, std::string *error_message){
+      if (const bool parsed_value = strict_strtob(value->c_str(), error_message);
+	  error_message->empty() && parsed_value) {
+        *error_message = "invalid BlueStore sharding configuration."
+                         " Be aware any change takes effect only on mkfs!";
+        return -EINVAL;
+      } else {
+        return 0;
+      }
+    })
+#endif
     .set_description("Enable use of rocksdb column families for bluestore metadata"),
 
     Option("bluestore_rocksdb_cfs", Option::TYPE_STR, Option::LEVEL_DEV)
-    .set_default("m(3) O(3,0-13) L")
+    .set_default("m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} L P")
     .set_description("Definition of column families and their sharding")
     .set_long_description("Space separated list of elements: column_def [ '=' rocksdb_options ]. "
 			  "column_def := column_name [ '(' shard_count [ ',' hash_begin '-' [ hash_end ] ] ')' ]. "
@@ -4439,7 +4673,7 @@ std::vector<Option> get_global_options() {
     .set_description("Run deep fsck at mount when bluestore_fsck_on_mount is set to true"),
 
     Option("bluestore_fsck_quick_fix_on_mount", Option::TYPE_BOOL, Option::LEVEL_DEV)
-      .set_default(true)
+      .set_default(false)
       .set_description("Do quick-fix for the store at mount"),
 
     Option("bluestore_fsck_on_umount", Option::TYPE_BOOL, Option::LEVEL_DEV)
@@ -4500,17 +4734,20 @@ std::vector<Option> get_global_options() {
 
     Option("bluestore_deferred_batch_ops", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_min_max(0, 65535)
     .set_flag(Option::FLAG_RUNTIME)
     .set_description("Max number of deferred writes before we flush the deferred write queue"),
 
     Option("bluestore_deferred_batch_ops_hdd", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(64)
+    .set_min_max(0, 65535)
     .set_flag(Option::FLAG_RUNTIME)
     .set_description("Default bluestore_deferred_batch_ops for rotational media")
     .add_see_also("bluestore_deferred_batch_ops"),
 
     Option("bluestore_deferred_batch_ops_ssd", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(16)
+    .set_min_max(0, 65535)
     .set_flag(Option::FLAG_RUNTIME)
     .set_description("Default bluestore_deferred_batch_ops for non-rotational (solid state) media")
     .add_see_also("bluestore_deferred_batch_ops"),
@@ -4537,10 +4774,6 @@ std::vector<Option> get_global_options() {
     .set_default(false)
     .set_flag(Option::FLAG_RUNTIME)
     .set_description("Cache writes by default (unless hinted NOCACHE or WONTNEED)"),
-
-    Option("bluestore_debug_misc", Option::TYPE_BOOL, Option::LEVEL_DEV)
-    .set_default(false)
-    .set_description(""),
 
     Option("bluestore_debug_no_reuse_blocks", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(false)
@@ -4622,9 +4855,17 @@ std::vector<Option> get_global_options() {
     .set_default(false)
     .set_description("Make fsck error (instead of warn) when objects without per-pool omap are found"),
 
+    Option("bluestore_fsck_error_on_no_per_pg_omap", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Make fsck error (instead of warn) when objects without per-pg omap are found"),
+
     Option("bluestore_warn_on_no_per_pool_omap", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .set_description("Enable health indication on lack of per-pool omap"),
+
+    Option("bluestore_warn_on_no_per_pg_omap", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Enable health indication on lack of per-pg omap"),
 
     Option("bluestore_log_op_age", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(5)
@@ -4646,21 +4887,36 @@ std::vector<Option> get_global_options() {
 
     Option("bluestore_avl_alloc_bf_threshold", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(131072)
-    .set_description(""),
+    .set_description("Sets threshold at which shrinking max free chunk size triggers enabling best-fit mode.")
+    .set_long_description("AVL allocator works in two modes: near-fit and best-fit. By default, it uses very fast near-fit mode, "
+			  "in which it tries to fit a new block near the last allocated block of similar size. The second mode "
+			  "is much slower best-fit mode, in which it tries to find an exact match for the requested allocation. "
+			  "This mode is used when either the device gets fragmented or when it is low on free space. "
+			  "When the largest free block is smaller than 'bluestore_avl_alloc_bf_threshold', best-fit mode is used.")
+    .add_see_also("bluestore_avl_alloc_bf_free_pct"),
 
     Option("bluestore_avl_alloc_bf_free_pct", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(4)
-    .set_description(""),
+    .set_description("Sets threshold at which shrinking free space (in %, integer) triggers enabling best-fit mode.")
+    .set_long_description("AVL allocator works in two modes: near-fit and best-fit. By default, it uses very fast near-fit mode, "
+			  "in which it tries to fit a new block near the last allocated block of similar size. The second mode "
+			  "is much slower best-fit mode, in which it tries to find an exact match for the requested allocation. "
+			  "This mode is used when either the device gets fragmented or when it is low on free space. "
+			  "When free space is smaller than 'bluestore_avl_alloc_bf_free_pct', best-fit mode is used.")
+    .add_see_also("bluestore_avl_alloc_bf_threshold"),
 
     Option("bluestore_hybrid_alloc_mem_cap", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(64_M)
     .set_description("Maximum RAM hybrid allocator should use before enabling bitmap supplement"),
 
     Option("bluestore_volume_selection_policy", Option::TYPE_STR, Option::LEVEL_DEV)
-    .set_default("rocksdb_original")
-    .set_enum_allowed({ "rocksdb_original", "use_some_extra" })
+    .set_default("use_some_extra")
+    .set_enum_allowed({ "rocksdb_original", "use_some_extra", "fit_to_fast" })
     .set_description("Determines bluefs volume selection policy")
-    .set_long_description("Determines bluefs volume selection policy. 'use_some_extra' policy allows to override RocksDB level granularity and put high level's data to faster device even when the level doesn't completely fit there"),
+    .set_long_description("Determines bluefs volume selection policy. 'use_some_extra' policy allows to override RocksDB level "
+                          "granularity and put high level's data to faster device even when the level doesn't completely fit there. "
+                          "'fit_to_fast' policy enables using 100% of faster disk capacity and allows the user to turn on "
+                          "'level_compaction_dynamic_level_bytes' option in RocksDB options."),
 
     Option("bluestore_volume_selection_reserved_factor", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
       .set_flag(Option::FLAG_STARTUP)
@@ -4672,9 +4928,25 @@ std::vector<Option> get_global_options() {
       .set_default(0)
       .set_description("Space reserved at DB device and not allowed for 'use some extra' policy usage. Overrides 'bluestore_volume_selection_reserved_factor' setting and introduces straightforward limit."),
 
-    Option("bluestore_ioring", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    Option("bdev_ioring", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
     .set_description("Enables Linux io_uring API instead of libaio"),
+
+    Option("bdev_ioring_hipri", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Enables Linux io_uring API Use polled IO completions"),
+
+    Option("bdev_ioring_sqthread_poll", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Enables Linux io_uring API Offload submission/completion to kernel thread"),
+
+    Option("bluestore_kv_sync_util_logging_s", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(10.0)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("KV sync thread utilization logging period")
+    .set_long_description("How often (in seconds) to print KV sync thread utilization, "
+      "not logged when set to 0 or when utilization is 0%"),
+
 
     // -----------------------------------------
     // kstore
@@ -5147,13 +5419,17 @@ std::vector<Option> get_global_options() {
     .set_default("/tmp/fio")
     .set_description(""),
 
-    Option("rados_mon_op_timeout", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    Option("rados_mon_op_timeout", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
     .set_default(0)
-    .set_description(""),
+    .set_description("timeout for operations handled by monitors such as statfs (0 is unlimited)")
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_min(0),
 
-    Option("rados_osd_op_timeout", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    Option("rados_osd_op_timeout", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
     .set_default(0)
-    .set_description(""),
+    .set_description("timeout for operations handled by osds such as write (0 is unlimited)")
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_min(0),
 
     Option("rados_tracing", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
@@ -5168,6 +5444,17 @@ std::vector<Option> get_global_options() {
     .set_default(CEPH_DATADIR "/mgr")
     .add_service("mgr")
     .set_description("Filesystem path to manager modules."),
+
+    Option("mgr_standby_modules", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("Start modules in standby (redirect) mode when mgr is standby")
+    .set_long_description(
+      "By default, the standby modules will answer incoming requests with a "
+      "HTTP redirect to the active manager, allowing users to point their browser at any "
+      "mgr node and find their way to an active mgr.  However, this mode is problematic "
+      "when using a load balancer because (1) the redirect locations are usually private "
+      "IPs and (2) the load balancer can't identify which mgr is the right one to send "
+      "traffic to. If a load balancer is being used, set this to false."),
 
     Option("mgr_disabled_modules", Option::TYPE_STR, Option::LEVEL_ADVANCED)
 #ifdef MGR_DISABLED_MODULES
@@ -5357,6 +5644,40 @@ std::vector<Option> get_global_options() {
     .set_default(0)
     .set_description("Override 60 second periods for testing only"),
 
+    Option("librados_thread_count", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .set_min(1)
+    .set_description("Size of thread pool for Objecter")
+    .add_tag("client"),
+
+    Option("osd_asio_thread_count", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .set_min(1)
+    .set_description("Size of thread pool for ASIO completions")
+    .add_tag("osd"),
+
+    Option("cephsqlite_lock_renewal_interval", Option::TYPE_MILLISECS, Option::LEVEL_ADVANCED)
+    .add_see_also("cephsqlite_lock_renewal_timeout")
+    .add_tag("client")
+    .set_default(2000)
+    .set_description("number of milliseconds before lock is renewed")
+    .set_min(100)
+    ,
+
+    Option("cephsqlite_lock_renewal_timeout", Option::TYPE_MILLISECS, Option::LEVEL_ADVANCED)
+    .add_see_also("cephsqlite_lock_renewal_interval")
+    .add_tag("client")
+    .set_default(30000)
+    .set_description("number of milliseconds before transaction lock times out")
+    .set_long_description("The amount of time before a running libcephsqlite VFS connection has to renew a lock on the database before the lock is automatically lost. If the lock is lost, the VFS will abort the process to prevent database corruption.")
+    .set_min(100),
+
+    Option("cephsqlite_blocklist_dead_locker", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .add_tag("client")
+    .set_default(true)
+    .set_description("blocklist the last dead owner of the database lock")
+    .set_long_description("Require that the Ceph SQLite VFS blocklist the last dead owner of the database when cleanup was incomplete. DO NOT CHANGE THIS UNLESS YOU UNDERSTAND THE RAMIFICATIONS. CORRUPTION MAY RESULT."),
+
     // ----------------------------
     // Crimson specific options
 
@@ -5366,7 +5687,13 @@ std::vector<Option> get_global_options() {
 
     Option("crimson_osd_scheduler_concurrency", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(0)
-    .set_description("The maximum number concurrent IO operations, 0 for unlimited")
+    .set_description("The maximum number concurrent IO operations, 0 for unlimited"),
+
+    // ----------------------------
+    // blk specific options
+    Option("bdev_type", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_description("Explicitly set the device type to select the driver if it's needed")
+    .set_enum_allowed({"aio", "spdk", "pmem", "hm_smr"})
 
   });
 }
@@ -5500,7 +5827,7 @@ std::vector<Option> get_rgw_options() {
         "will be located in the path that is specified here. "),
 
     Option("rgw_enable_apis", Option::TYPE_STR, Option::LEVEL_ADVANCED)
-    .set_default("s3, s3website, swift, swift_auth, admin, sts, iam, pubsub")
+    .set_default("s3, s3website, swift, swift_auth, admin, sts, iam, notifications")
     .set_description("A list of set of RESTful APIs that rgw handles."),
 
     Option("rgw_cache_enabled", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -5580,20 +5907,34 @@ std::vector<Option> get_rgw_options() {
     .set_long_description("Local time window in which the lifecycle maintenance thread can work."),
 
     Option("rgw_lc_lock_max_time", Option::TYPE_INT, Option::LEVEL_DEV)
-    .set_default(60)
+    .set_default(90)
     .set_description(""),
 
     Option("rgw_lc_thread_delay", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(0)
     .set_description("Delay after processing of bucket listing chunks (i.e., per 1000 entries) in milliseconds"),
 
+    Option("rgw_lc_max_worker", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_default(3)
+    .set_description("Number of LCWorker tasks that will be run in parallel")
+    .set_long_description(
+      "Number of LCWorker tasks that will run in parallel--used to permit >1 "
+      "bucket/index shards to be processed simultaneously"),
+
+    Option("rgw_lc_max_wp_worker", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_default(3)
+    .set_description("Number of workpool threads per LCWorker")
+    .set_long_description(
+      "Number of threads in per-LCWorker workpools--used to accelerate "
+      "per-bucket processing"),
+
     Option("rgw_lc_max_objs", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(32)
     .set_description("Number of lifecycle data shards")
     .set_long_description(
-          "Number of RADOS objects to use for storing lifecycle index. This can affect "
-          "concurrency of lifecycle maintenance, but requires multiple RGW processes "
-          "running on the zone to be utilized."),
+          "Number of RADOS objects to use for storing lifecycle index. This "
+	  "affects concurrency of lifecycle maintenance, as shards can be "
+          "processed in parallel."),
 
     Option("rgw_lc_max_rules", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1000)
@@ -5953,6 +6294,22 @@ std::vector<Option> get_rgw_options() {
     .set_description("use fast S3 attrs from bucket index (immutable only)")
     .set_long_description("use fast S3 attrs from bucket index (assumes NFS "
 			  "mounts are immutable)"),
+
+    Option("rgw_nfs_run_gc_threads", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("run GC threads in librgw (default off)"),
+
+    Option("rgw_nfs_run_lc_threads", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("run lifecycle threads in librgw (default off)"),
+
+    Option("rgw_nfs_run_quota_threads", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("run quota threads in librgw (default off)"),
+
+    Option("rgw_nfs_run_sync_thread", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("run sync thread in librgw (default off)"),
 
     Option("rgw_rados_pool_autoscale_bias", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(4.0)
@@ -6320,6 +6677,14 @@ std::vector<Option> get_rgw_options() {
         "the metadata sync parallelism as a shard can only be processed by a single "
         "RGW at a time"),
 
+    Option("rgw_curl_buffersize", Option::TYPE_INT, Option::LEVEL_DEV)
+    .set_default(512_K)
+    .set_min_max(1_K, 512_K)
+    .set_long_description(
+        "Pass a long specifying your preferred size (in bytes) for the receive"
+        "buffer in libcurl. "
+        "See: https://curl.se/libcurl/c/CURLOPT_BUFFERSIZE.html"),
+
     Option("rgw_curl_wait_timeout_ms", Option::TYPE_INT, Option::LEVEL_DEV)
     .set_default(1000)
     .set_description(""),
@@ -6347,6 +6712,15 @@ std::vector<Option> get_rgw_options() {
     Option("rgw_copy_obj_progress_every_bytes", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
     .set_default(1_M)
     .set_description("Send copy-object progress info after these many bytes"),
+
+    Option("rgw_sync_obj_etag_verify", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .set_description("Verify if the object copied from remote is identical to its source")
+    .set_long_description(
+        "If true, this option computes the MD5 checksum of the data which is written at the "
+	"destination and checks if it is identical to the ETAG stored in the source. "
+        "It ensures integrity of the objects fetched from a remote server over HTTP including "
+        "multisite sync."),
 
     Option("rgw_obj_tombstone_cache_size", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(1000)
@@ -6504,8 +6878,9 @@ std::vector<Option> get_rgw_options() {
     .set_default(1000)
     .set_description("Max number of buckets per user")
     .set_long_description(
-        "A user can create this many buckets. Zero means unlimited, negative number means "
-        "user cannot create any buckets (although user will retain buckets already created."),
+      "A user can create at most this number of buckets. Zero means "
+      "no limit; a negative value means users cannot create any new "
+      "buckets, although users will retain buckets already created."),
 
     Option("rgw_objexp_gc_interval", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(10_min)
@@ -6704,7 +7079,10 @@ std::vector<Option> get_rgw_options() {
         "does not know whether incoming http connections are secure. Enable "
         "this option to trust the Forwarded and X-Forwarded-Proto headers sent "
         "by the proxy when determining whether the connection is secure. This "
-        "is required for some features, such as server side encryption.")
+        "is required for some features, such as server side encryption. "
+        "(Never enable this setting if you do not have a trusted proxy in "
+        "front of radosgw, or else malicious users will be able to set these "
+        "headers in any request.)")
     .add_see_also("rgw_crypt_require_ssl"),
 
     Option("rgw_crypt_require_ssl", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -6717,7 +7095,7 @@ std::vector<Option> get_rgw_options() {
 
     Option("rgw_crypt_s3_kms_backend", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("barbican")
-    .set_enum_allowed({"barbican", "vault", "testing"})
+    .set_enum_allowed({"barbican", "vault", "testing", "kmip"})
     .set_description(
         "Where the SSE-KMS encryption keys are stored. Supported KMS "
         "systems are OpenStack Barbican ('barbican', the default) and HashiCorp "
@@ -6766,7 +7144,6 @@ std::vector<Option> get_rgw_options() {
 
 
     Option("rgw_crypt_vault_secret_engine", Option::TYPE_STR, Option::LEVEL_ADVANCED)
-    .set_enum_allowed({"kv", "transit"})
     .set_default("transit")
     .set_description(
         "Vault Secret Engine to be used to retrieve encryption keys.")
@@ -6782,6 +7159,38 @@ std::vector<Option> get_rgw_options() {
       "rgw_crypt_s3_kms_backend",
       "rgw_crypt_vault_auth",
       "rgw_crypt_vault_addr"}),
+
+    Option("rgw_crypt_kmip_addr", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("kmip server address"),
+
+    Option("rgw_crypt_kmip_ca_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("ca for kmip servers"),
+
+    Option("rgw_crypt_kmip_username", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("when authenticating via username"),
+
+    Option("rgw_crypt_kmip_password", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("optional w/ username"),
+
+    Option("rgw_crypt_kmip_client_cert", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("connect using client certificate"),
+
+    Option("rgw_crypt_kmip_client_key", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("connect using client certificate"),
+
+    Option("rgw_crypt_kmip_kms_key_template", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("sse-kms; kmip key names"),
+
+    Option("rgw_crypt_kmip_s3_key_template", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("$keyid")
+    .set_description("sse-s3; kmip key template"),
 
     Option("rgw_crypt_suppress_logs", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -6930,6 +7339,10 @@ std::vector<Option> get_rgw_options() {
     .set_description("Session token max duration")
     .set_long_description("Max duration in seconds for which the session token is valid."),
 
+    Option("rgw_sts_min_session_duration", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(900)
+    .set_description("Minimum allowed duration of a session"),
+
     Option("rgw_max_listing_results", Option::TYPE_UINT,
 	   Option::LEVEL_ADVANCED)
     .set_default(1000)
@@ -7043,6 +7456,25 @@ std::vector<Option> get_rgw_options() {
     .set_description("mclock limit for metadata requests")
     .add_see_also("rgw_dmclock_metadata_res")
     .add_see_also("rgw_dmclock_metadata_wgt"),
+
+   Option("rgw_default_data_log_backing", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("fifo")
+    .set_enum_allowed( { "fifo", "omap" } )
+    .set_description("Default backing store for the RGW data sync log")
+    .set_long_description(
+        "Whether to use the older OMAP backing store or the high performance "
+	"FIFO based backing store by default. This only covers the creation of "
+	"the log on startup if none exists."),
+
+   Option("rgw_luarocks_location", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+     .set_flag(Option::FLAG_STARTUP)
+#ifdef WITH_RADOSGW_LUA_PACKAGES
+    .set_default("/tmp/luarocks")
+#else
+    // if set to empty string, system default luarocks package location (if exist) will be used
+    .set_default("")
+#endif
+    .set_description("Directory where luarocks install packages from allowlist"),
   });
 }
 
@@ -7205,13 +7637,13 @@ static std::vector<Option> get_rbd_options() {
     .set_default(false)
     .set_description("copy-up parent image blocks to clone upon read request"),
 
-    Option("rbd_blacklist_on_break_lock", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    Option("rbd_blocklist_on_break_lock", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
-    .set_description("whether to blacklist clients whose lock was broken"),
+    .set_description("whether to blocklist clients whose lock was broken"),
 
-    Option("rbd_blacklist_expire_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("rbd_blocklist_expire_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(0)
-    .set_description("number of seconds to blacklist - set to 0 for OSD default"),
+    .set_description("number of seconds to blocklist - set to 0 for OSD default"),
 
     Option("rbd_request_timed_out_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(30)
@@ -7268,6 +7700,10 @@ static std::vector<Option> get_rbd_options() {
     Option("rbd_validate_names", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .set_description("validate new image names for RBD compatibility"),
+
+    Option("rbd_invalidate_object_map_on_timeout", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(true)
+    .set_description("true if object map should be invalidated when load or update timeout"),
 
     Option("rbd_auto_exclusive_lock_until_manual_request", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -7433,6 +7869,36 @@ static std::vector<Option> get_rbd_options() {
     .set_default(0)
     .set_description("the desired burst limit of write bytes"),
 
+    Option("rbd_qos_iops_burst_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of IO operations"),
+
+    Option("rbd_qos_bps_burst_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of IO bytes"),
+
+    Option("rbd_qos_read_iops_burst_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of read operations"),
+
+    Option("rbd_qos_write_iops_burst_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of write operations"),
+
+    Option("rbd_qos_read_bps_burst_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of read bytes"),
+
+    Option("rbd_qos_write_bps_burst_seconds", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of write bytes"),
+
     Option("rbd_qos_schedule_tick_min", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(50)
     .set_min(1)
@@ -7462,20 +7928,21 @@ static std::vector<Option> get_rbd_options() {
     .set_min(0)
     .set_description("maximum io delay (in milliseconds) for simple io scheduler (if set to 0 dalay is calculated based on latency stats)"),
 
-    Option("rbd_rwl_enabled", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
-    .set_default(false)
+    Option("rbd_persistent_cache_mode", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("disabled")
+    .set_enum_allowed({"disabled", "rwl", "ssd"})
     .set_description("enable persistent write back cache for this volume"),
 
-    Option("rbd_rwl_log_periodic_stats", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    Option("rbd_persistent_cache_log_periodic_stats", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
     .set_description("emit periodic perf stats to debug log"),
 
-    Option("rbd_rwl_size", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    Option("rbd_persistent_cache_size", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1073741824)
     .set_min(1073741824)
     .set_description("size of the persistent write back cache for this volume"),
 
-    Option("rbd_rwl_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    Option("rbd_persistent_cache_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("/tmp")
     .set_description("location of the persistent write back cache in a DAX-enabled filesystem on persistent memory"),
 
@@ -7483,6 +7950,21 @@ static std::vector<Option> get_rbd_options() {
     .set_default(10)
     .set_min(1)
     .set_description("the number of quiesce notification attempts"),
+
+    Option("rbd_default_snapshot_quiesce_mode", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("required")
+    .set_enum_allowed({"required", "ignore-error", "skip"})
+    .set_description("default snapshot quiesce mode"),
+
+    Option("rbd_plugins", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("comma-delimited list of librbd plugins to enable"),
+
+    Option("rbd_config_pool_override_update_timestamp", Option::TYPE_UINT,
+           Option::LEVEL_DEV)
+    .set_default(0)
+    .set_description("timestamp of last update to pool-level config overrides"),
+
   });
 }
 
@@ -7612,7 +8094,7 @@ static std::vector<Option> get_rbd_mirror_options() {
 static std::vector<Option> get_immutable_object_cache_options() {
   return std::vector<Option>({
     Option("immutable_object_cache_path", Option::TYPE_STR, Option::LEVEL_ADVANCED)
-    .set_default("/tmp")
+    .set_default("/tmp/ceph_immutable_object_cache")
     .set_description("immutable object cache data dir"),
 
     Option("immutable_object_cache_sock", Option::TYPE_STR, Option::LEVEL_ADVANCED)
@@ -7632,13 +8114,53 @@ static std::vector<Option> get_immutable_object_cache_options() {
     .set_description("immutable object cache client dedicated thread number"),
 
     Option("immutable_object_cache_watermark", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(0.1)
+    .set_default(0.9)
     .set_description("immutable object cache water mark"),
+
+    Option("immutable_object_cache_qos_schedule_tick_min", Option::TYPE_MILLISECS, Option::LEVEL_ADVANCED)
+    .set_default(50)
+    .set_min(1)
+    .set_description("minimum schedule tick for immutable object cache"),
+
+    Option("immutable_object_cache_qos_iops_limit", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(0)
+    .set_description("the desired immutable object cache IO operations limit per second"),
+
+    Option("immutable_object_cache_qos_iops_burst", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(0)
+    .set_description("the desired burst limit of immutable object cache IO operations"),
+
+    Option("immutable_object_cache_qos_iops_burst_seconds", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of immutable object cache IO operations"),
+
+    Option("immutable_object_cache_qos_bps_limit", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(0)
+    .set_description("the desired immutable object cache IO bytes limit per second"),
+
+    Option("immutable_object_cache_qos_bps_burst", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(0)
+    .set_description("the desired burst limit of immutable object cache IO bytes"),
+
+    Option("immutable_object_cache_qos_bps_burst_seconds", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(1)
+    .set_min(1)
+    .set_description("the desired burst duration in seconds of immutable object cache IO bytes"),
   });
 }
 
 std::vector<Option> get_mds_options() {
   return std::vector<Option>({
+    Option("mds_alternate_name_max", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
+    .set_default(8192)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("set the maximum length of alternate names for dentries"),
+
+    Option("mds_valgrind_exit", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    .set_default(false)
+    .set_flag(Option::FLAG_RUNTIME),
+
     Option("mds_numa_node", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(-1)
     .set_flag(Option::FLAG_STARTUP)
@@ -7694,7 +8216,7 @@ std::vector<Option> get_mds_options() {
     .set_flag(Option::FLAG_RUNTIME),
 
     Option("mds_cache_trim_threshold", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(64_K)
+    .set_default(256_K)
     .set_description("threshold for number of dentries that can be trimmed")
     .set_flag(Option::FLAG_RUNTIME),
 
@@ -7730,40 +8252,40 @@ std::vector<Option> get_mds_options() {
     .set_default(true)
     .set_description("require MDS name is unique in the cluster"),
 
-    Option("mds_session_blacklist_on_timeout", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    Option("mds_session_blocklist_on_timeout", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
-    .set_description("blacklist clients whose sessions have become stale"),
+    .set_description("blocklist clients whose sessions have become stale"),
 
-    Option("mds_session_blacklist_on_evict", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    Option("mds_session_blocklist_on_evict", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
-    .set_description("blacklist clients that have been evicted"),
+    .set_description("blocklist clients that have been evicted"),
 
     Option("mds_sessionmap_keys_per_op", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1024)
     .set_description("number of omap keys to read from the SessionMap in one operation"),
 
     Option("mds_recall_max_caps", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(5000)
+    .set_default(30000)
     .set_description("maximum number of caps to recall from client session in single recall")
     .set_flag(Option::FLAG_RUNTIME),
 
     Option("mds_recall_max_decay_rate", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
-    .set_default(2.5)
+    .set_default(1.5)
     .set_description("decay rate for throttle on recalled caps on a session")
     .set_flag(Option::FLAG_RUNTIME),
 
     Option("mds_recall_max_decay_threshold", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(16_K)
+    .set_default(128_K)
     .set_description("decay threshold for throttle on recalled caps on a session")
     .set_flag(Option::FLAG_RUNTIME),
 
     Option("mds_recall_global_max_decay_threshold", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(64_K)
+    .set_default(128_K)
     .set_description("decay threshold for throttle on recalled caps globally")
     .set_flag(Option::FLAG_RUNTIME),
 
     Option("mds_recall_warning_threshold", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
-    .set_default(32_K)
+    .set_default(256_K)
     .set_description("decay threshold for warning on slow session cap recall")
     .set_flag(Option::FLAG_RUNTIME),
 
@@ -7785,6 +8307,24 @@ std::vector<Option> get_mds_options() {
     .set_description("decay magnitude for preemptively recalling caps on quiet client")
     .set_flag(Option::FLAG_RUNTIME)
     .set_long_description("This is the order of magnitude difference (in base 2) of the internal liveness decay counter and the number of capabilities the session holds. When this difference occurs, the MDS treats the session as quiescent and begins recalling capabilities."),
+
+    Option("mds_session_cap_acquisition_decay_rate", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(10)
+    .set_description("decay rate for session readdir caps leading to readdir throttle")
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_long_description("The half-life for the session cap acquisition counter of caps acquired by readdir. This is used for throttling readdir requests from clients slow to release caps."),
+
+    Option("mds_session_cap_acquisition_throttle", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(500000)
+    .set_description("throttle point for cap acquisition decay counter"),
+
+    Option("mds_session_max_caps_throttle_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(1.1)
+    .set_description("ratio of mds_max_maps_per_client that client must exceed before readdir may be throttled by cap acquisition throttle"),
+
+    Option("mds_cap_acquisition_throttle_retry_request_timeout", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(0.5)
+    .set_description("timeout in seconds after which a client request is retried due to cap acquisition throttling"),
 
     Option("mds_freeze_tree_timeout", Option::TYPE_FLOAT, Option::LEVEL_DEV)
     .set_default(30)
@@ -7830,7 +8370,7 @@ std::vector<Option> get_mds_options() {
 
     Option("mds_replay_unsafe_with_closed_session", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
-    .set_flag(Option::FLAG_RUNTIME)
+    .set_flag(Option::FLAG_STARTUP)
     .set_description("complete all the replay request when mds is restarted, no matter the session is closed or not"),
 
     Option("mds_default_dir_hash", Option::TYPE_INT, Option::LEVEL_ADVANCED)
@@ -7861,9 +8401,40 @@ std::vector<Option> get_mds_options() {
     .set_default(128)
     .set_description("maximum number of segments which may be untrimmed"),
 
+    Option("mds_log_warn_factor", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(2.0)
+    .set_min(1.0)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("trigger MDS_HEALTH_TRIM warning when the mds log is longer than mds_log_max_segments * mds_log_warn_factor"),
+
     Option("mds_bal_export_pin", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .set_description("allow setting directory export pins to particular ranks"),
+
+    Option("mds_export_ephemeral_random", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("allow ephemeral random pinning of the loaded subtrees")
+    .set_long_description("probabilistically pin the loaded directory inode and the subtree beneath it to an MDS based on the consistent hash of the inode number. The higher this value the more likely the loaded subtrees get pinned"),
+
+    Option("mds_export_ephemeral_random_max", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(0.01)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("the maximum percent permitted for random ephemeral pin policy")
+    .set_min_max(0.0, 1.0)
+    .add_see_also("mds_export_ephemeral_random"),
+
+    Option("mds_export_ephemeral_distributed", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("allow ephemeral distributed pinning of the loaded subtrees")
+    .set_long_description("pin the immediate child directories of the loaded directory inode based on the consistent hash of the child's inode number. "),
+
+    Option("mds_export_ephemeral_distributed_factor", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_default(2.0)
+    .set_min_max(1.0, 100.0)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("multiple of max_mds for splitting and distributing directory"),
 
     Option("mds_bal_sample_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(3.0)
@@ -7962,6 +8533,11 @@ std::vector<Option> get_mds_options() {
     Option("mds_bal_target_decay", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(10.0)
     .set_description("rate of decay for export targets communicated to clients"),
+
+    Option("mds_oft_prefetch_dirfrags", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("prefetch dirfrags recorded in open file table on startup")
+    .set_flag(Option::FLAG_STARTUP),
 
     Option("mds_replay_interval", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(1.0)
@@ -8168,6 +8744,11 @@ std::vector<Option> get_mds_options() {
     .set_default(100)
     .set_description("minimum number of capabilities a client may hold"),
 
+    Option("mds_min_caps_working_set", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(10000)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("number of capabilities a client may hold without cache pressure warnings generated"),
+
     Option("mds_max_caps_per_client", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
     .set_default(1_M)
     .set_description("maximum number of capabilities a client may hold"),
@@ -8215,6 +8796,30 @@ std::vector<Option> get_mds_options() {
      .set_flag(Option::FLAG_RUNTIME)
      .set_description("max snapshots per directory")
      .set_long_description("maximum number of snapshots that can be created per directory"),
+
+    Option("mds_asio_thread_count", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .set_min(1)
+    .set_description("Size of thread pool for ASIO completions")
+    .add_tag("mds"),
+
+    Option("mds_ping_grace", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+     .set_default(15)
+     .set_flag(Option::FLAG_RUNTIME)
+     .set_description("timeout after which an MDS is considered laggy by rank 0 MDS.")
+     .set_long_description("timeout for replying to a ping message sent by rank 0 after which an active MDS considered laggy (delayed metrics) by rank 0."),
+
+    Option("mds_ping_interval", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+     .set_default(5)
+     .set_flag(Option::FLAG_RUNTIME)
+     .set_description("interval in seconds for sending ping messages to active MDSs.")
+     .set_long_description("interval in seconds for rank 0 to send ping messages to all active MDSs."),
+
+    Option("mds_metrics_update_interval", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+     .set_default(2)
+     .set_flag(Option::FLAG_RUNTIME)
+     .set_description("interval in seconds for metrics data update.")
+     .set_long_description("interval in seconds after which active MDSs send client metrics data to rank 0.")
   });
 }
 
@@ -8236,8 +8841,8 @@ std::vector<Option> get_mds_client_options() {
     .set_default(300.0)
     .set_description("timeout for mounting CephFS (seconds)"),
 
-    Option("client_tick_interval", Option::TYPE_FLOAT, Option::LEVEL_DEV)
-    .set_default(1.0)
+    Option("client_tick_interval", Option::TYPE_SECS, Option::LEVEL_DEV)
+    .set_default(1)
     .set_description("seconds between client upkeep ticks"),
 
     Option("client_trace", Option::TYPE_STR, Option::LEVEL_DEV)
@@ -8299,22 +8904,27 @@ std::vector<Option> get_mds_client_options() {
     .set_description("enable object caching"),
 
     Option("client_oc_size", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_default(200_M)
     .set_description("maximum size of object cache"),
 
     Option("client_oc_max_dirty", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_default(100_M)
     .set_description("maximum size of dirty pages in object cache"),
 
     Option("client_oc_target_dirty", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_default(8_M)
     .set_description("target size of dirty pages object cache"),
 
     Option("client_oc_max_dirty_age", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_default(5.0)
     .set_description("maximum age of dirty pages in object cache (seconds)"),
 
     Option("client_oc_max_objects", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_default(1000)
     .set_description("maximum number of objects in cache"),
 
@@ -8326,7 +8936,7 @@ std::vector<Option> get_mds_client_options() {
     .set_default(false)
     .set_description(""),
 
-    Option("client_debug_inject_tick_delay", Option::TYPE_INT, Option::LEVEL_DEV)
+    Option("client_debug_inject_tick_delay", Option::TYPE_SECS, Option::LEVEL_DEV)
     .set_default(0)
     .set_description(""),
 
@@ -8381,6 +8991,18 @@ std::vector<Option> get_mds_client_options() {
     .set_description("pass default_permisions to FUSE on mount")
     .set_flag(Option::FLAG_STARTUP),
 
+    Option("fuse_splice_read", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("enable splice read to reduce the memory copies"),
+
+    Option("fuse_splice_write", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("enable splice write to reduce the memory copies"),
+
+    Option("fuse_splice_move", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("enable splice move to reduce the memory copies"),
+
     Option("fuse_big_writes", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
     .set_description("big_writes is deprecated in libfuse 3.0.0"),
@@ -8394,9 +9016,11 @@ std::vector<Option> get_mds_client_options() {
     .set_default(true)
     .set_description("pass atomic_o_trunc flag to FUSE on mount"),
 
-    Option("fuse_debug", Option::TYPE_BOOL, Option::LEVEL_DEV)
+    Option("fuse_debug", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(false)
-    .set_description(""),
+    .set_flag(Option::FLAG_STARTUP)
+    .set_flag(Option::FLAG_NO_MON_UPDATE)
+    .set_description("enable debugging for the libfuse"),
 
     Option("fuse_multithreaded", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
     .set_default(true)
@@ -8457,59 +9081,73 @@ std::vector<Option> get_mds_client_options() {
     Option("debug_allow_any_pool_priority", Option::TYPE_BOOL, Option::LEVEL_DEV)
     .set_default(false)
     .set_description("Allow any pool priority to be set to test conversion to new range"),
-  });
+
+    Option("client_asio_thread_count", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .set_min(1)
+    .set_description("Size of thread pool for ASIO completions")
+    .add_tag("client"),
+
+    Option("client_shutdown_timeout", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_default(30)
+    .set_min(0)
+    .set_description("timeout for shutting down CephFS")
+    .set_long_description("Timeout for shutting down CephFS via unmount or shutdown.")
+    .add_tag("client")
+    });
 }
 
-
-std::vector<Option> get_cephfs_shell_options() {
+std::vector<Option> get_cephfs_mirror_options() {
   return std::vector<Option>({
-    Option("allow_ansi", Option::TYPE_STR, Option::LEVEL_BASIC)
-    .set_default("Terminal")
-    .set_description("Allow ANSI escape sequences in output. Values: "
-		     "Terminal, Always, Never"),
+    Option("cephfs_mirror_max_concurrent_directory_syncs", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(3)
+    .set_min(1)
+    .set_description("maximum number of concurrent snapshot synchronization threads")
+    .set_long_description("maximum number of directory snapshots that can be synchronized concurrently by cephfs-mirror daemon. Controls the number of synchronization threads."),
 
-    Option("colors", Option::TYPE_STR, Option::LEVEL_BASIC)
-    .set_default("Terminal")
-    .set_description("Colouring CephFS shell input and output. Values: "
-		     "Terminal, Always, Never"),
+    Option("cephfs_mirror_action_update_interval", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(2)
+    .set_min(1)
+    .set_description("interval for driving asynchornous mirror actions")
+    .set_long_description("Interval in seconds to process pending mirror update actions."),
 
-    Option("continuation_prompt", Option::TYPE_STR, Option::LEVEL_BASIC)
-    .set_default(">")
-    .set_description("Prompt string when a command continue to second line"),
+    Option("cephfs_mirror_restart_mirror_on_blocklist_interval", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(30)
+    .set_min(0)
+    .set_description("interval to restart blocklisted instances")
+    .set_long_description("Interval in seconds to restart blocklisted mirror instances. Setting to zero (0) disables restarting blocklisted instances."),
 
-    Option("debug_shell", Option::TYPE_BOOL, Option::LEVEL_BASIC)
-    .set_default(false)
-    .set_description("Allow tracebacks on error for CephFS Shell"),
+    Option("cephfs_mirror_max_snapshot_sync_per_cycle", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(3)
+    .set_min(1)
+    .set_description("number of snapshots to mirror in one cycle")
+    .set_long_description("maximum number of snapshots to mirror when a directory is picked up for mirroring by worker threads."),
 
-    Option("echo", Option::TYPE_BOOL, Option::LEVEL_BASIC)
-    .set_default(false)
-    .set_description("Print command issued on prompt before execution"),
+    Option("cephfs_mirror_directory_scan_interval", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(10)
+    .set_min(1)
+    .set_description("interval to scan directories to mirror snapshots")
+    .set_long_description("interval in seconds to scan configured directories for snapshot mirroring."),
 
-    Option("editor", Option::TYPE_STR, Option::LEVEL_BASIC)
-    .set_default("vim")
-    .set_description("Default text editor for shell"),
+    Option("cephfs_mirror_max_consecutive_failures_per_directory", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(10)
+    .set_min(0)
+    .set_description("consecutive failed directory synchronization attempts before marking a directory as \"failed\"")
+    .set_long_description("number of consecutive snapshot synchronization failues to mark a directory as \"failed\". failed directories are retried for synchronization less frequently."),
 
-    Option("feedback_to_output", Option::TYPE_BOOL, Option::LEVEL_BASIC)
-    .set_default(false)
-    .set_description("include '|' and '>' in result"),
+    Option("cephfs_mirror_retry_failed_directories_interval", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
+    .set_default(60)
+    .set_min(1)
+    .set_description("failed directory retry interval for synchronization")
+    .set_long_description("interval in seconds to retry synchronization for failed directories."),
 
-    Option("max_completion_items", Option::TYPE_INT, Option::LEVEL_BASIC)
-    .set_default(50)
-    .set_description("Maximum number of items to be displayed by tab "
-		     "completion"),
-
-    Option("prompt", Option::TYPE_STR, Option::LEVEL_BASIC)
-    .set_default("\x1b[01;33mCephFS:~\x1b[96m/\x1b[0m\x1b[01;33m>>>\x1b[00m ")
-    .set_description("Whether non-essential feedback should be printed."),
-
-    Option("quiet", Option::TYPE_BOOL, Option::LEVEL_BASIC)
-    .set_default(false)
-    .set_description("Whether non-essential feedback should be printed."),
-
-    Option("timing", Option::TYPE_BOOL, Option::LEVEL_BASIC)
-    .set_default(false)
-    .set_description("Whether execution time should be reported"),
-  });
+    Option("cephfs_mirror_restart_mirror_on_failure_interval", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(20)
+    .set_min(0)
+    .set_description("interval to restart failed mirror instances")
+    .set_long_description("Interval in seconds to restart failed mirror instances. Setting to zero (0) disables restarting failed mirror instances."),
+    });
 }
 
 static std::vector<Option> build_options()
@@ -8529,7 +9167,7 @@ static std::vector<Option> build_options()
   ingest(get_immutable_object_cache_options(), "immutable-objet-cache");
   ingest(get_mds_options(), "mds");
   ingest(get_mds_client_options(), "mds_client");
-  ingest(get_cephfs_shell_options(), "cephfs-shell");
+  ingest(get_cephfs_mirror_options(), "cephfs-mirror");
 
   return result;
 }

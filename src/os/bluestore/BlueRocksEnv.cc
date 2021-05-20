@@ -137,6 +137,10 @@ class BlueRocksRandomAccessFile : public rocksdb::RandomAccessFile {
       h->buf.max_prefetch = fs->cct->_conf->bluefs_max_prefetch;
   }
 
+  bool use_direct_io() const override {
+    return !fs->cct->_conf->bluefs_buffered_io;
+  }
+
   // Remove any kind of caching of data from the offset to offset+length
   // of this file. If the length is 0, then it refers to the end of file.
   // If the system is not caching the file contents, then this is a noop.
@@ -173,7 +177,7 @@ class BlueRocksWritableFile : public rocksdb::WritableFile {
     }*/
 
   rocksdb::Status Append(const rocksdb::Slice& data) override {
-    h->append(data.data(), data.size());
+    fs->append_try_flush(h, data.data(), data.size());
     return rocksdb::Status::OK();
   }
 
@@ -198,7 +202,7 @@ class BlueRocksWritableFile : public rocksdb::WritableFile {
   }
 
   rocksdb::Status Close() override {
-    Flush();
+    fs->flush(h, true);
 
     // mimic posix env, here.  shrug.
     size_t block_size;
@@ -243,7 +247,7 @@ class BlueRocksWritableFile : public rocksdb::WritableFile {
    * Get the size of valid data in the file.
    */
   uint64_t GetFileSize() override {
-    return h->file->fnode.size + h->buffer.length();;
+    return h->file->fnode.size + h->get_buffer_length();;
   }
 
   // For documentation, refer to RandomAccessFile::GetUniqueId()

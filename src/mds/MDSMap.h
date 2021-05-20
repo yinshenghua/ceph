@@ -35,6 +35,7 @@
 #include "common/config.h"
 
 #include "mds/mdstypes.h"
+#include "mds/cephfs_features.h"
 
 #define MDS_FEATURE_INCOMPAT_BASE CompatSet::Feature(1, "base v0.20")
 #define MDS_FEATURE_INCOMPAT_CLIENTRANGES CompatSet::Feature(2, "client writeable ranges")
@@ -186,8 +187,17 @@ public:
   uint64_t get_max_filesize() const { return max_file_size; }
   void set_max_filesize(uint64_t m) { max_file_size = m; }
 
-  ceph_release_t get_min_compat_client() const { return min_compat_client; }
-  void set_min_compat_client(ceph_release_t version) { min_compat_client = version; }
+  void set_min_compat_client(ceph_release_t version);
+
+  void add_required_client_feature(size_t bit) {
+    required_client_features.insert(bit);
+  }
+  void remove_required_client_feature(size_t bit) {
+    required_client_features.erase(bit);
+  }
+  const auto& get_required_client_features() const {
+    return required_client_features;
+  }
   
   int get_flags() const { return flags; }
   bool test_flag(int f) const { return flags & f; }
@@ -295,6 +305,15 @@ public:
   int get_num_failed_mds() const {
     return failed.size();
   }
+  unsigned get_num_standby_replay_mds() const {
+    unsigned num = 0;
+    for (auto& i : mds_info) {
+      if (i.second.state == MDSMap::STATE_STANDBY_REPLAY) {
+	++num;
+      }
+    }
+    return num;
+  }
   unsigned get_num_mds(int state) const;
   // data pools
   void add_data_pool(int64_t poolid) {
@@ -303,7 +322,7 @@ public:
   int remove_data_pool(int64_t poolid) {
     std::vector<int64_t>::iterator p = std::find(data_pools.begin(), data_pools.end(), poolid);
     if (p == data_pools.end())
-      return -ENOENT;
+      return -CEPHFS_ENOENT;
     data_pools.erase(p);
     return 0;
   }
@@ -321,6 +340,9 @@ public:
   }
   void get_failed_mds_set(std::set<mds_rank_t>& s) const {
     s = failed;
+  }
+  void get_damaged_mds_set(std::set<mds_rank_t>& s) const {
+    s = damaged;
   }
 
   // features
@@ -463,7 +485,10 @@ public:
   // recovery_set.
   bool is_degraded() const;
   bool is_any_failed() const {
-    return failed.size();
+    return !failed.empty();
+  }
+  bool is_any_damaged() const {
+    return !damaged.empty();
   }
   bool is_resolving() const {
     return
@@ -550,7 +575,7 @@ protected:
   uint32_t flags = CEPH_MDSMAP_DEFAULTS; // flags
   epoch_t last_failure = 0;  // mds epoch of last failure
   epoch_t last_failure_osd_epoch = 0; // osd epoch of last failure; any mds entering replay needs
-                                  // at least this osdmap to ensure the blacklist propagates.
+                                  // at least this osdmap to ensure the blocklist propagates.
   utime_t created;
   utime_t modified;
 
@@ -561,7 +586,7 @@ protected:
   __u32 session_autoclose = 300;
   uint64_t max_file_size = 1ULL<<40; /* 1TB */
 
-  ceph_release_t min_compat_client{ceph_release_t::unknown};
+  feature_bitset_t required_client_features;
 
   std::vector<int64_t> data_pools;  // file data pools available to clients (via an ioctl).  first is the default.
   int64_t cas_pool = -1;            // where CAS objects go

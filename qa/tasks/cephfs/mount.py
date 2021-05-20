@@ -1,38 +1,63 @@
-from contextlib import contextmanager
+import hashlib
 import json
 import logging
 import datetime
-import six
-import time
-from six import StringIO
-from textwrap import dedent
 import os
 import re
+import time
+
+from io import StringIO
+from contextlib import contextmanager
+from textwrap import dedent
 from IPy import IP
+
+from teuthology.contextutil import safe_while
+from teuthology.misc import get_file, sudo_write_file
 from teuthology.orchestra import run
-from teuthology.orchestra.run import CommandFailedError, ConnectionLostError
+from teuthology.orchestra.run import CommandFailedError, ConnectionLostError, Raw
+
 from tasks.cephfs.filesystem import Filesystem
-import platform
 
 log = logging.getLogger(__name__)
 
-
 class CephFSMount(object):
-    def __init__(self, ctx, test_dir, client_id, client_remote, brxnet):
+    def __init__(self, ctx, test_dir, client_id, client_remote,
+                 client_keyring_path=None, hostfs_mntpt=None,
+                 cephfs_name=None, cephfs_mntpt=None, brxnet=None):
         """
         :param test_dir: Global teuthology test dir
         :param client_id: Client ID, the 'foo' in client.foo
-        :param client_remote: Remote instance for the host where client will run
+        :param client_keyring_path: path to keyring for given client_id
+        :param client_remote: Remote instance for the host where client will
+                              run
+        :param hostfs_mntpt: Path to directory on the FS on which Ceph FS will
+                             be mounted
+        :param cephfs_name: Name of Ceph FS to be mounted
+        :param cephfs_mntpt: Path to directory inside Ceph FS that will be
+                             mounted as root
         """
-
+        self.mounted = False
         self.ctx = ctx
         self.test_dir = test_dir
+
+        self._verify_attrs(client_id=client_id,
+                           client_keyring_path=client_keyring_path,
+                           hostfs_mntpt=hostfs_mntpt, cephfs_name=cephfs_name,
+                           cephfs_mntpt=cephfs_mntpt)
+
         self.client_id = client_id
+        self.client_keyring_path = client_keyring_path
         self.client_remote = client_remote
-        self.mountpoint_dir_name = 'mnt.{id}'.format(id=self.client_id)
-        self._mountpoint = None
+        if hostfs_mntpt:
+            self.hostfs_mntpt = hostfs_mntpt
+            self.hostfs_mntpt_dirname = os.path.basename(self.hostfs_mntpt)
+        else:
+            self.hostfs_mntpt = os.path.join(self.test_dir, f'mnt.{self.client_id}')
+        self.cephfs_name = cephfs_name
+        self.cephfs_mntpt = cephfs_mntpt
+
         self.fs = None
-        self.mounted = False
+
         self._netns_name = None
         self.nsid = -1
         if brxnet is None:
@@ -44,34 +69,49 @@ class CephFSMount(object):
 
         self.background_procs = []
 
-        # On Centos/Redhat 8 the 'brctl' has been deprecated. But the
-        # 'nmcli' in ubuntu 18.04 is buggy to setup the network bridge
-        # and there is no workaround, will continue to use the 'brctl'
-        args = ["bash", "-c",
-                "cat /etc/os-release"]
-        p = self.client_remote.run(args=args, stderr=StringIO(),
-                                   stdout=StringIO(), timeout=(5*60))
-        distro = re.findall(r'NAME="Ubuntu"', p.stdout.getvalue())
-        version = re.findall(r'VERSION_ID="18.04"', p.stdout.getvalue())
-        self.use_brctl = len(distro) is not 0 and len(version) is not 0
-        
+    # This will cleanup the stale netnses, which are from the
+    # last failed test cases.
+    @staticmethod
+    def cleanup_stale_netnses_and_bridge(remote):
+        p = remote.run(args=['ip', 'netns', 'list'],
+                       stdout=StringIO(), timeout=(5*60))
+        p = p.stdout.getvalue().strip()
+
+        # Get the netns name list
+        netns_list = re.findall(r'ceph-ns-[^()\s][-.\w]+[^():\s]', p)
+
+        # Remove the stale netnses
+        for ns in netns_list:
+            ns_name = ns.split()[0]
+            args = ['sudo', 'ip', 'netns', 'delete', '{0}'.format(ns_name)]
+            try:
+                remote.run(args=args, timeout=(5*60), omit_sudo=False)
+            except Exception:
+                pass
+
+        # Remove the stale 'ceph-brx'
+        try:
+            args = ['sudo', 'ip', 'link', 'delete', 'ceph-brx']
+            remote.run(args=args, timeout=(5*60), omit_sudo=False)
+        except Exception:
+            pass
+
     def _parse_netns_name(self):
         self._netns_name = '-'.join(["ceph-ns",
                                      re.sub(r'/+', "-", self.mountpoint)])
 
     @property
     def mountpoint(self):
-        if self._mountpoint == None:
-            self._mountpoint= os.path.join(
-                self.test_dir, '{dir_name}'.format(dir_name=self.mountpoint_dir_name))
-        return self._mountpoint
+        if self.hostfs_mntpt == None:
+            self.hostfs_mntpt = os.path.join(self.test_dir,
+                                             self.hostfs_mntpt_dirname)
+        return self.hostfs_mntpt
 
     @mountpoint.setter
     def mountpoint(self, path):
         if not isinstance(path, str):
             raise RuntimeError('path should be of str type.')
-        self._mountpoint = path
-        self._parse_netns_name()
+        self._mountpoint = self.hostfs_mntpt = path
 
     @property
     def netns_name(self):
@@ -81,9 +121,33 @@ class CephFSMount(object):
 
     @netns_name.setter
     def netns_name(self, name):
-        if not isinstance(path, str):
-            raise RuntimeError('path should be of str type.')
         self._netns_name = name
+
+    def assert_and_log_minimum_mount_details(self):
+        """
+        Make sure we have minimum details required for mounting. Ideally, this
+        method should be called at the beginning of the mount method.
+        """
+        if not self.client_id or not self.client_remote or \
+           not self.hostfs_mntpt:
+            errmsg = ('Mounting CephFS requires that at least following '
+                      'details to be provided -\n'
+                      '1. the client ID,\n2. the mountpoint and\n'
+                      '3. the remote machine where CephFS will be mounted.\n')
+            raise RuntimeError(errmsg)
+
+        log.info('Mounting Ceph FS. Following are details of mount; remember '
+                 '"None" represents Python type None -')
+        log.info(f'self.client_remote.hostname = {self.client_remote.hostname}')
+        log.info(f'self.client.name = client.{self.client_id}')
+        log.info(f'self.hostfs_mntpt = {self.hostfs_mntpt}')
+        log.info(f'self.cephfs_name = {self.cephfs_name}')
+        log.info(f'self.cephfs_mntpt = {self.cephfs_mntpt}')
+        log.info(f'self.client_keyring_path = {self.client_keyring_path}')
+        if self.client_keyring_path:
+            log.info('keyring content -\n' +
+                     get_file(self.client_remote, self.client_keyring_path,
+                              sudo=True).decode())
 
     def is_mounted(self):
         return self.mounted
@@ -96,11 +160,6 @@ class CephFSMount(object):
         log.info('Wait for MDS to reach steady state...')
         self.fs.wait_for_daemons()
         log.info('Ready to start {}...'.format(type(self).__name__))
-
-    def _bringup_network_manager_service(self):
-        args = ["sudo", "bash", "-c",
-                "systemctl start NetworkManager"]
-        self.client_remote.run(args=args, timeout=(5*60))
 
     def _setup_brx_and_nat(self):
         # The ip for ceph-brx should be
@@ -117,43 +176,21 @@ class CephFSMount(object):
             _ip, _mask = brx[0].split()[1].split('/', 1)
             if _ip != "{}".format(ip) or _mask != mask:
                 raise RuntimeError("Conflict with existing ceph-brx {0}, new {1}/{2}".format(brx[0].split()[1], ip, mask))
-            return 
-
-        log.info("Setuping the 'ceph-brx' with {0}/{1}".format(ip, mask))
 
         # Setup the ceph-brx and always use the last valid IP
-        if self.use_brctl == True:
-            args = ["sudo", "bash", "-c", "brctl addbr ceph-brx"]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c", "ip link set ceph-brx up"]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "ip addr add {0}/{1} brd {2} dev ceph-brx".format(ip, mask, brd)]
-            self.client_remote.run(args=args, timeout=(5*60))
-        else:
-            self._bringup_network_manager_service()
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection add type bridge con-name ceph-brx ifname ceph-brx stp no"]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection modify ceph-brx ipv4.addresses {0}/{1} ipv4.method manual".format(ip, mask)]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c", "nmcli connection up ceph-brx"]
-            self.client_remote.run(args=args, timeout=(5*60))
+        if not brx:
+            log.info("Setuping the 'ceph-brx' with {0}/{1}".format(ip, mask))
+
+            self.run_shell_payload(f"""
+                set -e
+                sudo ip link add name ceph-brx type bridge
+                sudo ip addr flush dev ceph-brx
+                sudo ip link set ceph-brx up
+                sudo ip addr add {ip}/{mask} brd {brd} dev ceph-brx
+            """, timeout=(5*60), omit_sudo=False, cwd='/')
         
-        # Save the ip_forward
-        self.client_remote.run(args=['touch', '/tmp/python-ceph-brx'],
-                               timeout=(5*60))
-        p = self.client_remote.run(args=['cat', '/proc/sys/net/ipv4/ip_forward'],
-                                   stderr=StringIO(), stdout=StringIO(),
-                                   timeout=(5*60))
-        val = p.stdout.getvalue().strip()
-        args = ["sudo", "bash", "-c",
-                "echo {} > /tmp/python-ceph-brx".format(val)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "echo 1 > /proc/sys/net/ipv4/ip_forward"]
-        self.client_remote.run(args=args, timeout=(5*60))
+        args = "echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward"
+        self.client_remote.run(args=args, timeout=(5*60), omit_sudo=False)
         
         # Setup the NAT
         p = self.client_remote.run(args=['route'], stderr=StringIO(),
@@ -162,48 +199,50 @@ class CephFSMount(object):
         if p == False:
             raise RuntimeError("No default gw found")
         gw = p[0].split()[7]
-        args = ["sudo", "bash", "-c",
-                "iptables -A FORWARD -o {0} -i ceph-brx -j ACCEPT".format(gw)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "iptables -A FORWARD -i {0} -o ceph-brx -j ACCEPT".format(gw)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "iptables -t nat -A POSTROUTING -s {0}/{1} -o {2} -j MASQUERADE".format(ip, mask, gw)]
-        self.client_remote.run(args=args, timeout=(5*60))
+
+        self.run_shell_payload(f"""
+            set -e
+            sudo iptables -A FORWARD -o {gw} -i ceph-brx -j ACCEPT
+            sudo iptables -A FORWARD -i {gw} -o ceph-brx -j ACCEPT
+            sudo iptables -t nat -A POSTROUTING -s {ip}/{mask} -o {gw} -j MASQUERADE
+        """, timeout=(5*60), omit_sudo=False, cwd='/')
 
     def _setup_netns(self):
         p = self.client_remote.run(args=['ip', 'netns', 'list'],
                                    stderr=StringIO(), stdout=StringIO(),
-                                   timeout=(5*60))
-        p = p.stdout.getvalue().strip()
-        if re.match(self.netns_name, p) is not None:
-            raise RuntimeError("the netns '{}' already exists!".format(self.netns_name))
+                                   timeout=(5*60)).stdout.getvalue().strip()
 
         # Get the netns name list
         netns_list = re.findall(r'[^()\s][-.\w]+[^():\s]', p)
 
-        # Get an uniq netns id
-        nsid = 0
-        while True:
+        out = re.search(r"{0}".format(self.netns_name), p)
+        if out is None:
+            # Get an uniq nsid for the new netns
+            nsid = 0
             p = self.client_remote.run(args=['ip', 'netns', 'list-id'],
                                        stderr=StringIO(), stdout=StringIO(),
-                                       timeout=(5*60))
-            p = re.search(r"nsid {} ".format(nsid), p.stdout.getvalue())
-            if p is None:
-                break
+                                       timeout=(5*60)).stdout.getvalue()
+            while True:
+                out = re.search(r"nsid {} ".format(nsid), p)
+                if out is None:
+                    break
 
-            nsid += 1
+                nsid += 1
 
-        self.nsid = nsid;
+            # Add one new netns and set it id
+            self.run_shell_payload(f"""
+                set -e
+                sudo ip netns add {self.netns_name}
+                sudo ip netns set {self.netns_name} {nsid}
+            """, timeout=(5*60), omit_sudo=False, cwd='/')
+            self.nsid = nsid;
+        else:
+            # The netns already exists and maybe suspended by self.kill()
+            self.resume_netns();
 
-        # Add one new netns and set it id
-        args = ["sudo", "bash", "-c",
-                "ip netns add {0}".format(self.netns_name)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "ip netns set {0} {1}".format(self.netns_name, nsid)]
-        self.client_remote.run(args=args, timeout=(5*60))
+            nsid = int(re.search(r"{0} \(id: (\d+)\)".format(self.netns_name), p).group(1))
+            self.nsid = nsid;
+            return
 
         # Get one ip address for netns
         ips = IP(self.ceph_brx_net)
@@ -216,14 +255,20 @@ class CephFSMount(object):
 
             for ns in netns_list:
                 ns_name = ns.split()[0]
-                args = ["sudo", "bash", "-c",
-                        "ip netns exec {0} ip addr".format(ns_name)]
-                p = self.client_remote.run(args=args, stderr=StringIO(),
-                                           stdout=StringIO(), timeout=(5*60))
-                q = re.search("{0}".format(ip), p.stdout.getvalue())
-                if q is not None:
-                    found = True
-                    break
+                args = ['sudo', 'ip', 'netns', 'exec', '{0}'.format(ns_name), 'ip', 'addr']
+                try:
+                    p = self.client_remote.run(args=args, stderr=StringIO(),
+                                               stdout=StringIO(), timeout=(5*60),
+                                               omit_sudo=False)
+                    q = re.search("{0}".format(ip), p.stdout.getvalue())
+                    if q is not None:
+                        found = True
+                        break
+                except CommandFailedError:
+                    if "No such file or directory" in p.stderr.getvalue():
+                        pass
+                    if "Invalid argument" in p.stderr.getvalue():
+                        pass
 
             if found == False:
                 break
@@ -234,40 +279,22 @@ class CephFSMount(object):
         log.info("Setuping the netns '{0}' with {1}/{2}".format(self.netns_name, ip, mask))
 
         # Setup the veth interfaces
-        args = ["sudo", "bash", "-c",
-                "ip link add veth0 netns {0} type veth peer name brx.{1}".format(self.netns_name, nsid)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "ip netns exec {0} ip addr add {1}/{2} brd {3} dev veth0".format(self.netns_name, ip, mask, brd)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "ip netns exec {0} ip link set veth0 up".format(self.netns_name)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "ip netns exec {0} ip link set lo up".format(self.netns_name)]
-        self.client_remote.run(args=args, timeout=(5*60))
-
         brxip = IP(self.ceph_brx_net)[-2]
-        args = ["sudo", "bash", "-c",
-                "ip netns exec {0} ip route add default via {1}".format(self.netns_name, brxip)]
-        self.client_remote.run(args=args, timeout=(5*60))
+        self.run_shell_payload(f"""
+            set -e
+            sudo ip link add veth0 netns {self.netns_name} type veth peer name brx.{nsid}
+            sudo ip netns exec {self.netns_name} ip addr add {ip}/{mask} brd {brd} dev veth0
+            sudo ip netns exec {self.netns_name} ip link set veth0 up
+            sudo ip netns exec {self.netns_name} ip link set lo up
+            sudo ip netns exec {self.netns_name} ip route add default via {brxip}
+        """, timeout=(5*60), omit_sudo=False, cwd='/')
 
         # Bring up the brx interface and join it to 'ceph-brx'
-        if self.use_brctl == True:
-            args = ["sudo", "bash", "-c",
-                    "ip link set brx.{0} up".format(nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "brctl addif ceph-brx brx.{0}".format(nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-        else:
-            self._bringup_network_manager_service()
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection add type bridge-slave con-name brx.{0} ifname brx.{0} master ceph-brx".format(nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection up brx.{0}".format(self.nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
+        self.run_shell_payload(f"""
+            set -e
+            sudo ip link set brx.{nsid} up
+            sudo ip link set dev brx.{nsid} master ceph-brx
+        """, timeout=(5*60), omit_sudo=False, cwd='/')
 
     def _cleanup_netns(self):
         if self.nsid == -1:
@@ -275,28 +302,12 @@ class CephFSMount(object):
         log.info("Removing the netns '{0}'".format(self.netns_name))
 
         # Delete the netns and the peer veth interface
-        if self.use_brctl == True:
-            args = ["sudo", "bash", "-c",
-                    "ip link set brx.{0} down".format(self.nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "brctl delif ceph-brx brx.{0}".format(self.nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "ip link delete brx.{0}".format(self.nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-        else:
-            self._bringup_network_manager_service()
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection down brx.{0}".format(self.nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection delete brx.{0}".format(self.nsid)]
-            self.client_remote.run(args=args, timeout=(5*60))
-
-        args = ["sudo", "bash", "-c",
-                "ip netns delete {0}".format(self.netns_name)]
-        self.client_remote.run(args=args, timeout=(5*60))
+        self.run_shell_payload(f"""
+            set -e
+            sudo ip link set brx.{self.nsid} down
+            sudo ip link delete dev brx.{self.nsid}
+            sudo ip netns delete {self.netns_name}
+        """, timeout=(5*60), omit_sudo=False, cwd='/')
 
         self.nsid = -1
 
@@ -308,35 +319,20 @@ class CephFSMount(object):
             return
 
         # If we are the last netns, will delete the ceph-brx
-        if self.use_brctl == True:
-            p = self.client_remote.run(args=['brctl', 'show', 'ceph-brx'],
-                                       stderr=StringIO(), stdout=StringIO(),
-                                       timeout=(5*60))
-        else:
-            self._bringup_network_manager_service()
-            p = self.client_remote.run(args=['nmcli', 'connection', 'show'],
-                                       stderr=StringIO(), stdout=StringIO(),
-                                       timeout=(5*60))
+        args = ['sudo', 'ip', 'link', 'show']
+        p = self.client_remote.run(args=args, stdout=StringIO(),
+                                   timeout=(5*60), omit_sudo=False)
         _list = re.findall(r'brx\.', p.stdout.getvalue().strip())
         if len(_list) != 0:
             return
 
         log.info("Removing the 'ceph-brx'")
 
-        if self.use_brctl == True:
-            args = ["sudo", "bash", "-c",
-                    "ip link set ceph-brx down"]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "brctl delbr ceph-brx"]
-            self.client_remote.run(args=args, timeout=(5*60))
-        else:
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection down ceph-brx"]
-            self.client_remote.run(args=args, timeout=(5*60))
-            args = ["sudo", "bash", "-c",
-                    "nmcli connection delete ceph-brx"]
-            self.client_remote.run(args=args, timeout=(5*60))
+        self.run_shell_payload("""
+            set -e
+            sudo ip link set ceph-brx down
+            sudo ip link delete ceph-brx
+        """, timeout=(5*60), omit_sudo=False, cwd='/')
 
         # Drop the iptables NAT rules
         ip = IP(self.ceph_brx_net)[-2]
@@ -348,26 +344,12 @@ class CephFSMount(object):
         if p == False:
             raise RuntimeError("No default gw found")
         gw = p[0].split()[7]
-        args = ["sudo", "bash", "-c",
-                "iptables -D FORWARD -o {0} -i ceph-brx -j ACCEPT".format(gw)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "iptables -D FORWARD -i {0} -o ceph-brx -j ACCEPT".format(gw)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        args = ["sudo", "bash", "-c",
-                "iptables -t nat -D POSTROUTING -s {0}/{1} -o {2} -j MASQUERADE".format(ip, mask, gw)]
-        self.client_remote.run(args=args, timeout=(5*60))
-
-        # Restore the ip_forward
-        p = self.client_remote.run(args=['cat', '/tmp/python-ceph-brx'],
-                                   stderr=StringIO(), stdout=StringIO(),
-                                   timeout=(5*60))
-        val = p.stdout.getvalue().strip()
-        args = ["sudo", "bash", "-c",
-                "echo {} > /proc/sys/net/ipv4/ip_forward".format(val)]
-        self.client_remote.run(args=args, timeout=(5*60))
-        self.client_remote.run(args=['rm', '-f', '/tmp/python-ceph-brx'],
-                               timeout=(5*60))
+        self.run_shell_payload(f"""
+            set -e
+            sudo iptables -D FORWARD -o {gw} -i ceph-brx -j ACCEPT
+            sudo iptables -D FORWARD -i {gw} -o ceph-brx -j ACCEPT
+            sudo iptables -t nat -D POSTROUTING -s {ip}/{mask} -o {gw} -j MASQUERADE
+        """, timeout=(5*60), omit_sudo=False, cwd='/')
 
     def setup_netns(self):
         """
@@ -381,9 +363,13 @@ class CephFSMount(object):
         """
         Cleanup the netns for the mountpoint.
         """
-        log.info("Cleaning the '{0}' netns for '{1}'".format(self._netns_name, self.mountpoint))
-        self._cleanup_netns()
-        self._cleanup_brx_and_nat()
+        # We will defer cleaning the netnses and bridge until the last
+        # mountpoint is unmounted, this will be a temporary work around
+        # for issue#46282.
+
+        # log.info("Cleaning the '{0}' netns for '{1}'".format(self._netns_name, self.mountpoint))
+        # self._cleanup_netns()
+        # self._cleanup_brx_and_nat()
 
     def suspend_netns(self):
         """
@@ -394,9 +380,8 @@ class CephFSMount(object):
 
         log.info("Suspending the '{0}' netns for '{1}'".format(self._netns_name, self.mountpoint))
 
-        args = ["sudo", "bash", "-c",
-                "ip link set brx.{0} down".format(self.nsid)]
-        self.client_remote.run(args=args, timeout=(5*60))
+        args = ['sudo', 'ip', 'link', 'set', 'brx.{0}'.format(self.nsid), 'down']
+        self.client_remote.run(args=args, timeout=(5*60), omit_sudo=False)
 
     def resume_netns(self):
         """
@@ -407,22 +392,27 @@ class CephFSMount(object):
 
         log.info("Resuming the '{0}' netns for '{1}'".format(self._netns_name, self.mountpoint))
 
-        args = ["sudo", "bash", "-c",
-                "ip link set brx.{0} up".format(self.nsid)]
-        self.client_remote.run(args=args, timeout=(5*60))
+        args = ['sudo', 'ip', 'link', 'set', 'brx.{0}'.format(self.nsid), 'up']
+        self.client_remote.run(args=args, timeout=(5*60), omit_sudo=False)
 
-    def mount(self, mount_path=None, mount_fs_name=None, mountpoint=None, mount_options=[]):
+    def mount(self, mntopts=[], createfs=True, check_status=True, **kwargs):
+        """
+        kwargs expects its members to be same as the arguments accepted by
+        self.update_attrs().
+        """
         raise NotImplementedError()
 
-    def mount_wait(self, mount_path=None, mount_fs_name=None, mountpoint=None, mount_options=[]):
-        self.mount(mount_path=mount_path, mount_fs_name=mount_fs_name, mountpoint=mountpoint,
-                   mount_options=mount_options)
+    def mount_wait(self, **kwargs):
+        """
+        Accepts arguments same as self.mount().
+        """
+        self.mount(**kwargs)
         self.wait_until_mounted()
 
     def umount(self):
         raise NotImplementedError()
 
-    def umount_wait(self, force=False, require_clean=False):
+    def umount_wait(self, force=False, require_clean=False, timeout=None):
         """
 
         :param force: Expect that the mount will not shutdown cleanly: kill
@@ -430,9 +420,78 @@ class CephFSMount(object):
         :param require_clean: Wait for the Ceph client associated with the
                               mount (e.g. ceph-fuse) to terminate, and
                               raise if it doesn't do so cleanly.
+        :param timeout: amount of time to be waited for umount command to finish
         :return:
         """
         raise NotImplementedError()
+
+    def _verify_attrs(self, **kwargs):
+        """
+        Verify that client_id, client_keyring_path, client_remote, hostfs_mntpt,
+        cephfs_name, cephfs_mntpt are either type str or None.
+        """
+        for k, v in kwargs.items():
+            if v is not None and not isinstance(v, str):
+                raise RuntimeError('value of attributes should be either str '
+                                   f'or None. {k} - {v}')
+
+    def update_attrs(self, client_id=None, client_keyring_path=None,
+                     client_remote=None, hostfs_mntpt=None, cephfs_name=None,
+                     cephfs_mntpt=None):
+        if not (client_id or client_keyring_path or client_remote or
+                cephfs_name or cephfs_mntpt or hostfs_mntpt):
+            return
+
+        self._verify_attrs(client_id=client_id,
+                           client_keyring_path=client_keyring_path,
+                           hostfs_mntpt=hostfs_mntpt, cephfs_name=cephfs_name,
+                           cephfs_mntpt=cephfs_mntpt)
+
+        if client_id:
+            self.client_id = client_id
+        if client_keyring_path:
+            self.client_keyring_path = client_keyring_path
+        if client_remote:
+            self.client_remote = client_remote
+        if hostfs_mntpt:
+            self.hostfs_mntpt = hostfs_mntpt
+        if cephfs_name:
+            self.cephfs_name = cephfs_name
+        if cephfs_mntpt:
+            self.cephfs_mntpt = cephfs_mntpt
+
+    def remount(self, **kwargs):
+        """
+        Update mount object's attributes and attempt remount with these
+        new values for these attrbiutes.
+
+        1. Run umount_wait().
+        2. Run update_attrs().
+        3. Run mount().
+
+        Accepts arguments of self.mount() and self.update_attrs() with 2 exceptions -
+        1. Accepts wait too which can be True or False.
+        2. The default value of createfs is False.
+        """
+        self.umount_wait()
+        assert not self.mounted
+
+        mntopts = kwargs.pop('mntopts', [])
+        createfs = kwargs.pop('createfs', False)
+        check_status = kwargs.pop('check_status', True)
+        wait = kwargs.pop('wait', True)
+
+        self.update_attrs(**kwargs)
+
+        retval = self.mount(mntopts=mntopts, createfs=createfs,
+                            check_status=check_status)
+        # avoid this scenario (again): mount command might've failed and
+        # check_status might have silenced the exception, yet we attempt to
+        # wait which might lead to an error.
+        if retval is None and wait:
+            self.wait_until_mounted()
+
+        return retval
 
     def kill(self):
         """
@@ -448,7 +507,6 @@ class CephFSMount(object):
         """
         log.info('Cleaning up killed connection on {0}'.format(self.client_remote.name))
         self.umount_wait(force=True)
-        self.cleanup()
 
     def cleanup(self):
         """
@@ -456,30 +514,32 @@ class CephFSMount(object):
 
         Prerequisite: the client is not mounted.
         """
+        log.info('Cleaning up mount {0}'.format(self.client_remote.name))
         stderr = StringIO()
         try:
-            self.client_remote.run(
-                args=[
-                    'rmdir',
-                    '--',
-                    self.mountpoint,
-                ],
-                cwd=self.test_dir,
-                stderr=stderr,
-                timeout=(60*5),
-                check_status=False,
-            )
+            self.client_remote.run(args=['rmdir', '--', self.mountpoint],
+                                   cwd=self.test_dir, stderr=stderr,
+                                   timeout=(60*5), check_status=False)
         except CommandFailedError:
-            if "No such file or directory" in stderr.getvalue():
-                pass
-            else:
+            if "no such file or directory" not in stderr.getvalue().lower():
                 raise
+
+        self.cleanup_netns()
 
     def wait_until_mounted(self):
         raise NotImplementedError()
 
     def get_keyring_path(self):
         return '/etc/ceph/ceph.client.{id}.keyring'.format(id=self.client_id)
+
+    def get_key_from_keyfile(self):
+        # XXX: don't call run_shell(), since CephFS might be unmounted.
+        keyring = self.client_remote.run(
+            args=['sudo', 'cat', self.client_keyring_path], stdout=StringIO(),
+            omit_sudo=False).stdout.getvalue()
+        for line in keyring.split('\n'):
+            if line.find('key') != -1:
+                return line[line.find('=') + 1 : ].strip()
 
     @property
     def config_path(self):
@@ -502,14 +562,6 @@ class CephFSMount(object):
         finally:
             self.umount_wait()
 
-    def is_blacklisted(self):
-        addr = self.get_global_addr()
-        blacklist = json.loads(self.fs.mon_manager.raw_cluster_cmd("osd", "blacklist", "ls", "--format=json"))
-        for b in blacklist:
-            if addr == b["addr"]:
-                return True
-        return False
-
     def create_file(self, filename='testfile', dirname=None, user=None,
                     check_status=True):
         assert(self.is_mounted())
@@ -519,9 +571,9 @@ class CephFSMount(object):
                 if os.path.isabs(dirname):
                     path = os.path.join(dirname, filename)
                 else:
-                    path = os.path.join(self.mountpoint, dirname, filename)
+                    path = os.path.join(self.hostfs_mntpt, dirname, filename)
             else:
-                path = os.path.join(self.mountpoint, filename)
+                path = os.path.join(self.hostfs_mntpt, filename)
         else:
             path = filename
 
@@ -538,7 +590,7 @@ class CephFSMount(object):
         for suffix in self.test_files:
             log.info("Creating file {0}".format(suffix))
             self.client_remote.run(args=[
-                'sudo', 'touch', os.path.join(self.mountpoint, suffix)
+                'sudo', 'touch', os.path.join(self.hostfs_mntpt, suffix)
             ])
 
     def test_create_file(self, filename='testfile', dirname=None, user=None,
@@ -552,10 +604,33 @@ class CephFSMount(object):
         for suffix in self.test_files:
             log.info("Checking file {0}".format(suffix))
             r = self.client_remote.run(args=[
-                'sudo', 'ls', os.path.join(self.mountpoint, suffix)
+                'sudo', 'ls', os.path.join(self.hostfs_mntpt, suffix)
             ], check_status=False)
             if r.exitstatus != 0:
                 raise RuntimeError("Expected file {0} not found".format(suffix))
+
+    def write_file(self, path, data, perms=None):
+        """
+        Write the given data at the given path and set the given perms to the
+        file on the path.
+        """
+        if path.find(self.hostfs_mntpt) == -1:
+            path = os.path.join(self.hostfs_mntpt, path)
+
+        sudo_write_file(self.client_remote, path, data)
+
+        if perms:
+            self.run_shell(args=f'chmod {perms} {path}')
+
+    def read_file(self, path):
+        """
+        Return the data from the file on given path.
+        """
+        if path.find(self.hostfs_mntpt) == -1:
+            path = os.path.join(self.hostfs_mntpt, path)
+
+        return self.run_shell(args=['sudo', 'cat', path], omit_sudo=False).\
+            stdout.getvalue().strip()
 
     def create_destroy(self):
         assert(self.is_mounted())
@@ -563,11 +638,11 @@ class CephFSMount(object):
         filename = "{0} {1}".format(datetime.datetime.now(), self.client_id)
         log.debug("Creating test file {0}".format(filename))
         self.client_remote.run(args=[
-            'sudo', 'touch', os.path.join(self.mountpoint, filename)
+            'sudo', 'touch', os.path.join(self.hostfs_mntpt, filename)
         ])
         log.debug("Deleting test file {0}".format(filename))
         self.client_remote.run(args=[
-            'sudo', 'rm', '-f', os.path.join(self.mountpoint, filename)
+            'sudo', 'rm', '-f', os.path.join(self.hostfs_mntpt, filename)
         ])
 
     def _run_python(self, pyscript, py_version='python3'):
@@ -579,52 +654,51 @@ class CephFSMount(object):
     def run_python(self, pyscript, py_version='python3'):
         p = self._run_python(pyscript, py_version)
         p.wait()
-        return six.ensure_str(p.stdout.getvalue().strip())
+        return p.stdout.getvalue().strip()
 
-    def run_shell(self, args, wait=True, stdin=None, check_status=True,
-                  cwd=None, omit_sudo=True):
+    def run_shell(self, args, omit_sudo=True, timeout=900, **kwargs):
         args = args.split() if isinstance(args, str) else args
         # XXX: all commands ran with CephFS mount as CWD must be executed with
         #  superuser privileges when tests are being run using teuthology.
         if args[0] != 'sudo':
             args.insert(0, 'sudo')
-        if not cwd:
-            cwd = self.mountpoint
+        cwd = kwargs.pop('cwd', self.mountpoint)
+        stdout = kwargs.pop('stdout', StringIO())
+        stderr = kwargs.pop('stderr', StringIO())
 
-        return self.client_remote.run(args=args, stdin=stdin, wait=wait,
-                                      stdout=StringIO(), stderr=StringIO(),
-                                      cwd=cwd, check_status=check_status)
+        return self.client_remote.run(args=args, cwd=cwd, timeout=timeout, stdout=stdout, stderr=stderr, **kwargs)
 
-    def run_as_user(self, args, user, wait=True, stdin=None,
-                    check_status=True, cwd=None):
+    def run_shell_payload(self, payload, **kwargs):
+        return self.run_shell(["bash", "-c", Raw(f"'{payload}'")], **kwargs)
+
+    def run_as_user(self, **kwargs):
+        """
+        Besides the arguments defined for run_shell() this method also
+        accepts argument 'user'.
+        """
+        args = kwargs.pop('args')
+        user = kwargs.pop('user')
         if isinstance(args, str):
-            args = 'sudo -u %s -s /bin/bash -c %s' % (user, args)
+            args = ['sudo', '-u', user, '-s', '/bin/bash', '-c', args]
         elif isinstance(args, list):
             cmdlist = args
             cmd = ''
             for i in cmdlist:
                 cmd = cmd + i + ' '
-            args = ['sudo', '-u', user, '-s', '/bin/bash', '-c']
-            args.append(cmd)
-        if not cwd:
-            cwd = self.mountpoint
+            # get rid of extra space at the end.
+            cmd = cmd[:-1]
 
-        return self.client_remote.run(args=args, wait=wait, stdin=stdin,
-                                      stdout=StringIO(), stderr=StringIO(),
-                                      check_status=check_status, cwd=cwd)
+            args = ['sudo', '-u', user, '-s', '/bin/bash', '-c', cmd]
 
-    def run_as_root(self, args, wait=True, stdin=None, check_status=True,
-                    cwd=None):
-        if isinstance(args, str):
-            args = 'sudo ' + args
-        if isinstance(args, list):
-            args.insert(0, 'sudo')
-        if not cwd:
-            cwd = self.mountpoint
+        kwargs['args'] = args
+        return self.run_shell(**kwargs)
 
-        return self.client_remote.run(args=args, wait=wait, stdin=stdin,
-                                      stdout=StringIO(), stderr=StringIO(),
-                                      check_status=check_status, cwd=cwd)
+    def run_as_root(self, **kwargs):
+        """
+        Accepts same arguments as run_shell().
+        """
+        kwargs['user'] = 'root'
+        return self.run_as_user(**kwargs)
 
     def _verify(self, proc, retval=None, errmsg=None):
         if retval:
@@ -672,7 +746,7 @@ class CephFSMount(object):
         """
         assert(self.is_mounted())
 
-        path = os.path.join(self.mountpoint, basename)
+        path = os.path.join(self.hostfs_mntpt, basename)
 
         p = self._run_python(dedent(
             """
@@ -691,7 +765,7 @@ class CephFSMount(object):
         """
         assert(self.is_mounted())
 
-        path = os.path.join(self.mountpoint, basename)
+        path = os.path.join(self.hostfs_mntpt, basename)
 
         if write:
             pyscript = dedent("""
@@ -724,26 +798,19 @@ class CephFSMount(object):
         return rproc
 
     def wait_for_dir_empty(self, dirname, timeout=30):
-        i = 0
-        dirpath = os.path.join(self.mountpoint, dirname)
-        while i < timeout:
-            nr_entries = int(self.getfattr(dirpath, "ceph.dir.entries"))
-            if nr_entries == 0:
-                log.debug("Directory {0} seen empty from {1} after {2}s ".format(
-                    dirname, self.client_id, i))
-                return
-            else:
-                time.sleep(1)
-                i += 1
-
-        raise RuntimeError("Timed out after {0}s waiting for {1} to become empty from {2}".format(
-            i, dirname, self.client_id))
+        dirpath = os.path.join(self.hostfs_mntpt, dirname)
+        with safe_while(sleep=5, tries=(timeout//5)) as proceed:
+            while proceed():
+                p = self.run_shell_payload(f"stat -c %h {dirpath}")
+                nr_links = int(p.stdout.getvalue().strip())
+                if nr_links == 2:
+                    return
 
     def wait_for_visible(self, basename="background_file", timeout=30):
         i = 0
         while i < timeout:
             r = self.client_remote.run(args=[
-                'sudo', 'ls', os.path.join(self.mountpoint, basename)
+                'sudo', 'ls', os.path.join(self.hostfs_mntpt, basename)
             ], check_status=False)
             if r.exitstatus == 0:
                 log.debug("File {0} became visible from {1} after {2}s".format(
@@ -762,7 +829,7 @@ class CephFSMount(object):
         """
         assert(self.is_mounted())
 
-        path = os.path.join(self.mountpoint, basename)
+        path = os.path.join(self.hostfs_mntpt, basename)
 
         script_builder = """
             import time
@@ -790,7 +857,7 @@ class CephFSMount(object):
     def lock_and_release(self, basename="background_file"):
         assert(self.is_mounted())
 
-        path = os.path.join(self.mountpoint, basename)
+        path = os.path.join(self.hostfs_mntpt, basename)
 
         script = """
             import time
@@ -810,7 +877,7 @@ class CephFSMount(object):
     def check_filelock(self, basename="background_file", do_flock=True):
         assert(self.is_mounted())
 
-        path = os.path.join(self.mountpoint, basename)
+        path = os.path.join(self.hostfs_mntpt, basename)
 
         script_builder = """
             import fcntl
@@ -852,7 +919,7 @@ class CephFSMount(object):
         """
         assert(self.is_mounted())
 
-        path = os.path.join(self.mountpoint, basename)
+        path = os.path.join(self.hostfs_mntpt, basename)
 
         pyscript = dedent("""
             import os
@@ -896,7 +963,7 @@ class CephFSMount(object):
                     val = zlib.crc32(str(i).encode('utf-8')) & 7
                     f.write(chr(val))
         """.format(
-            path=os.path.join(self.mountpoint, filename),
+            path=os.path.join(self.hostfs_mntpt, filename),
             size=size
         )))
 
@@ -916,7 +983,7 @@ class CephFSMount(object):
                 if b != chr(val):
                     raise RuntimeError("Bad data at offset {{0}}".format(i))
         """.format(
-            path=os.path.join(self.mountpoint, filename),
+            path=os.path.join(self.hostfs_mntpt, filename),
             size=size
         )))
 
@@ -929,7 +996,7 @@ class CephFSMount(object):
         """
         assert(self.is_mounted())
 
-        abs_path = os.path.join(self.mountpoint, fs_path)
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
 
         pyscript = dedent("""
             import sys
@@ -939,13 +1006,14 @@ class CephFSMount(object):
             n = {count}
             abs_path = "{abs_path}"
 
-            if not os.path.exists(os.path.dirname(abs_path)):
-                os.makedirs(os.path.dirname(abs_path))
+            if not os.path.exists(abs_path):
+                os.makedirs(abs_path)
 
             handles = []
             for i in range(0, n):
-                fname = "{{0}}_{{1}}".format(abs_path, i)
-                handles.append(open(fname, 'w'))
+                fname = "file_"+str(i)
+                path = os.path.join(abs_path, fname)
+                handles.append(open(path, 'w'))
 
             while True:
                 time.sleep(1)
@@ -958,7 +1026,7 @@ class CephFSMount(object):
     def create_n_files(self, fs_path, count, sync=False):
         assert(self.is_mounted())
 
-        abs_path = os.path.join(self.mountpoint, fs_path)
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
 
         pyscript = dedent("""
             import sys
@@ -1025,6 +1093,9 @@ class CephFSMount(object):
     def get_osd_epoch(self):
         raise NotImplementedError()
 
+    def get_op_read_count(self):
+        raise NotImplementedError()
+
     def lstat(self, fs_path, follow_symlinks=False, wait=True):
         return self.stat(fs_path, follow_symlinks=False, wait=True)
 
@@ -1046,7 +1117,7 @@ class CephFSMount(object):
 
         Raises exception on absent file.
         """
-        abs_path = os.path.join(self.mountpoint, fs_path)
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
         if follow_symlinks:
             stat_call = "os.stat('" + abs_path + "')"
         else:
@@ -1084,7 +1155,7 @@ class CephFSMount(object):
         :param fs_path:
         :return:
         """
-        abs_path = os.path.join(self.mountpoint, fs_path)
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
         pyscript = dedent("""
             import sys
             import errno
@@ -1099,7 +1170,7 @@ class CephFSMount(object):
         proc.wait()
 
     def path_to_ino(self, fs_path, follow_symlinks=True):
-        abs_path = os.path.join(self.mountpoint, fs_path)
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
 
         if follow_symlinks:
             pyscript = dedent("""
@@ -1121,7 +1192,7 @@ class CephFSMount(object):
         return int(proc.stdout.getvalue().strip())
 
     def path_to_nlink(self, fs_path):
-        abs_path = os.path.join(self.mountpoint, fs_path)
+        abs_path = os.path.join(self.hostfs_mntpt, fs_path)
 
         pyscript = dedent("""
             import os
@@ -1178,7 +1249,7 @@ class CephFSMount(object):
             else:
                 raise
 
-        return p.stdout.getvalue()
+        return str(p.stdout.getvalue())
 
     def df(self):
         """
@@ -1188,10 +1259,21 @@ class CephFSMount(object):
         p = self.run_shell(["df", "-B1", "."])
         lines = p.stdout.getvalue().strip().split("\n")
         fs, total, used, avail = lines[1].split()[:4]
-        log.warn(lines)
+        log.warning(lines)
 
         return {
             "total": int(total),
             "used": int(used),
             "available": int(avail)
         }
+
+    def dir_checksum(self, path=None, follow_symlinks=False):
+        cmd = ["find"]
+        if follow_symlinks:
+            cmd.append("-L")
+        if path:
+            cmd.append(path)
+        cmd.extend(["-type", "f", "-exec", "md5sum", "{}", "+"])
+        checksum_text = self.run_shell(cmd).stdout.getvalue().strip()
+        checksum_sorted = sorted(checksum_text.split('\n'), key=lambda v: v.split()[1])
+        return hashlib.md5(('\n'.join(checksum_sorted)).encode('utf-8')).hexdigest()

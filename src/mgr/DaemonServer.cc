@@ -12,6 +12,7 @@
  */
 
 #include "DaemonServer.h"
+#include <boost/algorithm/string.hpp>
 #include "mgr/Mgr.h"
 
 #include "include/stringify.h"
@@ -22,6 +23,7 @@
 #include "mgr/mgr_commands.h"
 #include "mgr/DaemonHealthMetricCollector.h"
 #include "mgr/OSDPerfMetricCollector.h"
+#include "mgr/MDSPerfMetricCollector.h"
 #include "mon/MonCommand.h"
 
 #include "messages/MMgrOpen.h"
@@ -90,7 +92,9 @@ DaemonServer::DaemonServer(MonClient *monc_,
       shutting_down(false),
       tick_event(nullptr),
       osd_perf_metric_collector_listener(this),
-      osd_perf_metric_collector(osd_perf_metric_collector_listener)
+      osd_perf_metric_collector(osd_perf_metric_collector_listener),
+      mds_perf_metric_collector_listener(this),
+      mds_perf_metric_collector(mds_perf_metric_collector_listener)
 {
   g_conf().add_observer(this);
 }
@@ -108,8 +112,7 @@ int DaemonServer::init(uint64_t gid, entity_addrvec_t client_addrs)
   msgr = Messenger::create(g_ceph_context, public_msgr_type,
 			   entity_name_t::MGR(gid),
 			   "mgr",
-			   Messenger::get_pid_nonce(),
-			   0);
+			   Messenger::get_pid_nonce());
   msgr->set_default_policy(Messenger::Policy::stateless_server(0));
 
   msgr->set_auth_client(monc);
@@ -364,6 +367,22 @@ void DaemonServer::handle_osd_perf_metric_query_updated()
       }));
 }
 
+void DaemonServer::handle_mds_perf_metric_query_updated()
+{
+  dout(10) << dendl;
+
+  // Send a fresh MMgrConfigure to all clients, so that they can follow
+  // the new policy for transmitting stats
+  finisher.queue(new LambdaContext([this](int r) {
+        std::lock_guard l(lock);
+        for (auto &c : daemon_connections) {
+          if (c->peer_is_mds()) {
+            _send_configure(c);
+          }
+        }
+      }));
+}
+
 void DaemonServer::shutdown()
 {
   dout(10) << "begin" << dendl;
@@ -529,12 +548,16 @@ bool DaemonServer::handle_close(const ref_t<MMgrClose>& m)
   return true;
 }
 
-void DaemonServer::update_task_status(DaemonKey key, const ref_t<MMgrReport>& m) {
+void DaemonServer::update_task_status(
+  DaemonKey key,
+  const std::map<std::string,std::string>& task_status)
+{
   dout(10) << "got task status from " << key << dendl;
 
-  auto p = pending_service_map.get_daemon(key.type, key.name);
-  if (!map_compare(p.first->task_status, *m->task_status)) {
-    p.first->task_status = *m->task_status;
+  [[maybe_unused]] auto [daemon, added] =
+    pending_service_map.get_daemon(key.type, key.name);
+  if (daemon->task_status != task_status) {
+    daemon->task_status = task_status;
     pending_service_map_dirty = pending_service_map.epoch;
   }
 }
@@ -633,7 +656,7 @@ bool DaemonServer::handle_report(const ref_t<MMgrReport>& m)
       }
       // update task status
       if (m->task_status) {
-        update_task_status(key, m);
+        update_task_status(key, *m->task_status);
         daemon->last_service_beacon = now;
       }
       if (m->get_connection()->peer_is_osd() || m->get_connection()->peer_is_mon()) {
@@ -812,20 +835,12 @@ public:
 bool DaemonServer::handle_command(const ref_t<MCommand>& m)
 {
   std::lock_guard l(lock);
-  // a blank fsid in MCommand signals a legacy client sending a "mon-mgr" CLI
-  // command.
-  if (m->fsid != uuid_d()) {
-    cct->get_admin_socket()->queue_tell_command(m);
+  auto cmdctx = std::make_shared<CommandContext>(m);
+  try {
+    return _handle_command(cmdctx);
+  } catch (const bad_cmd_get& e) {
+    cmdctx->reply(-EINVAL, e.what());
     return true;
-  } else {
-    // legacy client; send to CLI processing
-    auto cmdctx = std::make_shared<CommandContext>(m);
-    try {
-      return _handle_command(cmdctx);
-    } catch (const bad_cmd_get& e) {
-      cmdctx->reply(-EINVAL, e.what());
-      return true;
-    }
   }
 }
 
@@ -849,16 +864,157 @@ void DaemonServer::log_access_denied(
                      << "entity='" << session->entity_name << "' "
                      << "cmd=" << cmdctx->cmd << ":  access denied";
   ss << "access denied: does your client key have mgr caps? "
-        "See http://docs.ceph.com/docs/master/mgr/administrator/"
+        "See http://docs.ceph.com/en/latest/mgr/administrator/"
         "#client-authentication";
+}
+
+void DaemonServer::_check_offlines_pgs(
+  const set<int>& osds,
+  const OSDMap& osdmap,
+  const PGMap& pgmap,
+  offline_pg_report *report)
+{
+  // reset output
+  *report = offline_pg_report();
+  report->osds = osds;
+
+  for (const auto& q : pgmap.pg_stat) {
+    set<int32_t> pg_acting;  // net acting sets (with no missing if degraded)
+    bool found = false;
+    if (q.second.state == 0) {
+      report->unknown.insert(q.first);
+      continue;
+    }
+    if (q.second.state & PG_STATE_DEGRADED) {
+      for (auto& anm : q.second.avail_no_missing) {
+	if (osds.count(anm.osd)) {
+	  found = true;
+	  continue;
+	}
+	if (anm.osd != CRUSH_ITEM_NONE) {
+	  pg_acting.insert(anm.osd);
+	}
+      }
+    } else {
+      for (auto& a : q.second.acting) {
+	if (osds.count(a)) {
+	  found = true;
+	  continue;
+	}
+	if (a != CRUSH_ITEM_NONE) {
+	  pg_acting.insert(a);
+	}
+      }
+    }
+    if (!found) {
+      continue;
+    }
+    const pg_pool_t *pi = osdmap.get_pg_pool(q.first.pool());
+    bool dangerous = false;
+    if (!pi) {
+      report->bad_no_pool.insert(q.first); // pool is creating or deleting
+      dangerous = true;
+    }
+    if (!(q.second.state & PG_STATE_ACTIVE)) {
+      report->bad_already_inactive.insert(q.first);
+      dangerous = true;
+    }
+    if (pg_acting.size() < pi->min_size) {
+      report->bad_become_inactive.insert(q.first);
+      dangerous = true;
+    }
+    if (dangerous) {
+      report->not_ok.insert(q.first);
+    } else {
+      report->ok.insert(q.first);
+      if (q.second.state & PG_STATE_DEGRADED) {
+	report->ok_become_more_degraded.insert(q.first);
+      } else {
+	report->ok_become_degraded.insert(q.first);
+      }
+    }
+  }
+  dout(20) << osds << " -> " << report->ok.size() << " ok, "
+	   << report->not_ok.size() << " not ok, "
+	   << report->unknown.size() << " unknown"
+	   << dendl;
+}
+
+void DaemonServer::_maximize_ok_to_stop_set(
+  const set<int>& orig_osds,
+  unsigned max,
+  const OSDMap& osdmap,
+  const PGMap& pgmap,
+  offline_pg_report *out_report)
+{
+  dout(20) << "orig_osds " << orig_osds << " max " << max << dendl;
+  _check_offlines_pgs(orig_osds, osdmap, pgmap, out_report);
+  if (!out_report->ok_to_stop()) {
+    return;
+  }
+  if (orig_osds.size() >= max) {
+    // already at max
+    return;
+  }
+
+  // semi-arbitrarily start with the first osd in the set
+  offline_pg_report report;
+  set<int> osds = orig_osds;
+  int parent = *osds.begin();
+  set<int> children;
+
+  while (true) {
+    // identify the next parent
+    int r = osdmap.crush->get_immediate_parent_id(parent, &parent);
+    if (r < 0) {
+      return;  // just go with what we have so far!
+    }
+
+    // get candidate additions that are beneath this point in the tree
+    children.clear();
+    r = osdmap.crush->get_all_children(parent, &children);
+    if (r < 0) {
+      return;  // just go with what we have so far!
+    }
+    dout(20) << "  parent " << parent << " children " << children << dendl;
+
+    // try adding in more osds
+    int failed = 0;  // how many children we failed to add to our set
+    for (auto o : children) {
+      if (o >= 0 && osdmap.is_up(o) && osds.count(o) == 0) {
+	osds.insert(o);
+	_check_offlines_pgs(osds, osdmap, pgmap, &report);
+	if (!report.ok_to_stop()) {
+	  osds.erase(o);
+	  ++failed;
+	  continue;
+	}
+	*out_report = report;
+	if (osds.size() == max) {
+	  dout(20) << " hit max" << dendl;
+	  return;  // yay, we hit the max
+	}
+      }
+    }
+
+    if (failed) {
+      // we hit some failures; go with what we have
+      dout(20) << " hit some peer failures" << dendl;
+      return;
+    }
+  }
 }
 
 bool DaemonServer::_handle_command(
   std::shared_ptr<CommandContext>& cmdctx)
 {
   MessageRef m;
+  bool admin_socket_cmd = false;
   if (cmdctx->m_tell) {
     m = cmdctx->m_tell;
+    // a blank fsid in MCommand signals a legacy client sending a "mon-mgr" CLI
+    // command.
+    admin_socket_cmd = (cmdctx->m_tell->fsid != uuid_d());
   } else {
     m = cmdctx->m_mgr;
   }
@@ -871,8 +1027,6 @@ bool DaemonServer::_handle_command(
     session->inst.name = m->get_source();
   }
 
-  std::string format;
-  boost::scoped_ptr<Formatter> f;
   map<string,string> param_str_map;
   std::stringstream ss;
   int r = 0;
@@ -882,17 +1036,25 @@ bool DaemonServer::_handle_command(
     return true;
   }
 
+  string prefix;
+  cmd_getval(cmdctx->cmdmap, "prefix", prefix);
+  dout(10) << "decoded-size=" << cmdctx->cmdmap.size() << " prefix=" << prefix << dendl;
+
+  boost::scoped_ptr<Formatter> f;
   {
-    cmd_getval(cmdctx->cmdmap, "format", format, string("plain"));
+    std::string format;
+    if (boost::algorithm::ends_with(prefix, "_json")) {
+      format = "json";
+    } else {
+      cmd_getval(cmdctx->cmdmap, "format", format, string("plain"));
+    }
     f.reset(Formatter::create(format));
   }
 
-  string prefix;
-  cmd_getval(cmdctx->cmdmap, "prefix", prefix);
-
-  dout(10) << "decoded-size=" << cmdctx->cmdmap.size() << " prefix=" << prefix  << dendl;
-
-  if (prefix == "get_command_descriptions") {
+  // this is just for mgr commands - admin socket commands will fall
+  // through and use the admin socket version of
+  // get_command_descriptions
+  if (prefix == "get_command_descriptions" && !admin_socket_cmd) {
     dout(10) << "reading commands from python modules" << dendl;
     const auto py_commands = py_modules.get_commands();
 
@@ -929,7 +1091,10 @@ bool DaemonServer::_handle_command(
 
   bool is_allowed = false;
   ModuleCommand py_command;
-  if (!mgr_cmd) {
+  if (admin_socket_cmd) {
+    // admin socket commands require all capabilities
+    is_allowed = session->caps.is_allow_all();
+  } else if (!mgr_cmd) {
     // Resolve the command to the name of the module that will
     // handle it (if the command exists)
     auto py_commands = py_modules.get_py_commands();
@@ -961,6 +1126,11 @@ bool DaemonServer::_handle_command(
     << "from='" << session->inst << "' "
     << "entity='" << session->entity_name << "' "
     << "cmd=" << cmdctx->cmd << ": dispatch";
+
+  if (admin_socket_cmd) {
+    cct->get_admin_socket()->queue_tell_command(cmdctx->m_tell);
+    return true;
+  }
 
   // ----------------
   // service map commands
@@ -1561,6 +1731,8 @@ bool DaemonServer::_handle_command(
     vector<string> ids;
     cmd_getval(cmdctx->cmdmap, "ids", ids);
     set<int> osds;
+    int64_t max = 1;
+    cmd_getval(cmdctx->cmdmap, "max", max);
     int r;
     cluster_state.with_osdmap([&](const OSDMap& osdmap) {
 	r = osdmap.parse_osd_id_list(ids, &osds, &ss);
@@ -1569,78 +1741,36 @@ bool DaemonServer::_handle_command(
       ss << "must specify one or more OSDs";
       r = -EINVAL;
     }
+    if (max < (int)osds.size()) {
+      max = osds.size();
+    }
     if (r < 0) {
       cmdctx->reply(r, ss);
       return true;
     }
-    int touched_pgs = 0;
-    int dangerous_pgs = 0;
+    offline_pg_report out_report;
     cluster_state.with_osdmap_and_pgmap([&](const OSDMap& osdmap, const PGMap& pg_map) {
-	if (pg_map.num_pg_unknown > 0) {
-	  ss << pg_map.num_pg_unknown << " pgs have unknown state; "
-	     << "cannot draw any conclusions";
-	  r = -EAGAIN;
-	  return;
-	}
-	for (const auto& q : pg_map.pg_stat) {
-          set<int32_t> pg_acting;  // net acting sets (with no missing if degraded)
-	  bool found = false;
-	  if (q.second.state & PG_STATE_DEGRADED) {
-	    for (auto& anm : q.second.avail_no_missing) {
-	      if (osds.count(anm.osd)) {
-		found = true;
-		continue;
-	      }
-	      if (anm.osd != CRUSH_ITEM_NONE) {
-		pg_acting.insert(anm.osd);
-	      }
-	    }
-	  } else {
-	    for (auto& a : q.second.acting) {
-	      if (osds.count(a)) {
-		found = true;
-		continue;
-	      }
-	      if (a != CRUSH_ITEM_NONE) {
-		pg_acting.insert(a);
-	      }
-	    }
-	  }
-	  if (!found) {
-	    continue;
-	  }
-	  touched_pgs++;
-	  if (!(q.second.state & PG_STATE_ACTIVE) ||
-	      (q.second.state & PG_STATE_DEGRADED)) {
-	    ++dangerous_pgs;
-	    continue;
-	  }
-	  const pg_pool_t *pi = osdmap.get_pg_pool(q.first.pool());
-	  if (!pi) {
-	    ++dangerous_pgs; // pool is creating or deleting
-	  } else {
-	    if (pg_acting.size() < pi->min_size) {
-	      ++dangerous_pgs;
-	    }
-	  }
-	}
+	_maximize_ok_to_stop_set(
+	  osds, max, osdmap, pg_map,
+	  &out_report);
       });
-    if (r) {
-      cmdctx->reply(r, ss);
-      return true;
+    if (!f) {
+      f.reset(Formatter::create("json"));
     }
-    if (dangerous_pgs) {
-      ss << dangerous_pgs << " PGs are already too degraded, would become"
-	 << " too degraded or might become unavailable";
+    f->dump_object("ok_to_stop", out_report);
+    f->flush(cmdctx->odata);
+    cmdctx->odata.append("\n");
+    if (!out_report.unknown.empty()) {
+      ss << out_report.unknown.size() << " pgs have unknown state; "
+	 << "cannot draw any conclusions";
+      cmdctx->reply(-EAGAIN, ss);
+    }
+    if (!out_report.ok_to_stop()) {
+      ss << "unsafe to stop osd(s) at this time (" << out_report.not_ok.size() << " PGs are or would become offline)";
       cmdctx->reply(-EBUSY, ss);
-      return true;
+    } else {
+      cmdctx->reply(0, ss);
     }
-    ss << "OSD(s) " << osds << " are ok to stop without reducing"
-       << " availability or risking data, provided there are no other concurrent failures"
-       << " or interventions." << std::endl;
-    ss << touched_pgs << " PGs are likely to be"
-       << " degraded (but remain available) as a result.";
-    cmdctx->reply(0, ss);
     return true;
   } else if (prefix == "pg force-recovery" ||
   	     prefix == "pg force-backfill" ||
@@ -1829,6 +1959,12 @@ bool DaemonServer::_handle_command(
     int r = 0;
     string name;
     if (cmd_getval(cmdctx->cmdmap, "key", name)) {
+      // handle special options
+      if (name == "fsid") {
+       cmdctx->odata.append(stringify(monc->get_fsid()) + "\n");
+       cmdctx->reply(r, ss);
+       return true;
+      }
       auto p = daemon->config.find(name);
       if (p != daemon->config.end() &&
 	  !p->second.empty()) {
@@ -2001,6 +2137,7 @@ bool DaemonServer::_handle_command(
       tbl.define_column("DEVICE", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("HOST:DEV", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("DAEMONS", TextTable::LEFT, TextTable::LEFT);
+      tbl.define_column("WEAR", TextTable::RIGHT, TextTable::RIGHT);
       tbl.define_column("LIFE EXPECTANCY", TextTable::LEFT, TextTable::LEFT);
       auto now = ceph_clock_now();
       daemon_state.with_devices([&tbl, now](const DeviceState& dev) {
@@ -2018,9 +2155,15 @@ bool DaemonServer::_handle_command(
 	    }
 	    d += to_string(i);
 	  }
+	  char wear_level_str[16] = {0};
+	  if (dev.wear_level >= 0) {
+	    snprintf(wear_level_str, sizeof(wear_level_str)-1, "%d%%",
+		     (int)(100.1 * dev.wear_level));
+	  }
 	  tbl << dev.devid
 	      << h
 	      << d
+	      << wear_level_str
 	      << dev.get_life_expectancy_str(now)
 	      << TextTable::endrow;
 	});
@@ -2260,10 +2403,12 @@ bool DaemonServer::_handle_command(
     return true;
   }
 
-  dout(10) << "passing through " << cmdctx->cmdmap.size() << dendl;
+  dout(10) << "passing through command '" << prefix << "' size " << cmdctx->cmdmap.size() << dendl;
   finisher.queue(new LambdaContext([this, cmdctx, session, py_command, prefix]
                                    (int r_) mutable {
     std::stringstream ss;
+
+    dout(10) << "dispatching command '" << prefix << "' size " << cmdctx->cmdmap.size() << dendl;
 
     // Validate that the module is enabled
     auto& py_handler_name = py_command.module_name;
@@ -2320,6 +2465,7 @@ bool DaemonServer::_handle_command(
 
     cmdctx->odata.append(ds);
     cmdctx->reply(r, ss);
+    dout(10) << " command returned " << r << dendl;
   }));
   return true;
 }
@@ -2389,6 +2535,7 @@ void DaemonServer::send_report()
   }
 
   auto m = ceph::make_message<MMonMgrReport>();
+  m->gid = monc->get_global_id();
   py_modules.get_health_checks(&m->health_checks);
   py_modules.get_progress_events(&m->progress_events);
 
@@ -2773,12 +2920,13 @@ void DaemonServer::got_service_map()
 	// we just started up
 	dout(10) << "got initial map e" << service_map.epoch << dendl;
 	pending_service_map = service_map;
+	pending_service_map.epoch = service_map.epoch + 1;
       } else {
 	// we we already active and therefore must have persisted it,
 	// which means ours is the same or newer.
 	dout(10) << "got updated map e" << service_map.epoch << dendl;
+	ceph_assert(pending_service_map.epoch > service_map.epoch);
       }
-      pending_service_map.epoch = service_map.epoch + 1;
     });
 
   // cull missing daemons, populate new ones
@@ -2881,6 +3029,9 @@ void DaemonServer::_send_configure(ConnectionRef c)
   if (c->peer_is_osd()) {
     configure->osd_perf_metric_queries =
         osd_perf_metric_collector.get_queries();
+  } else if (c->peer_is_mds()) {
+    configure->metric_config_message =
+      MetricConfigMessage(MDSConfigPayload(mds_perf_metric_collector.get_queries()));
   }
 
   c->send_message2(configure);
@@ -2898,9 +3049,24 @@ int DaemonServer::remove_osd_perf_query(MetricQueryID query_id)
   return osd_perf_metric_collector.remove_query(query_id);
 }
 
-int DaemonServer::get_osd_perf_counters(
-    MetricQueryID query_id,
-    std::map<OSDPerfMetricKey, PerformanceCounters> *counters)
+int DaemonServer::get_osd_perf_counters(OSDPerfCollector *collector)
 {
-  return osd_perf_metric_collector.get_counters(query_id, counters);
+  return osd_perf_metric_collector.get_counters(collector);
+}
+
+MetricQueryID DaemonServer::add_mds_perf_query(
+    const MDSPerfMetricQuery &query,
+    const std::optional<MDSPerfMetricLimit> &limit)
+{
+  return mds_perf_metric_collector.add_query(query, limit);
+}
+
+int DaemonServer::remove_mds_perf_query(MetricQueryID query_id)
+{
+  return mds_perf_metric_collector.remove_query(query_id);
+}
+
+int DaemonServer::get_mds_perf_counters(MDSPerfCollector *collector)
+{
+  return mds_perf_metric_collector.get_counters(collector);
 }

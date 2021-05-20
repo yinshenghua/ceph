@@ -144,7 +144,7 @@ ConfigMap::generate_entity_map(
   vector<pair<string,Section*>> sections = { make_pair("global", &global) };
   auto p = by_type.find(name.get_type_name());
   if (p != by_type.end()) {
-    sections.push_back(make_pair(name.get_type_name(), &p->second));
+    sections.emplace_back(name.get_type_name(), &p->second);
   }
   vector<std::string> name_bits;
   boost::split(name_bits, name.to_str(), [](char c){ return c == '.'; });
@@ -231,6 +231,23 @@ bool ConfigMap::parse_mask(
     *section = i;
   }
   return true;
+}
+
+void ConfigMap::parse_key(
+  const std::string& key,
+  std::string *name,
+  std::string *who)
+{
+  auto last_slash = key.rfind('/');
+  if (last_slash == std::string::npos) {
+    *name = key;
+  } else if (auto mgrpos = key.find("/mgr/"); mgrpos != std::string::npos) {
+    *name = key.substr(mgrpos + 1);
+    *who = key.substr(0, mgrpos);
+  } else {
+    *name = key.substr(last_slash + 1);
+    *who = key.substr(0, last_slash);
+  }
 }
 
 

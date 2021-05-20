@@ -2,7 +2,6 @@ set(msg_srcs
   DispatchQueue.cc
   Message.cc
   Messenger.cc
-  QueueStrategy.cc
   Connection.cc
   msg_types.cc)
 
@@ -17,6 +16,7 @@ list(APPEND msg_srcs
   async/PosixStack.cc
   async/Stack.cc
   async/crypto_onwire.cc
+  async/frames_v2.cc
   async/net_handler.cc)
 
 if(LINUX)

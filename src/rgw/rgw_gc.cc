@@ -17,6 +17,7 @@
 
 #include <list> // XXX
 #include <sstream>
+#include "xxhash.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
@@ -49,7 +50,7 @@ void RGWGC::initialize(CephContext *_cct, RGWRados *_store) {
     op.create(false);
     const uint64_t queue_size = cct->_conf->rgw_gc_max_queue_size, num_deferred_entries = cct->_conf->rgw_gc_max_deferred;
     gc_log_init2(op, queue_size, num_deferred_entries);
-    store->gc_operate(obj_names[i], &op);
+    store->gc_operate(this, obj_names[i], &op);
   }
 }
 
@@ -60,7 +61,7 @@ void RGWGC::finalize()
 
 int RGWGC::tag_index(const string& tag)
 {
-  return rgw_shard_id(tag, max_objs);
+  return rgw_shards_mod(XXH64(tag.c_str(), tag.size(), seed), max_objs);
 }
 
 int RGWGC::send_chain(cls_rgw_obj_chain& chain, const string& tag)
@@ -75,13 +76,13 @@ int RGWGC::send_chain(cls_rgw_obj_chain& chain, const string& tag)
 
   ldpp_dout(this, 20) << "RGWGC::send_chain - on object name: " << obj_names[i] << "tag is: " << tag << dendl;
 
-  auto ret = store->gc_operate(obj_names[i], &op);
+  auto ret = store->gc_operate(this, obj_names[i], &op);
   if (ret != -ECANCELED && ret != -EPERM) {
     return ret;
   }
   ObjectWriteOperation set_entry_op;
   cls_rgw_gc_set_entry(set_entry_op, cct->_conf->rgw_gc_obj_min_wait, info);
-  return store->gc_operate(obj_names[i], &set_entry_op);
+  return store->gc_operate(this, obj_names[i], &set_entry_op);
 }
 
 struct defer_chain_state {
@@ -187,7 +188,7 @@ int RGWGC::remove(int index, int num_entries)
   ObjectWriteOperation op;
   cls_rgw_gc_queue_remove_entries(op, num_entries);
 
-  return store->gc_operate(obj_names[index], &op);
+  return store->gc_operate(this, obj_names[index], &op);
 }
 
 int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std::list<cls_rgw_gc_obj_info>& result, bool *truncated, bool& processing_queue)
@@ -208,7 +209,7 @@ int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std
       }
       obj_version objv;
       cls_version_read(store->gc_pool_ctx, obj_names[*index], &objv);
-      if (ret == -ENOENT) {
+      if (ret == -ENOENT || entries.size() == 0) {
         if (objv.ver == 0) {
           continue;
         } else {
@@ -252,6 +253,11 @@ int RGWGC::list(int *index, string& marker, uint32_t max, bool expired_only, std
     marker = next_marker;
 
     if (*index == max_objs - 1) {
+      if (queue_entries.size() > 0 && *truncated) {
+        processing_queue = true;
+      } else {
+        processing_queue = false;
+      }
       /* we cut short here, truncated will hold the correct value */
       return 0;
     }
@@ -307,11 +313,11 @@ class RGWGCIOManager {
 
 public:
   RGWGCIOManager(const DoutPrefixProvider* _dpp, CephContext *_cct, RGWGC *_gc) : dpp(_dpp),
-                                                  cct(_cct),
-                                                  gc(_gc),
-                                                  remove_tags(cct->_conf->rgw_gc_max_objs),
-                                                  tag_io_size(cct->_conf->rgw_gc_max_objs) {
+                                                                                  cct(_cct),
+                                                                                  gc(_gc) {
     max_aio = cct->_conf->rgw_gc_max_concurrent_io;
+    remove_tags.resize(min(static_cast<int>(cct->_conf->rgw_gc_max_objs), rgw_shards_max()));
+    tag_io_size.resize(min(static_cast<int>(cct->_conf->rgw_gc_max_objs), rgw_shards_max()));
   }
 
   ~RGWGCIOManager() {
@@ -479,6 +485,10 @@ public:
 	    index << " ret=" << ret << dendl;
       return ret;
     }
+    if (perfcounter) {
+      /* log the count of tags retired for rate estimation */
+      perfcounter->inc(l_rgw_gc_retire, num_entries);
+    }
     return 0;
   }
 }; // class RGWGCIOManger
@@ -537,13 +547,13 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
         if (non_expired_entries.size() == 0) {
           transitioned_objects_cache[index] = true;
           marker.clear();
-          ldpp_dout(this, 20) << "RGWGC::process cls_rgw_gc_list returned ENOENT for non expired entries, so setting cache entry to TRUE" << dendl;
+          ldpp_dout(this, 20) << "RGWGC::process cls_rgw_gc_list returned NO non expired entries, so setting cache entry to TRUE" << dendl;
         } else {
           ret = 0;
           goto done;
         }
       }
-      if ((objv.ver == 0) && (ret == -ENOENT)) {
+      if ((objv.ver == 0) && (ret == -ENOENT || entries.size() == 0)) {
         ret = 0;
         goto done;
       }
@@ -596,7 +606,7 @@ int RGWGC::process(int index, int max_secs, bool expired_only,
 	  if (obj.pool != last_pool) {
 	    delete ctx;
 	    ctx = new IoCtx;
-	    ret = rgw_init_ioctx(store->get_rados_handle(), obj.pool, *ctx);
+	    ret = rgw_init_ioctx(this, store->get_rados_handle(), obj.pool, *ctx);
 	    if (ret < 0) {
         if (transitioned_objects_cache[index]) {
           goto done;

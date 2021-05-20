@@ -16,12 +16,10 @@
 #include "librbd/ImageWatcher.h"
 #include "librbd/WatchNotifyTypes.h"
 #include "librbd/io/AioCompletion.h"
-#include "librbd/io/ImageRequestWQ.h"
 #include "test/librados/test.h"
 #include "gtest/gtest.h"
 #include <boost/assign/std/set.hpp>
 #include <boost/assign/std/map.hpp>
-#include <boost/bind.hpp>
 #include <boost/scope_exit.hpp>
 #include <boost/thread/thread.hpp>
 #include <iostream>
@@ -177,6 +175,41 @@ public:
         *id = payload.async_request_id;
       }
       return true;
+    case NOTIFY_OP_SNAP_RENAME:
+      {
+        SnapRenamePayload payload;
+        payload.decode(7, iter);
+        *id = payload.async_request_id;
+      }
+      return true;
+    case NOTIFY_OP_SNAP_REMOVE:
+      {
+        SnapRemovePayload payload;
+        payload.decode(7, iter);
+        *id = payload.async_request_id;
+      }
+      return true;
+    case NOTIFY_OP_SNAP_PROTECT:
+      {
+        SnapProtectPayload payload;
+        payload.decode(7, iter);
+        *id = payload.async_request_id;
+      }
+      return true;
+    case NOTIFY_OP_SNAP_UNPROTECT:
+      {
+        SnapUnprotectPayload payload;
+        payload.decode(7, iter);
+        *id = payload.async_request_id;
+      }
+      return true;
+    case NOTIFY_OP_RENAME:
+      {
+        RenamePayload payload;
+        payload.decode(7, iter);
+        *id = payload.async_request_id;
+      }
+      return true;
     case NOTIFY_OP_REBUILD_OBJECT_MAP:
       {
         RebuildObjectMapPayload payload;
@@ -294,8 +327,91 @@ struct SnapCreateTask {
     std::shared_lock l{ictx->owner_lock};
     C_SaferCond ctx;
     ictx->image_watcher->notify_snap_create(0, cls::rbd::UserSnapshotNamespace(),
-                                            "snap", *progress_context, &ctx);
-    ASSERT_EQ(0, ctx.wait());
+                                            "snap", 0, *progress_context, &ctx);
+    result = ctx.wait();
+  }
+};
+
+struct SnapRenameTask {
+  librbd::ImageCtx *ictx;
+  int result = 0;
+
+  SnapRenameTask(librbd::ImageCtx *ictx)
+    : ictx(ictx) {
+  }
+
+  void operator()() {
+    std::shared_lock l{ictx->owner_lock};
+    C_SaferCond ctx;
+    ictx->image_watcher->notify_snap_rename(0, 1, "snap-rename", &ctx);
+    result = ctx.wait();
+  }
+};
+
+struct SnapRemoveTask {
+  librbd::ImageCtx *ictx;
+  int result = 0;
+
+  SnapRemoveTask(librbd::ImageCtx *ictx)
+    : ictx(ictx) {
+  }
+
+  void operator()() {
+    std::shared_lock l{ictx->owner_lock};
+    C_SaferCond ctx;
+    ictx->image_watcher->notify_snap_remove(
+        0, cls::rbd::UserSnapshotNamespace(), "snap", &ctx);
+    result = ctx.wait();
+  }
+};
+
+struct SnapProtectTask {
+  librbd::ImageCtx *ictx;
+  int result = 0;
+
+  SnapProtectTask(librbd::ImageCtx *ictx)
+    : ictx(ictx) {
+  }
+
+  void operator()() {
+    std::shared_lock l{ictx->owner_lock};
+    C_SaferCond ctx;
+    ictx->image_watcher->notify_snap_protect(
+        0, cls::rbd::UserSnapshotNamespace(), "snap", &ctx);
+    result = ctx.wait();
+  }
+};
+
+struct SnapUnprotectTask {
+  librbd::ImageCtx *ictx;
+  int result = 0;
+
+  SnapUnprotectTask(librbd::ImageCtx *ictx)
+    : ictx(ictx) {
+  }
+
+  void operator()() {
+    std::shared_lock l{ictx->owner_lock};
+    C_SaferCond ctx;
+    ictx->image_watcher->notify_snap_unprotect(
+        0, cls::rbd::UserSnapshotNamespace(), "snap", &ctx);
+    result = ctx.wait();
+  }
+};
+
+struct RenameTask {
+  librbd::ImageCtx *ictx;
+  int result = 0;
+
+  RenameTask(librbd::ImageCtx *ictx)
+    : ictx(ictx) {
+  }
+
+  void operator()() {
+    std::shared_lock l{ictx->owner_lock};
+    C_SaferCond ctx;
+    ictx->image_watcher->notify_rename(0, "new_name", &ctx);
+    result = ctx.wait();
   }
 };
 
@@ -340,7 +456,7 @@ TEST_F(TestImageWatcher, NotifyFlatten) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_FLATTEN, create_response_message(0)}};
@@ -374,7 +490,7 @@ TEST_F(TestImageWatcher, NotifyResize) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_RESIZE, create_response_message(0)}};
@@ -408,7 +524,7 @@ TEST_F(TestImageWatcher, NotifyRebuildObjectMap) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_REBUILD_OBJECT_MAP, create_response_message(0)}};
@@ -443,7 +559,7 @@ TEST_F(TestImageWatcher, NotifySnapCreate) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_CREATE, create_response_message(0)}};
@@ -478,7 +594,7 @@ TEST_F(TestImageWatcher, NotifySnapCreateError) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_CREATE, create_response_message(-EEXIST)}};
@@ -487,7 +603,7 @@ TEST_F(TestImageWatcher, NotifySnapCreateError) {
   C_SaferCond notify_ctx;
   librbd::NoOpProgressContext prog_ctx;
   ictx->image_watcher->notify_snap_create(0, cls::rbd::UserSnapshotNamespace(),
-       "snap", prog_ctx, &notify_ctx);
+                                          "snap", 0, prog_ctx, &notify_ctx);
   ASSERT_EQ(-EEXIST, notify_ctx.wait());
 
   NotifyOps expected_notify_ops;
@@ -502,19 +618,28 @@ TEST_F(TestImageWatcher, NotifySnapRename) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_RENAME, create_response_message(0)}};
 
-  std::shared_lock l{ictx->owner_lock};
-  C_SaferCond notify_ctx;
-  ictx->image_watcher->notify_snap_rename(1, "snap-rename", &notify_ctx);
-  ASSERT_EQ(0, notify_ctx.wait());
+  SnapRenameTask snap_rename_task(ictx);
+  boost::thread thread(boost::ref(snap_rename_task));
+
+  ASSERT_TRUE(wait_for_notifies(*ictx));
 
   NotifyOps expected_notify_ops;
   expected_notify_ops += NOTIFY_OP_SNAP_RENAME;
   ASSERT_EQ(expected_notify_ops, m_notifies);
+
+  AsyncRequestId async_request_id;
+  ASSERT_TRUE(extract_async_request_id(NOTIFY_OP_SNAP_RENAME,
+                                       &async_request_id));
+
+  ASSERT_EQ(0, notify_async_complete(ictx, async_request_id, 0));
+
+  ASSERT_TRUE(thread.timed_join(boost::posix_time::seconds(10)));
+  ASSERT_EQ(0, snap_rename_task.result);
 }
 
 TEST_F(TestImageWatcher, NotifySnapRenameError) {
@@ -524,14 +649,14 @@ TEST_F(TestImageWatcher, NotifySnapRenameError) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_RENAME, create_response_message(-EEXIST)}};
 
   std::shared_lock l{ictx->owner_lock};
   C_SaferCond notify_ctx;
-  ictx->image_watcher->notify_snap_rename(1, "snap-rename", &notify_ctx);
+  ictx->image_watcher->notify_snap_rename(0, 1, "snap-rename", &notify_ctx);
   ASSERT_EQ(-EEXIST, notify_ctx.wait());
 
   NotifyOps expected_notify_ops;
@@ -546,21 +671,28 @@ TEST_F(TestImageWatcher, NotifySnapRemove) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_REMOVE, create_response_message(0)}};
 
-  std::shared_lock l{ictx->owner_lock};
-  C_SaferCond notify_ctx;
-  ictx->image_watcher->notify_snap_remove(cls::rbd::UserSnapshotNamespace(),
-					  "snap",
-					  &notify_ctx);
-  ASSERT_EQ(0, notify_ctx.wait());
+  SnapRemoveTask snap_remove_task(ictx);
+  boost::thread thread(boost::ref(snap_remove_task));
+
+  ASSERT_TRUE(wait_for_notifies(*ictx));
 
   NotifyOps expected_notify_ops;
   expected_notify_ops += NOTIFY_OP_SNAP_REMOVE;
   ASSERT_EQ(expected_notify_ops, m_notifies);
+
+  AsyncRequestId async_request_id;
+  ASSERT_TRUE(extract_async_request_id(NOTIFY_OP_SNAP_REMOVE,
+                                       &async_request_id));
+
+  ASSERT_EQ(0, notify_async_complete(ictx, async_request_id, 0));
+
+  ASSERT_TRUE(thread.timed_join(boost::posix_time::seconds(10)));
+  ASSERT_EQ(0, snap_remove_task.result);
 }
 
 TEST_F(TestImageWatcher, NotifySnapProtect) {
@@ -570,21 +702,28 @@ TEST_F(TestImageWatcher, NotifySnapProtect) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_PROTECT, create_response_message(0)}};
 
-  std::shared_lock l{ictx->owner_lock};
-  C_SaferCond notify_ctx;
-  ictx->image_watcher->notify_snap_protect(cls::rbd::UserSnapshotNamespace(),
-					   "snap",
-					   &notify_ctx);
-  ASSERT_EQ(0, notify_ctx.wait());
+  SnapProtectTask snap_protect_task(ictx);
+  boost::thread thread(boost::ref(snap_protect_task));
+
+  ASSERT_TRUE(wait_for_notifies(*ictx));
 
   NotifyOps expected_notify_ops;
   expected_notify_ops += NOTIFY_OP_SNAP_PROTECT;
   ASSERT_EQ(expected_notify_ops, m_notifies);
+
+  AsyncRequestId async_request_id;
+  ASSERT_TRUE(extract_async_request_id(NOTIFY_OP_SNAP_PROTECT,
+                                       &async_request_id));
+
+  ASSERT_EQ(0, notify_async_complete(ictx, async_request_id, 0));
+
+  ASSERT_TRUE(thread.timed_join(boost::posix_time::seconds(10)));
+  ASSERT_EQ(0, snap_protect_task.result);
 }
 
 TEST_F(TestImageWatcher, NotifySnapUnprotect) {
@@ -594,21 +733,28 @@ TEST_F(TestImageWatcher, NotifySnapUnprotect) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_SNAP_UNPROTECT, create_response_message(0)}};
 
-  std::shared_lock l{ictx->owner_lock};
-  C_SaferCond notify_ctx;
-  ictx->image_watcher->notify_snap_unprotect(cls::rbd::UserSnapshotNamespace(),
-					     "snap",
-					     &notify_ctx);
-  ASSERT_EQ(0, notify_ctx.wait());
+  SnapUnprotectTask snap_unprotect_task(ictx);
+  boost::thread thread(boost::ref(snap_unprotect_task));
+
+  ASSERT_TRUE(wait_for_notifies(*ictx));
 
   NotifyOps expected_notify_ops;
   expected_notify_ops += NOTIFY_OP_SNAP_UNPROTECT;
   ASSERT_EQ(expected_notify_ops, m_notifies);
+
+  AsyncRequestId async_request_id;
+  ASSERT_TRUE(extract_async_request_id(NOTIFY_OP_SNAP_UNPROTECT,
+                                       &async_request_id));
+
+  ASSERT_EQ(0, notify_async_complete(ictx, async_request_id, 0));
+
+  ASSERT_TRUE(thread.timed_join(boost::posix_time::seconds(10)));
+  ASSERT_EQ(0, snap_unprotect_task.result);
 }
 
 TEST_F(TestImageWatcher, NotifyRename) {
@@ -618,19 +764,28 @@ TEST_F(TestImageWatcher, NotifyRename) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_RENAME, create_response_message(0)}};
 
-  std::shared_lock l{ictx->owner_lock};
-  C_SaferCond notify_ctx;
-  ictx->image_watcher->notify_rename("new_name", &notify_ctx);
-  ASSERT_EQ(0, notify_ctx.wait());
+  RenameTask rename_task(ictx);
+  boost::thread thread(boost::ref(rename_task));
+
+  ASSERT_TRUE(wait_for_notifies(*ictx));
 
   NotifyOps expected_notify_ops;
   expected_notify_ops += NOTIFY_OP_RENAME;
   ASSERT_EQ(expected_notify_ops, m_notifies);
+
+  AsyncRequestId async_request_id;
+  ASSERT_TRUE(extract_async_request_id(NOTIFY_OP_RENAME,
+                                       &async_request_id));
+
+  ASSERT_EQ(0, notify_async_complete(ictx, async_request_id, 0));
+
+  ASSERT_TRUE(thread.timed_join(boost::posix_time::seconds(10)));
+  ASSERT_EQ(0, rename_task.result);
 }
 
 TEST_F(TestImageWatcher, NotifyAsyncTimedOut) {
@@ -640,7 +795,7 @@ TEST_F(TestImageWatcher, NotifyAsyncTimedOut) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_FLATTEN, {}}};
@@ -660,7 +815,7 @@ TEST_F(TestImageWatcher, NotifyAsyncError) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_FLATTEN, create_response_message(-EIO)}};
@@ -680,7 +835,7 @@ TEST_F(TestImageWatcher, NotifyAsyncCompleteError) {
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
         "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_FLATTEN, create_response_message(0)}};
@@ -713,7 +868,7 @@ TEST_F(TestImageWatcher, NotifyAsyncRequestTimedOut) {
   ictx->config.set_val("rbd_request_timed_out_seconds", "0");
 
   ASSERT_EQ(0, register_image_watch(*ictx));
-  ASSERT_EQ(0, lock_image(*ictx, LOCK_EXCLUSIVE,
+  ASSERT_EQ(0, lock_image(*ictx, ClsLockType::EXCLUSIVE,
 			  "auto " + stringify(m_watch_ctx->get_handle())));
 
   m_notify_acks = {{NOTIFY_OP_FLATTEN, create_response_message(0)}};

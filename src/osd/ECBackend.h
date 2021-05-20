@@ -261,16 +261,12 @@ private:
       switch (state) {
       case ECBackend::RecoveryOp::IDLE:
 	return "IDLE";
-	break;
       case ECBackend::RecoveryOp::READING:
 	return "READING";
-	break;
       case ECBackend::RecoveryOp::WRITING:
 	return "WRITING";
-	break;
       case ECBackend::RecoveryOp::COMPLETE:
 	return "COMPLETE";
-	break;
       default:
 	ceph_abort();
 	return "";
@@ -352,8 +348,8 @@ public:
   };
   struct read_request_t {
     const std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > to_read;
-    const std::map<pg_shard_t, std::vector<std::pair<int, int>>> need;
-    const bool want_attrs;
+    std::map<pg_shard_t, std::vector<std::pair<int, int>>> need;
+    bool want_attrs;
     GenContext<std::pair<RecoveryMessages *, read_result_t& > &> *cb;
     read_request_t(
       const std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > &to_read,

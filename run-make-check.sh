@@ -20,6 +20,12 @@
 
 source src/script/run-make.sh
 
+set -e
+
+function in_jenkins() {
+    test -n "$JENKINS_HOME"
+}
+
 function run() {
     # to prevent OSD EMFILE death on tests, make sure ulimit >= 1024
     $DRY_RUN ulimit -n $(ulimit -Hn)
@@ -33,9 +39,16 @@ function run() {
     $DRY_RUN sudo /sbin/sysctl -q -w fs.aio-max-nr=$((65536 * 16))
 
     CHECK_MAKEOPTS=${CHECK_MAKEOPTS:-$DEFAULT_MAKEOPTS}
-    if ! $DRY_RUN ctest $CHECK_MAKEOPTS --output-on-failure; then
-        rm -fr ${TMPDIR:-/tmp}/ceph-asok.*
-        return 1
+    if in_jenkins; then
+        if ! ctest $CHECK_MAKEOPTS --no-compress-output --output-on-failure -T Test; then
+            # do not return failure, as the jenkins publisher will take care of this
+            rm -fr ${TMPDIR:-/tmp}/ceph-asok.*
+        fi
+    else
+        if ! $DRY_RUN ctest $CHECK_MAKEOPTS --output-on-failure; then
+            rm -fr ${TMPDIR:-/tmp}/ceph-asok.*
+            return 1
+        fi
     fi
 }
 
@@ -58,8 +71,12 @@ function main() {
     if [ $WITH_SEASTAR ]; then
         cmake_opts+=" -DWITH_SEASTAR=ON"
     fi
+    if [ $WITH_ZBD ]; then
+        cmake_opts+=" -DWITH_ZBD=ON"
+    fi
     configure $cmake_opts $@
-    build tests && echo "make check: successful run on $(git rev-parse HEAD)"
+    build tests
+    echo "make check: successful build on $(git rev-parse HEAD)"
     run
 }
 

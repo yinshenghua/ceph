@@ -304,7 +304,7 @@ void decode_packed_val(T& val, ceph::buffer::list::const_iterator& bl)
       }
       break;
     default:
-      throw ceph::buffer::error();
+      throw ceph::buffer::malformed_input();
   }
 }
 
@@ -729,13 +729,10 @@ inline std::string to_string(const cls_rgw_reshard_status status)
   switch (status) {
   case cls_rgw_reshard_status::NOT_RESHARDING:
     return "not-resharding";
-    break;
   case cls_rgw_reshard_status::IN_PROGRESS:
     return "in-progress";
-    break;
   case cls_rgw_reshard_status::DONE:
     return "done";
-    break;
   };
   return "Unknown reshard status";
 }
@@ -1211,6 +1208,37 @@ struct cls_rgw_lc_obj_head
   static void generate_test_instances(std::list<cls_rgw_lc_obj_head*>& ls);
 };
 WRITE_CLASS_ENCODER(cls_rgw_lc_obj_head)
+
+struct cls_rgw_lc_entry {
+  std::string bucket;
+  uint64_t start_time; // if in_progress
+  uint32_t status;
+
+  cls_rgw_lc_entry()
+    : start_time(0), status(0) {}
+
+  cls_rgw_lc_entry(const cls_rgw_lc_entry& rhs) = default;
+
+  cls_rgw_lc_entry(const std::string& b, uint64_t t, uint32_t s)
+    : bucket(b), start_time(t), status(s) {};
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(bucket, bl);
+    encode(start_time, bl);
+    encode(status, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(bucket, bl);
+    decode(start_time, bl);
+    decode(status, bl);
+    DECODE_FINISH(bl);
+  }
+};
+WRITE_CLASS_ENCODER(cls_rgw_lc_entry);
 
 struct cls_rgw_reshard_entry
 {

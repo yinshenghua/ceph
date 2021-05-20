@@ -1,4 +1,3 @@
-
 if(WITH_RADOSGW_AMQP_ENDPOINT)
   # amqp mock library
   set(amqp_mock_src
@@ -11,6 +10,10 @@ if(WITH_RADOSGW_KAFKA_ENDPOINT)
   set(kafka_stub_src
     kafka_stub.cc)
   add_library(kafka_stub STATIC ${kafka_stub_src})
+endif()
+
+if(WITH_RADOSGW_LUA_PACKAGES)
+  list(APPEND rgw_libs Boost::filesystem)
 endif()
 
 #unittest_rgw_bencode
@@ -86,6 +89,7 @@ target_link_libraries(ceph_test_rgw_obj
   cls_user_client
   librados
   global
+  ceph-common
   ${CURL_LIBRARIES}
   ${EXPAT_LIBRARIES}
   ${CMAKE_DL_LIBS}
@@ -163,10 +167,8 @@ add_executable(unittest_rgw_dmclock_scheduler test_rgw_dmclock_scheduler.cc $<TA
 add_ceph_unittest(unittest_rgw_dmclock_scheduler)
 
 target_link_libraries(unittest_rgw_dmclock_scheduler rgw_schedulers global ${UNITTEST_LIBS})
-if(WITH_BOOST_CONTEXT)
-  target_compile_definitions(unittest_rgw_dmclock_scheduler PRIVATE BOOST_COROUTINES_NO_DEPRECATION_WARNING)
-  target_link_libraries(unittest_rgw_dmclock_scheduler Boost::coroutine Boost::context)
-endif()
+target_compile_definitions(unittest_rgw_dmclock_scheduler PRIVATE BOOST_COROUTINES_NO_DEPRECATION_WARNING)
+target_link_libraries(unittest_rgw_dmclock_scheduler Boost::coroutine Boost::context)
 
 if(WITH_RADOSGW_AMQP_ENDPOINT)
   add_executable(unittest_rgw_amqp test_rgw_amqp.cc)
@@ -204,3 +206,18 @@ install(TARGETS ceph_test_rgw_gc_log DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 add_ceph_test(test-ceph-diff-sorted.sh
   ${CMAKE_CURRENT_SOURCE_DIR}/test-ceph-diff-sorted.sh)
+
+# unittest_cls_fifo_legacy
+add_executable(unittest_cls_fifo_legacy test_cls_fifo_legacy.cc)
+target_link_libraries(unittest_cls_fifo_legacy radostest-cxx ${UNITTEST_LIBS}
+  ${rgw_libs})
+
+# unittest_log_backing
+add_executable(unittest_log_backing test_log_backing.cc)
+target_link_libraries(unittest_log_backing radostest-cxx ${UNITTEST_LIBS}
+  ${rgw_libs})
+
+add_executable(unittest_rgw_lua test_rgw_lua.cc)
+add_ceph_unittest(unittest_rgw_lua)
+target_link_libraries(unittest_rgw_lua ${rgw_libs} ${LUA_LIBRARIES})
+

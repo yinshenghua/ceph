@@ -4,10 +4,10 @@
 #include "messages/MPing.h"
 #include "common/ceph_argparse.h"
 #include "crimson/auth/DummyAuth.h"
+#include "crimson/common/throttle.h"
 #include "crimson/net/Connection.h"
 #include "crimson/net/Dispatcher.h"
 #include "crimson/net/Messenger.h"
-#include "crimson/thread/Throttle.h"
 
 #include <seastar/core/alien.hh>
 #include <seastar/core/app-template.hh>
@@ -38,19 +38,21 @@ struct DummyAuthAuthorizer : public AuthAuthorizer {
 };
 
 struct Server {
-  crimson::thread::Throttle byte_throttler;
+  crimson::common::Throttle byte_throttler;
   crimson::net::MessengerRef msgr;
   crimson::auth::DummyAuthClientServer dummy_auth;
-  struct ServerDispatcher : crimson::net::Dispatcher {
+  struct ServerDispatcher final : crimson::net::Dispatcher {
     unsigned count = 0;
     seastar::condition_variable on_reply;
-    seastar::future<> ms_dispatch(crimson::net::Connection* c,
-                                  MessageRef m) override {
+    std::optional<seastar::future<>> ms_dispatch(crimson::net::ConnectionRef c,
+                                                 MessageRef m) final
+    {
       std::cout << "server got ping " << *m << std::endl;
       // reply with a pong
       return c->send(make_message<MPing>()).then([this] {
         ++count;
         on_reply.signal();
+        return seastar::now();
       });
     }
   } dispatcher;
@@ -64,14 +66,15 @@ struct Server {
 };
 
 struct Client {
-  crimson::thread::Throttle byte_throttler;
+  crimson::common::Throttle byte_throttler;
   crimson::net::MessengerRef msgr;
   crimson::auth::DummyAuthClientServer dummy_auth;
-  struct ClientDispatcher : crimson::net::Dispatcher {
+  struct ClientDispatcher final : crimson::net::Dispatcher {
     unsigned count = 0;
     seastar::condition_variable on_reply;
-    seastar::future<> ms_dispatch(crimson::net::Connection* c,
-                                  MessageRef m) override {
+    std::optional<seastar::future<>> ms_dispatch(crimson::net::ConnectionRef c,
+                                                 MessageRef m) final
+    {
       std::cout << "client got pong " << *m << std::endl;
       ++count;
       on_reply.signal();
@@ -180,9 +183,11 @@ seastar_echo(const entity_addr_t addr, echo_role role, unsigned count)
       server.msgr->set_auth_client(&server.dummy_auth);
       server.msgr->set_auth_server(&server.dummy_auth);
       return server.msgr->bind(entity_addrvec_t{addr}
-      ).then([&server] {
-        return server.msgr->start(&server.dispatcher);
-      }).then([&dispatcher=server.dispatcher, count] {
+      ).safe_then([&server] {
+        return server.msgr->start({&server.dispatcher});
+      }, crimson::net::Messenger::bind_ertr::all_same_way([](auto& e) {
+        ceph_abort_msg("bind failed");
+      })).then([&dispatcher=server.dispatcher, count] {
         return dispatcher.on_reply.wait([&dispatcher, count] {
           return dispatcher.count >= count;
         });
@@ -203,7 +208,7 @@ seastar_echo(const entity_addr_t addr, echo_role role, unsigned count)
       client.msgr->set_require_authorizer(false);
       client.msgr->set_auth_client(&client.dummy_auth);
       client.msgr->set_auth_server(&client.dummy_auth);
-      return client.msgr->start(&client.dispatcher).then(
+      return client.msgr->start({&client.dispatcher}).then(
           [addr, &client, &disp=client.dispatcher, count] {
         auto conn = client.msgr->connect(addr, entity_name_t::TYPE_OSD);
         return seastar::do_until(

@@ -21,7 +21,7 @@
 #include "include/types.h"
 #include "osd/osd_types.h"
 
-class MOSDBoot : public PaxosServiceMessage {
+class MOSDBoot final : public PaxosServiceMessage {
 private:
   static constexpr int HEAD_VERSION = 7;
   static constexpr int COMPAT_VERSION = 7;
@@ -38,7 +38,7 @@ private:
     : PaxosServiceMessage{MSG_OSD_BOOT, 0, HEAD_VERSION, COMPAT_VERSION},
       boot_epoch(0), osd_features(0)
   { }
-  MOSDBoot(OSDSuperblock& s, epoch_t e, epoch_t be,
+  MOSDBoot(const OSDSuperblock& s, epoch_t e, epoch_t be,
 	   const entity_addrvec_t& hb_back_addr_ref,
 	   const entity_addrvec_t& hb_front_addr_ref,
            const entity_addrvec_t& cluster_addr_ref,
@@ -53,7 +53,7 @@ private:
   { }
   
 private:
-  ~MOSDBoot() override { }
+  ~MOSDBoot() final { }
 
 public:
   std::string_view get_type_name() const override { return "osd_boot"; }

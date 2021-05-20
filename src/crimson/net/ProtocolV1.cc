@@ -15,7 +15,7 @@
 #include "crimson/auth/AuthClient.h"
 #include "crimson/auth/AuthServer.h"
 #include "crimson/common/log.h"
-#include "Dispatcher.h"
+#include "chained_dispatchers.h"
 #include "Errors.h"
 #include "Socket.h"
 #include "SocketConnection.h"
@@ -125,10 +125,10 @@ void discard_up_to(std::deque<MessageRef>* queue,
 
 namespace crimson::net {
 
-ProtocolV1::ProtocolV1(Dispatcher& dispatcher,
+ProtocolV1::ProtocolV1(ChainedDispatchers& dispatchers,
                        SocketConnection& conn,
                        SocketMessenger& messenger)
-  : Protocol(proto_t::v1, dispatcher, conn), messenger{messenger} {}
+  : Protocol(proto_t::v1, dispatchers, conn), messenger{messenger} {}
 
 ProtocolV1::~ProtocolV1() {}
 
@@ -316,17 +316,19 @@ void ProtocolV1::start_connect(const entity_addr_t& _peer_addr,
   set_write_state(write_state_t::delay);
 
   ceph_assert(!socket);
+  ceph_assert(!gate.is_closed());
   conn.peer_addr = _peer_addr;
   conn.target_addr = _peer_addr;
   conn.set_peer_name(_peer_name);
   conn.policy = messenger.get_policy(_peer_name.type());
   messenger.register_conn(
     seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
-  gated_dispatch("start_connect", [this] {
+  gate.dispatch_in_background("start_connect", *this, [this] {
       return Socket::connect(conn.peer_addr)
         .then([this](SocketRef sock) {
           socket = std::move(sock);
-          if (state == state_t::closing) {
+          if (state != state_t::connecting) {
+            assert(state == state_t::closing);
             return socket->close().then([] {
               throw std::system_error(make_error_code(error::protocol_aborted));
             });
@@ -352,6 +354,7 @@ void ProtocolV1::start_connect(const entity_addr_t& _peer_addr,
                 make_error_code(crimson::net::error::bad_peer_address));
           }
           if (state != state_t::connecting) {
+            assert(state == state_t::closing);
             throw std::system_error(make_error_code(error::protocol_aborted));
           }
           socket->learn_ephemeral_port_as_connector(caddr.get_port());
@@ -374,6 +377,10 @@ void ProtocolV1::start_connect(const entity_addr_t& _peer_addr,
             return repeat_connect();
           });
         }).then([this] {
+          if (state != state_t::connecting) {
+            assert(state == state_t::closing);
+            throw std::system_error(make_error_code(error::protocol_aborted));
+          }
           execute_open(open_t::connected);
         }).handle_exception([this] (std::exception_ptr eptr) {
           // TODO: handle fault in the connecting state
@@ -522,10 +529,28 @@ bool ProtocolV1::require_auth_feature() const
     return true;
   }
   if (h.connect.host_type == CEPH_ENTITY_TYPE_OSD ||
-      h.connect.host_type == CEPH_ENTITY_TYPE_MDS) {
+      h.connect.host_type == CEPH_ENTITY_TYPE_MDS ||
+      h.connect.host_type == CEPH_ENTITY_TYPE_MGR) {
     return local_conf()->cephx_cluster_require_signatures;
   } else {
     return local_conf()->cephx_service_require_signatures;
+  }
+}
+
+bool ProtocolV1::require_cephx_v2_feature() const
+{
+  if (h.connect.authorizer_protocol != CEPH_AUTH_CEPHX) {
+    return false;
+  }
+  if (local_conf()->cephx_require_version >= 2) {
+    return true;
+  }
+  if (h.connect.host_type == CEPH_ENTITY_TYPE_OSD ||
+      h.connect.host_type == CEPH_ENTITY_TYPE_MDS ||
+      h.connect.host_type == CEPH_ENTITY_TYPE_MGR) {
+    return local_conf()->cephx_cluster_require_version >= 2;
+  } else {
+    return local_conf()->cephx_service_require_version >= 2;
   }
 }
 
@@ -561,6 +586,9 @@ seastar::future<stop_t> ProtocolV1::repeat_handle_connect()
       if (require_auth_feature()) {
         conn.policy.features_required |= CEPH_FEATURE_MSG_AUTH;
       }
+      if (require_cephx_v2_feature()) {
+        conn.policy.features_required |= CEPH_FEATUREMASK_CEPHX_V2;
+      }
       if (auto feat_missing = conn.policy.features_required & ~(uint64_t)h.connect.features;
           feat_missing != 0) {
         return send_connect_reply(
@@ -569,6 +597,10 @@ seastar::future<stop_t> ProtocolV1::repeat_handle_connect()
 
       bufferlist authorizer_reply;
       auth_meta->auth_method = h.connect.authorizer_protocol;
+      if (!HAVE_FEATURE((uint64_t)h.connect.features, CEPHX_V2)) {
+        // peer doesn't support it and we won't get here if we require it
+        auth_meta->skip_authorizer_challenge = true;
+      }
       auto more = static_cast<bool>(auth_meta->authorizer_challenge);
       ceph_assert(messenger.get_auth_server());
       int r = messenger.get_auth_server()->handle_auth_request(
@@ -624,7 +656,7 @@ void ProtocolV1::start_accept(SocketRef&& sock,
   socket = std::move(sock);
   messenger.accept_conn(
     seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
-  gated_dispatch("start_accept", [this] {
+  gate.dispatch_in_background("start_accept", *this, [this] {
       // stop learning my_addr before sending it out, so it won't change
       return messenger.learned_addr(messenger.get_myaddr(), conn).then([this] {
           // encode/send server's handshake header
@@ -658,6 +690,10 @@ void ProtocolV1::start_accept(SocketRef&& sock,
             return repeat_handle_connect();
           });
         }).then([this] {
+          if (state != state_t::accepting) {
+            assert(state == state_t::closing);
+            throw std::system_error(make_error_code(error::protocol_aborted));
+          }
           messenger.register_conn(
             seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
           messenger.unaccept_conn(
@@ -823,10 +859,10 @@ seastar::future<> ProtocolV1::read_message()
     }).then([this] (bufferlist bl) {
       auto p = bl.cbegin();
       ::decode(m.footer, p);
-      auto pconn = seastar::static_pointer_cast<SocketConnection>(
+      auto conn_ref = seastar::static_pointer_cast<SocketConnection>(
         conn.shared_from_this());
       auto msg = ::decode_message(nullptr, 0, m.header, m.footer,
-                                  m.front, m.middle, m.data, std::move(pconn));
+                                  m.front, m.middle, m.data, conn_ref);
       if (unlikely(!msg)) {
         logger().warn("{} decode message failed", conn);
         throw std::system_error{make_error_code(error::corrupted_message)};
@@ -846,15 +882,13 @@ seastar::future<> ProtocolV1::read_message()
 
       if (unlikely(!conn.update_rx_seq(msg->get_seq()))) {
         // skip this message
-        return;
+        return seastar::now();
       }
 
-      // start dispatch, ignoring exceptions from the application layer
-      gated_dispatch("ms_dispatch", [this, msg = std::move(msg_ref)] {
-        logger().debug("{} <== #{} === {} ({})",
-                       conn, msg->get_seq(), *msg, msg->get_type());
-        return dispatcher.ms_dispatch(&conn, std::move(msg));
-      });
+      logger().debug("{} <== #{} === {} ({})",
+                     conn, msg_ref->get_seq(), *msg_ref, msg_ref->get_type());
+      // throttle the reading process by the returned future
+      return dispatchers.ms_dispatch(conn_ref, std::move(msg_ref));
     });
 }
 
@@ -894,18 +928,14 @@ void ProtocolV1::execute_open(open_t type)
   set_write_state(write_state_t::open);
 
   if (type == open_t::connected) {
-    gated_dispatch("ms_handle_connect", [this] {
-      return dispatcher.ms_handle_connect(
-          seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
-    });
+    dispatchers.ms_handle_connect(
+        seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
   } else { // type == open_t::accepted
-    gated_dispatch("ms_handle_accept", [this] {
-      return dispatcher.ms_handle_accept(
-          seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
-    });
+    dispatchers.ms_handle_accept(
+        seastar::static_pointer_cast<SocketConnection>(conn.shared_from_this()));
   }
 
-  gated_dispatch("execute_open", [this] {
+  gate.dispatch_in_background("execute_open", *this, [this] {
       // start background processing of tags
       return handle_tags()
         .handle_exception_type([this] (const std::system_error& e) {
@@ -932,6 +962,9 @@ void ProtocolV1::trigger_close()
 {
   logger().trace("{} trigger closing, was {}",
                  conn, static_cast<int>(state));
+  messenger.closing_conn(
+      seastar::static_pointer_cast<SocketConnection>(
+        conn.shared_from_this()));
 
   if (state == state_t::accepting) {
     messenger.unaccept_conn(seastar::static_pointer_cast<SocketConnection>(
@@ -951,6 +984,13 @@ void ProtocolV1::trigger_close()
   state = state_t::closing;
 }
 
+void ProtocolV1::on_closed()
+{
+  messenger.closed_conn(
+      seastar::static_pointer_cast<SocketConnection>(
+        conn.shared_from_this()));
+}
+
 seastar::future<> ProtocolV1::fault()
 {
   if (conn.policy.lossy) {
@@ -964,6 +1004,11 @@ seastar::future<> ProtocolV1::fault()
   // will all be performed using v2 protocol.
   ceph_abort("lossless policy not supported for v1");
   return seastar::now();
+}
+
+void ProtocolV1::print(std::ostream& out) const
+{
+  out << conn;
 }
 
 } // namespace crimson::net

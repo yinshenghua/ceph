@@ -14,6 +14,8 @@
 
 #include "common/dout.h"
 #include "crimson/net/Fwd.h"
+#include "messages/MOSDRepOpReply.h"
+#include "messages/MOSDOpReply.h"
 #include "os/Transaction.h"
 #include "osd/osd_types.h"
 #include "crimson/osd/object_context.h"
@@ -21,6 +23,7 @@
 
 #include "crimson/common/type_helpers.h"
 #include "crimson/os/futurized_collection.h"
+#include "crimson/osd/backfill_state.h"
 #include "crimson/osd/osd_operations/client_request.h"
 #include "crimson/osd/osd_operations/peering_event.h"
 #include "crimson/osd/osd_operations/replicated_request.h"
@@ -31,8 +34,8 @@
 #include "crimson/osd/pg_recovery_listener.h"
 #include "crimson/osd/recovery_backend.h"
 
-class OSDMap;
 class MQuery;
+class OSDMap;
 class PGBackend;
 class PGPeeringEvent;
 class osd_op_params_t;
@@ -51,6 +54,7 @@ namespace crimson::os {
 
 namespace crimson::osd {
 class ClientRequest;
+class OpsExecuter;
 
 class PG : public boost::intrusive_ref_counter<
   PG,
@@ -113,7 +117,7 @@ public:
     return peering_state.get_min_last_complete_ondisk();
   }
 
-  const pg_info_t& get_info() const {
+  const pg_info_t& get_info() const final {
     return peering_state.get_info();
   }
 
@@ -147,16 +151,14 @@ public:
     // Not needed yet -- mainly for scrub scheduling
   }
 
-  void scrub_requested(bool deep, bool repair, bool need_auto = false) final {
-    ceph_assert(0 == "Not implemented");
-  }
+  void scrub_requested(scrub_level_t scrub_level, scrub_type_t scrub_type) final;
 
   uint64_t get_snap_trimq_size() const final {
     return 0;
   }
 
   void send_cluster_message(
-    int osd, Message *m,
+    int osd, MessageRef m,
     epoch_t epoch, bool share_map_update=false) final {
     (void)shard_services.send_to_osd(osd, m, epoch);
   }
@@ -181,7 +183,7 @@ public:
 
   template <typename T>
   void start_peering_event_operation(T &&evt, float delay = 0) {
-    shard_services.start_operation<LocalPeeringEvent>(
+    (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
       shard_services,
       pg_whoami,
@@ -200,8 +202,8 @@ public:
   }
   void request_local_background_io_reservation(
     unsigned priority,
-    PGPeeringEventRef on_grant,
-    PGPeeringEventRef on_preempt) final {
+    PGPeeringEventURef on_grant,
+    PGPeeringEventURef on_preempt) final {
     shard_services.local_reserver.request_reservation(
       pgid,
       on_grant ? make_lambda_context([this, on_grant=std::move(on_grant)] (int) {
@@ -228,8 +230,8 @@ public:
 
   void request_remote_recovery_reservation(
     unsigned priority,
-    PGPeeringEventRef on_grant,
-    PGPeeringEventRef on_preempt) final {
+    PGPeeringEventURef on_grant,
+    PGPeeringEventURef on_preempt) final {
     shard_services.remote_reserver.request_reservation(
       pgid,
       on_grant ? make_lambda_context([this, on_grant=std::move(on_grant)] (int) {
@@ -273,7 +275,13 @@ public:
     shard_services.remove_want_pg_temp(pgid.pgid);
   }
   void publish_stats_to_osd() final {
-    // Not needed yet
+    if (!is_primary())
+      return;
+
+    (void) peering_state.prepare_stats_for_publish(
+      false,
+      pg_stat_t(),
+      object_stat_collection_t());
   }
   void clear_publish_stats() final {
     // Not needed yet
@@ -281,7 +289,7 @@ public:
   void check_recovery_sources(const OSDMapRef& newmap) final {
     // Not needed yet
   }
-  void check_blacklisted_watchers() final {
+  void check_blocklisted_watchers() final {
     // Not needed yet
   }
   void clear_primary_state() final {
@@ -300,9 +308,7 @@ public:
   void on_role_change() final {
     // Not needed yet
   }
-  void on_change(ceph::os::Transaction &t) final {
-    recovery_backend->on_peering_interval_change(t);
-  }
+  void on_change(ceph::os::Transaction &t) final;
   void on_activate(interval_set<snapid_t> to_trim) final;
   void on_activate_complete() final;
   void on_new_interval() final {
@@ -322,7 +328,8 @@ public:
   void on_removal(ceph::os::Transaction &t) final {
     // TODO
   }
-  void do_delete_work(ceph::os::Transaction &t) final;
+  std::pair<ghobject_t, bool>
+  do_delete_work(ceph::os::Transaction &t, ghobject_t _next) final;
 
   // merge/split not ready
   void clear_ready_to_merge() final {}
@@ -343,20 +350,20 @@ public:
   }
 
   void on_backfill_reserved() final {
-    recovery_handler->start_background_recovery(
-      crimson::osd::scheduler::scheduler_class_t::background_best_effort);
+    recovery_handler->on_backfill_reserved();
   }
   void on_backfill_canceled() final {
     ceph_assert(0 == "Not implemented");
   }
+
   void on_recovery_reserved() final {
-    recovery_handler->start_background_recovery(
-      crimson::osd::scheduler::scheduler_class_t::background_recovery);
+    recovery_handler->start_pglogbased_recovery();
   }
 
 
   bool try_reserve_recovery_space(
     int64_t primary_num_bytes, int64_t local_num_bytes) final {
+    // TODO
     return true;
   }
   void unreserve_recovery_space() final {}
@@ -429,6 +436,9 @@ public:
   bool is_primary() const final {
     return peering_state.is_primary();
   }
+  bool is_nonprimary() const {
+    return peering_state.is_nonprimary();
+  }
   bool is_peered() const final {
     return peering_state.is_peered();
   }
@@ -449,9 +459,15 @@ public:
   bool get_need_up_thru() const {
     return peering_state.get_need_up_thru();
   }
+  epoch_t get_same_interval_since() const {
+    return get_info().history.same_interval_since;
+  }
 
   const auto& get_pool() const {
     return peering_state.get_pool();
+  }
+  pg_shard_t get_primary() const {
+    return peering_state.get_primary();
   }
 
   /// initialize created PG
@@ -475,67 +491,67 @@ public:
   void handle_activate_map(PeeringCtx &rctx);
   void handle_initialize(PeeringCtx &rctx);
 
-  static std::pair<hobject_t, RWState::State> get_oid_and_lock(
-    const MOSDOp &m,
-    const OpInfo &op_info);
+  static hobject_t get_oid(const MOSDOp &m);
+  static RWState::State get_lock_type(const OpInfo &op_info);
   static std::optional<hobject_t> resolve_oid(
     const SnapSet &snapset,
     const hobject_t &oid);
 
   using load_obc_ertr = crimson::errorator<
     crimson::ct_error::object_corrupted>;
-  load_obc_ertr::future<
-    std::pair<crimson::osd::ObjectContextRef, bool>>
-  get_or_load_clone_obc(
-    hobject_t oid, crimson::osd::ObjectContextRef head_obc);
 
-  load_obc_ertr::future<
-    std::pair<crimson::osd::ObjectContextRef, bool>>
-  get_or_load_head_obc(hobject_t oid);
+  load_obc_ertr::future<crimson::osd::ObjectContextRef>
+  load_head_obc(ObjectContextRef obc);
+
+  load_obc_ertr::future<>
+  reload_obc(crimson::osd::ObjectContext& obc) const;
+
+public:
+  using with_obc_func_t =
+    std::function<load_obc_ertr::future<> (ObjectContextRef)>;
+
+  template<RWState::State State>
+  load_obc_ertr::future<> with_head_obc(hobject_t oid, with_obc_func_t&& func);
+
+  load_obc_ertr::future<> with_locked_obc(
+    Ref<MOSDOp> &m,
+    const OpInfo &op_info,
+    Operation *op,
+    with_obc_func_t&& f);
+
+  seastar::future<> handle_rep_op(Ref<MOSDRepOp> m);
+  void handle_rep_op_reply(crimson::net::ConnectionRef conn,
+			   const MOSDRepOpReply& m);
+
+  void print(std::ostream& os) const;
+  void dump_primary(Formatter*);
+
+private:
+  template<RWState::State State>
+  load_obc_ertr::future<> with_clone_obc(hobject_t oid, with_obc_func_t&& func);
 
   load_obc_ertr::future<ObjectContextRef> get_locked_obc(
     Operation *op,
     const hobject_t &oid,
     RWState::State type);
-public:
-  template <typename F>
-  auto with_locked_obc(
-    Ref<MOSDOp> &m,
-    const OpInfo &op_info,
-    Operation *op,
-    F &&f) {
-    auto [oid, type] = get_oid_and_lock(*m, op_info);
-    return get_locked_obc(op, oid, type)
-      .safe_then([this, f=std::forward<F>(f), type=type](auto obc) {
-	return f(obc).finally([this, obc, type=type] {
-	  obc->put_lock_type(type);
-	  return load_obc_ertr::now();
-	});
-      });
-  }
 
-  seastar::future<> handle_rep_op(Ref<MOSDRepOp> m);
-  void handle_rep_op_reply(crimson::net::Connection* conn,
-			   const MOSDRepOpReply& m);
-
-  void print(std::ostream& os) const;
-
-private:
   void do_peering_event(
     const boost::statechart::event_base &evt,
     PeeringCtx &rctx);
+  osd_op_params_t&& fill_op_params_bump_pg_version(
+    osd_op_params_t&& osd_op_p,
+    Ref<MOSDOp> m,
+    const bool user_modify);
+  seastar::future<Ref<MOSDOpReply>> handle_failed_op(
+    const std::error_code& e,
+    ObjectContextRef obc,
+    const OpsExecuter& ox,
+    const MOSDOp& m) const;
   seastar::future<Ref<MOSDOpReply>> do_osd_ops(
     Ref<MOSDOp> m,
     ObjectContextRef obc,
     const OpInfo &op_info);
   seastar::future<Ref<MOSDOpReply>> do_pg_ops(Ref<MOSDOp> m);
-  seastar::future<> do_osd_op(
-    ObjectState& os,
-    OSDOp& op,
-    ceph::os::Transaction& txn);
-  seastar::future<ceph::bufferlist> do_pgnls(ceph::bufferlist& indata,
-					     const std::string& nspace,
-					     uint64_t limit);
   seastar::future<> submit_transaction(const OpInfo& op_info,
 				       const std::vector<OSDOp>& ops,
 				       ObjectContextRef&& obc,
@@ -551,12 +567,14 @@ private:
 public:
   cached_map_t get_osdmap() { return osdmap; }
   eversion_t next_version() {
-    return eversion_t(projected_last_update.epoch,
+    return eversion_t(get_osdmap_epoch(),
 		      ++projected_last_update.version);
   }
   ShardServices& get_shard_services() final {
     return shard_services;
   }
+  seastar::future<> stop();
+
 private:
   std::unique_ptr<PGBackend> backend;
   std::unique_ptr<RecoveryBackend> recovery_backend;
@@ -581,11 +599,14 @@ public:
   const pg_missing_tracker_t& get_local_missing() const {
     return peering_state.get_pg_log().get_missing();
   }
-  epoch_t get_last_peering_reset() const {
+  epoch_t get_last_peering_reset() const final {
     return peering_state.get_last_peering_reset();
   }
   const set<pg_shard_t> &get_acting_recovery_backfill() const {
     return peering_state.get_acting_recovery_backfill();
+  }
+  bool is_backfill_target(pg_shard_t osd) const {
+    return peering_state.is_backfill_target(osd);
   }
   void begin_peer_recover(pg_shard_t peer, const hobject_t oid) {
     peering_state.begin_peer_recover(peer, oid);
@@ -616,8 +637,17 @@ public:
     get_pool().info.opts.get(pool_opts_t::RECOVERY_OP_PRIORITY, &pri);
     return  pri > 0 ? pri : crimson::common::local_conf()->osd_recovery_op_priority;
   }
+  seastar::future<> mark_unfound_lost(int) {
+    // TODO: see PrimaryLogPG::mark_all_unfound_lost()
+    return seastar::now();
+  }
 
 private:
+  // instead of seastar::gate, we use a boolean flag to indicate
+  // whether the system is shutting down, as we don't need to track
+  // continuations here.
+  bool stopping = false;
+
   class WaitForActiveBlocker : public BlockerT<WaitForActiveBlocker> {
     PG *pg;
 
@@ -633,6 +663,7 @@ private:
     WaitForActiveBlocker(PG *pg) : pg(pg) {}
     void on_active();
     blocking_future<> wait();
+    seastar::future<> stop();
   } wait_for_active_blocker;
 
   friend std::ostream& operator<<(std::ostream&, const PG& pg);
@@ -640,22 +671,32 @@ private:
   friend class PGAdvanceMap;
   friend class PeeringEvent;
   friend class RepRequest;
+  friend class BackfillRecovery;
+  friend struct PGFacade;
 private:
   seastar::future<bool> find_unfound() {
     return seastar::make_ready_future<bool>(true);
   }
 
+  template <typename MsgType>
+  bool can_discard_replica_op(const MsgType& m) const;
+  bool can_discard_op(const MOSDOp& m) const;
   bool is_missing_object(const hobject_t& soid) const {
     return peering_state.get_pg_log().get_missing().get_items().count(soid);
   }
-  bool is_unreadable_object(const hobject_t &oid) const final {
+  bool is_unreadable_object(const hobject_t &oid,
+			    eversion_t* v = 0) const final {
     return is_missing_object(oid) ||
       !peering_state.get_missing_loc().readable_with_acting(
-	oid, get_actingset());
+	oid, get_actingset(), v);
   }
+  bool is_degraded_or_backfilling_object(const hobject_t& soid) const;
   const set<pg_shard_t> &get_actingset() const {
     return peering_state.get_actingset();
   }
+
+private:
+  BackfillRecovery::BackfillRecoveryPipeline backfill_pipeline;
 };
 
 std::ostream& operator<<(std::ostream&, const PG& pg);

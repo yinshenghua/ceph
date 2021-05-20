@@ -1,3 +1,4 @@
+from io import StringIO
 import json
 import logging
 import os
@@ -5,7 +6,6 @@ from textwrap import dedent
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
 from tasks.cephfs.fuse_mount import FuseMount
 from teuthology.exceptions import CommandFailedError
-from teuthology.misc import sudo_write_file
 
 log = logging.getLogger(__name__)
 
@@ -52,13 +52,14 @@ vc.disconnect()
             "mon", "allow *"
         )
         mount.client_id = id_name
-        sudo_write_file(mount.client_remote, mount.get_keyring_path(), out)
+        mount.client_remote.write_file(mount.get_keyring_path(),
+                                       out, sudo=True)
         self.set_conf("client.{name}".format(name=id_name), "keyring", mount.get_keyring_path())
 
     def _configure_guest_auth(self, volumeclient_mount, guest_mount,
-                              guest_entity, mount_path,
+                              guest_entity, cephfs_mntpt,
                               namespace_prefix=None, readonly=False,
-                              tenant_id=None):
+                              tenant_id=None, allow_existing_id=False):
         """
         Set up auth credentials for the guest client to mount a volume.
 
@@ -66,7 +67,7 @@ vc.disconnect()
                                    volumeclient.
         :param guest_mount: mount used by the guest client.
         :param guest_entity: auth ID used by the guest client.
-        :param mount_path: path of the volume.
+        :param cephfs_mntpt: path of the volume.
         :param namespace_prefix: name prefix of the RADOS namespace, which
                                  is used for the volume's layout.
         :param readonly: defaults to False. If set to 'True' only read-only
@@ -74,7 +75,7 @@ vc.disconnect()
         :param tenant_id: (OpenStack) tenant ID of the guest client.
         """
 
-        head, volume_id = os.path.split(mount_path)
+        head, volume_id = os.path.split(cephfs_mntpt)
         head, group_id = os.path.split(head)
         head, volume_prefix = os.path.split(head)
         volume_prefix = "/" + volume_prefix
@@ -83,14 +84,16 @@ vc.disconnect()
         key = self._volume_client_python(volumeclient_mount, dedent("""
             vp = VolumePath("{group_id}", "{volume_id}")
             auth_result = vc.authorize(vp, "{guest_entity}", readonly={readonly},
-                                       tenant_id="{tenant_id}")
+                                       tenant_id="{tenant_id}",
+                                       allow_existing_id="{allow_existing_id}")
             print(auth_result['auth_key'])
         """.format(
             group_id=group_id,
             volume_id=volume_id,
             guest_entity=guest_entity,
             readonly=readonly,
-            tenant_id=tenant_id)), volume_prefix, namespace_prefix
+            tenant_id=tenant_id,
+            allow_existing_id=allow_existing_id)), volume_prefix, namespace_prefix
         )
 
         # CephFSVolumeClient's authorize() does not return the secret
@@ -115,8 +118,8 @@ vc.disconnect()
             key=key
         ))
         guest_mount.client_id = guest_entity
-        sudo_write_file(guest_mount.client_remote,
-                        guest_mount.get_keyring_path(), keyring_txt)
+        guest_mount.client_remote.write_file(guest_mount.get_keyring_path(),
+                                             keyring_txt, sudo=True)
 
         # Add a guest client section to the ceph config file.
         self.set_conf("client.{0}".format(guest_entity), "client quota", "True")
@@ -177,7 +180,7 @@ vc.disconnect()
 
         # Create a 100MB volume
         volume_size = 100
-        mount_path = self._volume_client_python(self.mount_b, dedent("""
+        cephfs_mntpt = self._volume_client_python(self.mount_b, dedent("""
             vp = VolumePath("{group_id}", "{volume_id}")
             create_result = vc.create_volume(vp, 1024*1024*{volume_size})
             print(create_result['mount_path'])
@@ -193,8 +196,8 @@ vc.disconnect()
         # Authorize and configure credentials for the guest to mount the
         # the volume.
         self._configure_guest_auth(self.mount_b, self.mounts[2], guest_entity,
-                                   mount_path, namespace_prefix)
-        self.mounts[2].mount_wait(mount_path=mount_path)
+                                   cephfs_mntpt, namespace_prefix)
+        self.mounts[2].mount_wait(cephfs_mntpt=cephfs_mntpt)
 
         # The kernel client doesn't have the quota-based df behaviour,
         # or quotas at all, so only exercise the client behaviour when
@@ -271,7 +274,7 @@ vc.disconnect()
             try:
                 background.wait()
             except CommandFailedError:
-                # command failed with EBLACKLISTED?
+                # command failed with EBLOCKLISTED?
                 if "transport endpoint shutdown" in background.stderr.getvalue():
                     pass
                 else:
@@ -418,7 +421,7 @@ vc.disconnect()
 
         guest_entity = "guest"
         group_id = "grpid"
-        mount_paths = []
+        cephfs_mntpts = []
         volume_ids = []
 
         # Create two volumes. Authorize 'guest' auth ID to mount the two
@@ -426,7 +429,7 @@ vc.disconnect()
         for i in range(2):
             # Create volume.
             volume_ids.append("volid_{0}".format(str(i)))
-            mount_paths.append(
+            cephfs_mntpts.append(
                 self._volume_client_python(volumeclient_mount, dedent("""
                     vp = VolumePath("{group_id}", "{volume_id}")
                     create_result = vc.create_volume(vp, 10 * 1024 * 1024)
@@ -438,12 +441,12 @@ vc.disconnect()
 
             # Authorize 'guest' auth ID to mount the volume.
             self._configure_guest_auth(volumeclient_mount, guest_mounts[i],
-                                       guest_entity, mount_paths[i])
+                                       guest_entity, cephfs_mntpts[i])
 
             # Mount the volume.
             guest_mounts[i].mountpoint_dir_name = 'mnt.{id}.{suffix}'.format(
                 id=guest_entity, suffix=str(i))
-            guest_mounts[i].mount_wait(mount_path=mount_paths[i])
+            guest_mounts[i].mount_wait(cephfs_mntpt=cephfs_mntpts[i])
             guest_mounts[i].write_n_mb("data.bin", 1)
 
 
@@ -461,7 +464,7 @@ vc.disconnect()
 
         # Evicted guest client, guest_mounts[0], should not be able to do
         # anymore metadata ops.  It should start failing all operations
-        # when it sees that its own address is in the blacklist.
+        # when it sees that its own address is in the blocklist.
         try:
             guest_mounts[0].write_n_mb("rogue.bin", 1)
         except CommandFailedError:
@@ -469,7 +472,7 @@ vc.disconnect()
         else:
             raise RuntimeError("post-eviction write should have failed!")
 
-        # The blacklisted guest client should now be unmountable
+        # The blocklisted guest client should now be unmountable
         guest_mounts[0].umount_wait()
 
         # Guest client, guest_mounts[1], using the same auth ID 'guest', but
@@ -510,7 +513,7 @@ vc.disconnect()
         volume_id = u"volid"
 
         # Create
-        mount_path = self._volume_client_python(self.mount_b, dedent("""
+        cephfs_mntpt = self._volume_client_python(self.mount_b, dedent("""
             vp = VolumePath("{group_id}", u"{volume_id}")
             create_result = vc.create_volume(vp, 10)
             print(create_result['mount_path'])
@@ -520,14 +523,14 @@ vc.disconnect()
         )))
 
         # Strip leading "/"
-        mount_path = mount_path[1:]
+        cephfs_mntpt = cephfs_mntpt[1:]
 
         # A file with non-ascii characters
-        self.mount_a.run_shell(["touch", os.path.join(mount_path, u"b\u00F6b")])
+        self.mount_a.run_shell(["touch", os.path.join(cephfs_mntpt, u"b\u00F6b")])
 
         # A file with no permissions to do anything
-        self.mount_a.run_shell(["touch", os.path.join(mount_path, "noperms")])
-        self.mount_a.run_shell(["chmod", "0000", os.path.join(mount_path, "noperms")])
+        self.mount_a.run_shell(["touch", os.path.join(cephfs_mntpt, "noperms")])
+        self.mount_a.run_shell(["chmod", "0000", os.path.join(cephfs_mntpt, "noperms")])
 
         self._volume_client_python(self.mount_b, dedent("""
             vp = VolumePath("{group_id}", u"{volume_id}")
@@ -560,7 +563,7 @@ vc.disconnect()
         volume_id = "volid"
 
         # Create a volume.
-        mount_path = self._volume_client_python(volumeclient_mount, dedent("""
+        cephfs_mntpt = self._volume_client_python(volumeclient_mount, dedent("""
             vp = VolumePath("{group_id}", "{volume_id}")
             create_result = vc.create_volume(vp, 1024*1024*10)
             print(create_result['mount_path'])
@@ -571,11 +574,11 @@ vc.disconnect()
 
         # Authorize and configure credentials for the guest to mount the
         # the volume with read-write access.
-        self._configure_guest_auth(volumeclient_mount, guest_mount, guest_entity,
-                                   mount_path, readonly=False)
+        self._configure_guest_auth(volumeclient_mount, guest_mount,
+                                   guest_entity, cephfs_mntpt, readonly=False)
 
         # Mount the volume, and write to it.
-        guest_mount.mount_wait(mount_path=mount_path)
+        guest_mount.mount_wait(cephfs_mntpt=cephfs_mntpt)
         guest_mount.write_n_mb("data.bin", 1)
 
         # Change the guest auth ID's authorization to read-only mount access.
@@ -588,13 +591,13 @@ vc.disconnect()
             guest_entity=guest_entity
         )))
         self._configure_guest_auth(volumeclient_mount, guest_mount, guest_entity,
-                                   mount_path, readonly=True)
+                                   cephfs_mntpt, readonly=True)
 
         # The effect of the change in access level to read-only is not
         # immediate. The guest sees the change only after a remount of
         # the volume.
         guest_mount.umount_wait()
-        guest_mount.mount_wait(mount_path=mount_path)
+        guest_mount.mount_wait(cephfs_mntpt=cephfs_mntpt)
 
         # Read existing content of the volume.
         self.assertListEqual(guest_mount.ls(guest_mount.mountpoint), ["data.bin"])
@@ -732,10 +735,10 @@ vc.disconnect()
         # for different volumes, versioning details, etc.
         expected_auth_metadata = {
             "version": 2,
-            "compat_version": 1,
+            "compat_version": 6,
             "dirty": False,
             "tenant_id": "tenant1",
-            "volumes": {
+            "subvolumes": {
                 "groupid/volumeid": {
                     "dirty": False,
                     "access_level": "rw"
@@ -827,6 +830,209 @@ vc.disconnect()
         )))
         self.assertNotIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
 
+    def test_authorize_auth_id_not_created_by_ceph_volume_client(self):
+        """
+        If the auth_id already exists and is not created by
+        ceph_volume_client, it's not allowed to authorize
+        the auth-id by default.
+        """
+        volumeclient_mount = self.mounts[1]
+        volumeclient_mount.umount_wait()
+
+        # Configure volumeclient_mount as the handle for driving volumeclient.
+        self._configure_vc_auth(volumeclient_mount, "manila")
+
+        group_id = "groupid"
+        volume_id = "volumeid"
+
+        # Create auth_id
+        self.fs.mon_manager.raw_cluster_cmd(
+            "auth", "get-or-create", "client.guest1",
+            "mds", "allow *",
+            "osd", "allow rw",
+            "mon", "allow *"
+        )
+
+        auth_id = "guest1"
+        guestclient_1 = {
+            "auth_id": auth_id,
+            "tenant_id": "tenant1",
+        }
+
+        # Create a volume.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.create_volume(vp, 1024*1024*10)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
+        # Cannot authorize 'guestclient_1' to access the volume.
+        # It uses auth ID 'guest1', which already exists and not
+        # created by ceph_volume_client
+        with self.assertRaises(CommandFailedError):
+            self._volume_client_python(volumeclient_mount, dedent("""
+                vp = VolumePath("{group_id}", "{volume_id}")
+                vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+            """.format(
+                group_id=group_id,
+                volume_id=volume_id,
+                auth_id=guestclient_1["auth_id"],
+                tenant_id=guestclient_1["tenant_id"]
+            )))
+
+        # Delete volume
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
+    def test_authorize_allow_existing_id_option(self):
+        """
+        If the auth_id already exists and is not created by
+        ceph_volume_client, it's not allowed to authorize
+        the auth-id by default but is allowed with option
+        allow_existing_id.
+        """
+        volumeclient_mount = self.mounts[1]
+        volumeclient_mount.umount_wait()
+
+        # Configure volumeclient_mount as the handle for driving volumeclient.
+        self._configure_vc_auth(volumeclient_mount, "manila")
+
+        group_id = "groupid"
+        volume_id = "volumeid"
+
+        # Create auth_id
+        self.fs.mon_manager.raw_cluster_cmd(
+            "auth", "get-or-create", "client.guest1",
+            "mds", "allow *",
+            "osd", "allow rw",
+            "mon", "allow *"
+        )
+
+        auth_id = "guest1"
+        guestclient_1 = {
+            "auth_id": auth_id,
+            "tenant_id": "tenant1",
+        }
+
+        # Create a volume.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.create_volume(vp, 1024*1024*10)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
+        # Cannot authorize 'guestclient_1' to access the volume
+        # by default, which already exists and not created by
+        # ceph_volume_client but is allowed with option 'allow_existing_id'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}",
+                         allow_existing_id="{allow_existing_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+            auth_id=guestclient_1["auth_id"],
+            tenant_id=guestclient_1["tenant_id"],
+            allow_existing_id=True
+        )))
+
+        # Delete volume
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
+    def test_deauthorize_auth_id_after_out_of_band_update(self):
+        """
+        If the auth_id authorized by ceph_volume_client is updated
+        out of band, the auth_id should not be deleted after a
+        deauthorize. It should only remove caps associated it.
+        """
+        volumeclient_mount = self.mounts[1]
+        volumeclient_mount.umount_wait()
+
+        # Configure volumeclient_mount as the handle for driving volumeclient.
+        self._configure_vc_auth(volumeclient_mount, "manila")
+
+        group_id = "groupid"
+        volume_id = "volumeid"
+
+
+        auth_id = "guest1"
+        guestclient_1 = {
+            "auth_id": auth_id,
+            "tenant_id": "tenant1",
+        }
+
+        # Create a volume.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.create_volume(vp, 1024*1024*10)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
+        # Authorize 'guestclient_1' to access the volume.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+            auth_id=guestclient_1["auth_id"],
+            tenant_id=guestclient_1["tenant_id"]
+        )))
+
+        # Update caps for guestclient_1 out of band
+        out = self.fs.mon_manager.raw_cluster_cmd(
+            "auth", "caps", "client.guest1",
+            "mds", "allow rw path=/volumes/groupid, allow rw path=/volumes/groupid/volumeid",
+            "osd", "allow rw pool=cephfs_data namespace=fsvolumens_volumeid",
+            "mon", "allow r",
+            "mgr", "allow *"
+        )
+
+        # Deauthorize guestclient_1
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.deauthorize(vp, "{guest_entity}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+            guest_entity=guestclient_1["auth_id"]
+        )))
+
+        # Validate the caps of guestclient_1 after deauthorize. It should not have deleted
+        # guestclient_1. The mgr and mds caps should be present which was updated out of band.
+        out = json.loads(self.fs.mon_manager.raw_cluster_cmd("auth", "get", "client.guest1", "--format=json-pretty"))
+
+        self.assertEqual("client.guest1", out[0]["entity"])
+        self.assertEqual("allow rw path=/volumes/groupid", out[0]["caps"]["mds"])
+        self.assertEqual("allow *", out[0]["caps"]["mgr"])
+        self.assertNotIn("osd", out[0]["caps"])
+
+        # Delete volume
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
     def test_recover_metadata(self):
         """
         That volume client can recover from partial auth updates using
@@ -884,6 +1090,441 @@ vc.disconnect()
             auth_id=guestclient["auth_id"],
         )))
 
+    def test_update_old_style_auth_metadata_to_new_during_recover(self):
+        """
+        From nautilus onwards 'volumes' created by ceph_volume_client were
+        renamed and used as CephFS subvolumes accessed via the ceph-mgr
+        interface. Hence it makes sense to store the subvolume data in
+        auth-metadata file with 'subvolumes' key instead of 'volumes' key.
+        This test validates the transparent update of 'volumes' key to
+        'subvolumes' key in auth metadata file during recover.
+        """
+        volumeclient_mount = self.mounts[1]
+        volumeclient_mount.umount_wait()
+
+        # Configure volumeclient_mount as the handle for driving volumeclient.
+        self._configure_vc_auth(volumeclient_mount, "manila")
+
+        group_id = "groupid"
+        volume_id = "volumeid"
+
+        guestclient = {
+            "auth_id": "guest",
+            "tenant_id": "tenant",
+        }
+
+        # Create a volume.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.create_volume(vp, 1024*1024*10)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+
+        # Check that volume metadata file is created on volume creation.
+        vol_metadata_filename = "_{0}:{1}.meta".format(group_id, volume_id)
+        self.assertIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Authorize 'guestclient' access to the volume.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+            auth_id=guestclient["auth_id"],
+            tenant_id=guestclient["tenant_id"]
+        )))
+
+        # Check that auth metadata file for auth ID 'guest' is created.
+        auth_metadata_filename = "${0}.meta".format(guestclient["auth_id"])
+        self.assertIn(auth_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Replace 'subvolumes' to 'volumes', old style auth-metadata file
+        self.mounts[0].run_shell(['sed', '-i', 's/subvolumes/volumes/g', 'volumes/{0}'.format(auth_metadata_filename)])
+
+        # Verify that the auth metadata file stores the tenant ID that the
+        # auth ID belongs to, the auth ID's authorized access levels
+        # for different volumes, versioning details, etc.
+        expected_auth_metadata = {
+            "version": 2,
+            "compat_version": 6,
+            "dirty": False,
+            "tenant_id": "tenant",
+            "subvolumes": {
+                "groupid/volumeid": {
+                    "dirty": False,
+                    "access_level": "rw"
+                }
+            }
+        }
+
+        # Induce partial auth update state by modifying the auth metadata file,
+        # and then run recovery procedure. This should also update 'volumes' key
+        # to 'subvolumes'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            auth_metadata = vc._auth_metadata_get("{auth_id}")
+            auth_metadata['dirty'] = True
+            vc._auth_metadata_set("{auth_id}", auth_metadata)
+            vc.recover()
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+            auth_id=guestclient["auth_id"],
+        )))
+
+        auth_metadata = self._volume_client_python(volumeclient_mount, dedent("""
+            import json
+            auth_metadata = vc._auth_metadata_get("{auth_id}")
+            print(json.dumps(auth_metadata))
+        """.format(
+            auth_id=guestclient["auth_id"],
+        )))
+        auth_metadata = json.loads(auth_metadata)
+
+        self.assertGreaterEqual(auth_metadata["version"], expected_auth_metadata["version"])
+        del expected_auth_metadata["version"]
+        del auth_metadata["version"]
+        self.assertEqual(expected_auth_metadata, auth_metadata)
+
+        # Check that auth metadata file is cleaned up on removing
+        # auth ID's access to volumes 'volumeid'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.deauthorize(vp, "{guest_entity}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+            guest_entity=guestclient["auth_id"]
+        )))
+        self.assertNotIn(auth_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Check that volume metadata file is cleaned up on volume deletion.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id,
+        )))
+        self.assertNotIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
+
+    def test_update_old_style_auth_metadata_to_new_during_authorize(self):
+        """
+        From nautilus onwards 'volumes' created by ceph_volume_client were
+        renamed and used as CephFS subvolumes accessed via the ceph-mgr
+        interface. Hence it makes sense to store the subvolume data in
+        auth-metadata file with 'subvolumes' key instead of 'volumes' key.
+        This test validates the transparent update of 'volumes' key to
+        'subvolumes' key in auth metadata file during authorize.
+        """
+        volumeclient_mount = self.mounts[1]
+        volumeclient_mount.umount_wait()
+
+        # Configure volumeclient_mount as the handle for driving volumeclient.
+        self._configure_vc_auth(volumeclient_mount, "manila")
+
+        group_id = "groupid"
+        volume_id1 = "volumeid1"
+        volume_id2 = "volumeid2"
+
+        auth_id = "guest"
+        guestclient_1 = {
+            "auth_id": auth_id,
+            "tenant_id": "tenant1",
+        }
+
+        # Create a volume volumeid1.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            create_result = vc.create_volume(vp, 10*1024*1024)
+            print(create_result['mount_path'])
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+        )))
+
+        # Create a volume volumeid2.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            create_result = vc.create_volume(vp, 10*1024*1024)
+            print(create_result['mount_path'])
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+        )))
+
+        # Check that volume metadata file is created on volume creation.
+        vol_metadata_filename = "_{0}:{1}.meta".format(group_id, volume_id1)
+        self.assertIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
+        vol_metadata_filename2 = "_{0}:{1}.meta".format(group_id, volume_id2)
+        self.assertIn(vol_metadata_filename2, self.mounts[0].ls("volumes"))
+
+        # Authorize 'guestclient_1', using auth ID 'guest' and belonging to
+        # 'tenant1', with 'rw' access to the volume 'volumeid1'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+            auth_id=guestclient_1["auth_id"],
+            tenant_id=guestclient_1["tenant_id"]
+        )))
+
+        # Check that auth metadata file for auth ID 'guest', is
+        # created on authorizing 'guest' access to the volume.
+        auth_metadata_filename = "${0}.meta".format(guestclient_1["auth_id"])
+        self.assertIn(auth_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Replace 'subvolumes' to 'volumes', old style auth-metadata file
+        self.mounts[0].run_shell(['sed', '-i', 's/subvolumes/volumes/g', 'volumes/{0}'.format(auth_metadata_filename)])
+
+        # Authorize 'guestclient_1', using auth ID 'guest' and belonging to
+        # 'tenant1', with 'rw' access to the volume 'volumeid2'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+            auth_id=guestclient_1["auth_id"],
+            tenant_id=guestclient_1["tenant_id"]
+        )))
+
+        # Verify that the auth metadata file stores the tenant ID that the
+        # auth ID belongs to, the auth ID's authorized access levels
+        # for different volumes, versioning details, etc.
+        expected_auth_metadata = {
+            "version": 2,
+            "compat_version": 6,
+            "dirty": False,
+            "tenant_id": "tenant1",
+            "subvolumes": {
+                "groupid/volumeid1": {
+                    "dirty": False,
+                    "access_level": "rw"
+                },
+                "groupid/volumeid2": {
+                    "dirty": False,
+                    "access_level": "rw"
+                }
+            }
+        }
+
+        auth_metadata = self._volume_client_python(volumeclient_mount, dedent("""
+            import json
+            auth_metadata = vc._auth_metadata_get("{auth_id}")
+            print(json.dumps(auth_metadata))
+        """.format(
+            auth_id=guestclient_1["auth_id"],
+        )))
+        auth_metadata = json.loads(auth_metadata)
+
+        self.assertGreaterEqual(auth_metadata["version"], expected_auth_metadata["version"])
+        del expected_auth_metadata["version"]
+        del auth_metadata["version"]
+        self.assertEqual(expected_auth_metadata, auth_metadata)
+
+        # Check that auth metadata file is cleaned up on removing
+        # auth ID's access to volumes 'volumeid1' and 'volumeid2'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.deauthorize(vp, "{guest_entity}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+            guest_entity=guestclient_1["auth_id"]
+        )))
+
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.deauthorize(vp, "{guest_entity}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+            guest_entity=guestclient_1["auth_id"]
+        )))
+        self.assertNotIn(auth_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Check that volume metadata file is cleaned up on volume deletion.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+        )))
+        self.assertNotIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Check that volume metadata file is cleaned up on volume deletion.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+        )))
+        self.assertNotIn(vol_metadata_filename2, self.mounts[0].ls("volumes"))
+
+    def test_update_old_style_auth_metadata_to_new_during_deauthorize(self):
+        """
+        From nautilus onwards 'volumes' created by ceph_volume_client were
+        renamed and used as CephFS subvolumes accessed via the ceph-mgr
+        interface. Hence it makes sense to store the subvolume data in
+        auth-metadata file with 'subvolumes' key instead of 'volumes' key.
+        This test validates the transparent update of 'volumes' key to
+        'subvolumes' key in auth metadata file during de-authorize.
+        """
+        volumeclient_mount = self.mounts[1]
+        volumeclient_mount.umount_wait()
+
+        # Configure volumeclient_mount as the handle for driving volumeclient.
+        self._configure_vc_auth(volumeclient_mount, "manila")
+
+        group_id = "groupid"
+        volume_id1 = "volumeid1"
+        volume_id2 = "volumeid2"
+
+        auth_id = "guest"
+        guestclient_1 = {
+            "auth_id": auth_id,
+            "tenant_id": "tenant1",
+        }
+
+        # Create a volume volumeid1.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            create_result = vc.create_volume(vp, 10*1024*1024)
+            print(create_result['mount_path'])
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+        )))
+
+        # Create a volume volumeid2.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            create_result = vc.create_volume(vp, 10*1024*1024)
+            print(create_result['mount_path'])
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+        )))
+
+        # Check that volume metadata file is created on volume creation.
+        vol_metadata_filename = "_{0}:{1}.meta".format(group_id, volume_id1)
+        self.assertIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
+        vol_metadata_filename2 = "_{0}:{1}.meta".format(group_id, volume_id2)
+        self.assertIn(vol_metadata_filename2, self.mounts[0].ls("volumes"))
+
+        # Authorize 'guestclient_1', using auth ID 'guest' and belonging to
+        # 'tenant1', with 'rw' access to the volume 'volumeid1'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+            auth_id=guestclient_1["auth_id"],
+            tenant_id=guestclient_1["tenant_id"]
+        )))
+
+        # Authorize 'guestclient_1', using auth ID 'guest' and belonging to
+        # 'tenant1', with 'rw' access to the volume 'volumeid2'.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.authorize(vp, "{auth_id}", tenant_id="{tenant_id}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+            auth_id=guestclient_1["auth_id"],
+            tenant_id=guestclient_1["tenant_id"]
+        )))
+
+        # Check that auth metadata file for auth ID 'guest', is
+        # created on authorizing 'guest' access to the volume.
+        auth_metadata_filename = "${0}.meta".format(guestclient_1["auth_id"])
+        self.assertIn(auth_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Replace 'subvolumes' to 'volumes', old style auth-metadata file
+        self.mounts[0].run_shell(['sed', '-i', 's/subvolumes/volumes/g', 'volumes/{0}'.format(auth_metadata_filename)])
+
+        # Deauthorize 'guestclient_1' to access 'volumeid2'. This should update
+        # 'volumes' key to 'subvolumes'
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.deauthorize(vp, "{guest_entity}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+            guest_entity=guestclient_1["auth_id"],
+        )))
+
+        # Verify that the auth metadata file stores the tenant ID that the
+        # auth ID belongs to, the auth ID's authorized access levels
+        # for different volumes, versioning details, etc.
+        expected_auth_metadata = {
+            "version": 2,
+            "compat_version": 6,
+            "dirty": False,
+            "tenant_id": "tenant1",
+            "subvolumes": {
+                "groupid/volumeid1": {
+                    "dirty": False,
+                    "access_level": "rw"
+                }
+            }
+        }
+
+        auth_metadata = self._volume_client_python(volumeclient_mount, dedent("""
+            import json
+            auth_metadata = vc._auth_metadata_get("{auth_id}")
+            print(json.dumps(auth_metadata))
+        """.format(
+            auth_id=guestclient_1["auth_id"],
+        )))
+        auth_metadata = json.loads(auth_metadata)
+
+        self.assertGreaterEqual(auth_metadata["version"], expected_auth_metadata["version"])
+        del expected_auth_metadata["version"]
+        del auth_metadata["version"]
+        self.assertEqual(expected_auth_metadata, auth_metadata)
+
+        # Check that auth metadata file is cleaned up on removing
+        # auth ID's access to volumes 'volumeid1' and 'volumeid2'
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.deauthorize(vp, "{guest_entity}")
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+            guest_entity=guestclient_1["auth_id"]
+        )))
+        self.assertNotIn(auth_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Check that volume metadata file is cleaned up on 'volumeid1' deletion.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id1,
+        )))
+        self.assertNotIn(vol_metadata_filename, self.mounts[0].ls("volumes"))
+
+        # Check that volume metadata file is cleaned up on 'volumeid2' deletion.
+        self._volume_client_python(volumeclient_mount, dedent("""
+            vp = VolumePath("{group_id}", "{volume_id}")
+            vc.delete_volume(vp)
+        """.format(
+            group_id=group_id,
+            volume_id=volume_id2,
+        )))
+        self.assertNotIn(vol_metadata_filename2, self.mounts[0].ls("volumes"))
+
     def test_put_object(self):
         vc_mount = self.mounts[1]
         vc_mount.umount_wait()
@@ -913,7 +1554,7 @@ vc.disconnect()
         obj_name = 'test_vc_ob_2'
         pool_name = self.fs.get_data_pool_names()[0]
 
-        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin_data=obj_data)
+        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin=StringIO(obj_data))
 
         self._volume_client_python(vc_mount, dedent("""
             data_read = vc.get_object("{pool_name}", "{obj_name}")
@@ -932,7 +1573,7 @@ vc.disconnect()
         obj_data = 'test_data'
         obj_name = 'test_vc_obj'
         pool_name = self.fs.get_data_pool_names()[0]
-        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin_data=obj_data)
+        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin=StringIO(obj_data))
 
         self._volume_client_python(vc_mount, dedent("""
             data, version_before = vc.get_object_and_version("{pool_name}", "{obj_name}")
@@ -955,7 +1596,7 @@ vc.disconnect()
         obj_data = 'test_data'
         obj_name = 'test_vc_ob_2'
         pool_name = self.fs.get_data_pool_names()[0]
-        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin_data=obj_data)
+        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin=StringIO(obj_data))
 
         # Test if put_object_versioned() crosschecks the version of the
         # given object. Being a negative test, an exception is expected.
@@ -993,7 +1634,7 @@ vc.disconnect()
         obj_name = 'test_vc_obj_3'
         pool_name = self.fs.get_data_pool_names()[0]
 
-        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin_data=obj_data)
+        self.fs.rados(['put', obj_name, '-'], pool=pool_name, stdin=StringIO(obj_data))
 
         self._volume_client_python(vc_mount, dedent("""
             data_read = vc.delete_object("{pool_name}", "{obj_name}")
@@ -1029,7 +1670,7 @@ vc.disconnect()
         # Create a volume
         group_id = "grpid"
         volume_id = "volid"
-        mount_path = self._volume_client_python(vc_mount, dedent("""
+        cephfs_mntpt = self._volume_client_python(vc_mount, dedent("""
             vp = VolumePath("{group_id}", "{volume_id}")
             create_result = vc.create_volume(vp, 1024*1024*10)
             print(create_result['mount_path'])
@@ -1045,13 +1686,13 @@ vc.disconnect()
 
         guest_mount = self.mounts[2]
         guest_mount.umount_wait()
-
-        # Set auth caps for the auth ID using the volumeclient
-        self._configure_guest_auth(vc_mount, guest_mount, guest_id, mount_path)
+# Set auth caps for the auth ID using the volumeclient
+        self._configure_guest_auth(vc_mount, guest_mount, guest_id, cephfs_mntpt,
+                                   allow_existing_id=True)
 
         # Mount the volume in the guest using the auth ID to assert that the
         # auth caps are valid
-        guest_mount.mount_wait(mount_path=mount_path)
+        guest_mount.mount_wait(cephfs_mntpt=cephfs_mntpt)
 
     def test_volume_without_namespace_isolation(self):
         """

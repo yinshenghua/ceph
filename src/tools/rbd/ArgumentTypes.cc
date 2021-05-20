@@ -201,7 +201,7 @@ void add_snap_spec_options(po::options_description *pos,
   pos->add_options()
     ((get_name_prefix(modifier) + SNAPSHOT_SPEC).c_str(),
      (get_description_prefix(modifier) + "snapshot specification\n" +
-      "(example: [<pool-name>/[<namespace>/]]<image-name>@<snapshot-name>)").c_str());
+      "(example: [<pool-name>/[<namespace>/]]<image-name>@<snap-name>)").c_str());
   add_pool_option(opt, modifier);
   add_namespace_option(opt, modifier);
   add_image_option(opt, modifier);
@@ -307,7 +307,7 @@ void add_verbose_option(boost::program_options::options_description *opt) {
 
 void add_no_error_option(boost::program_options::options_description *opt) {
   opt->add_options()
-    (NO_ERROR.c_str(), po::bool_switch(), "continue after error");
+    (NO_ERR.c_str(), po::bool_switch(), "continue after error");
 }
 
 void add_export_format_option(boost::program_options::options_description *opt) {
@@ -319,6 +319,13 @@ void add_flatten_option(boost::program_options::options_description *opt) {
   opt->add_options()
     (IMAGE_FLATTEN.c_str(), po::bool_switch(),
      "fill clone with parent data (make it independent)");
+}
+
+void add_snap_create_options(po::options_description *opt) {
+  opt->add_options()
+    (SKIP_QUIESCE.c_str(), po::bool_switch(), "do not run quiesce hooks")
+    (IGNORE_QUIESCE_ERROR.c_str(), po::bool_switch(),
+     "ignore quiesce hook error");
 }
 
 std::string get_short_features_help(bool append_suffix) {
@@ -499,6 +506,19 @@ void validate(boost::any& v, const std::vector<std::string>& values,
     return;
   }
   throw po::validation_error(po::validation_error::invalid_option_value);
+}
+
+void validate(boost::any& v, const std::vector<std::string>& values,
+              EncryptionAlgorithm *target_type, int) {
+  po::validators::check_first_occurrence(v);
+  const std::string &s = po::validators::get_single_string(values);
+  if (s == "aes-128") {
+    v = boost::any(RBD_ENCRYPTION_ALGORITHM_AES128);
+  } else if (s == "aes-256") {
+    v = boost::any(RBD_ENCRYPTION_ALGORITHM_AES256);
+  } else {
+    throw po::validation_error(po::validation_error::invalid_option_value);
+  }
 }
 
 void validate(boost::any& v, const std::vector<std::string>& values,

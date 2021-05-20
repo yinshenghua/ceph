@@ -2,15 +2,16 @@ import { Component, HostBinding, OnDestroy, OnInit } from '@angular/core';
 
 import { Subscription } from 'rxjs';
 
-import { Icons } from '../../../shared/enum/icons.enum';
-import { Permissions } from '../../../shared/models/permissions';
-import { AuthStorageService } from '../../../shared/services/auth-storage.service';
+import { Icons } from '~/app/shared/enum/icons.enum';
+import { Permissions } from '~/app/shared/models/permissions';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import {
   FeatureTogglesMap$,
   FeatureTogglesService
-} from '../../../shared/services/feature-toggles.service';
-import { PrometheusAlertService } from '../../../shared/services/prometheus-alert.service';
-import { SummaryService } from '../../../shared/services/summary.service';
+} from '~/app/shared/services/feature-toggles.service';
+import { PrometheusAlertService } from '~/app/shared/services/prometheus-alert.service';
+import { SummaryService } from '~/app/shared/services/summary.service';
+import { TelemetryNotificationService } from '~/app/shared/services/telemetry-notification.service';
 
 @Component({
   selector: 'cd-navigation',
@@ -18,7 +19,10 @@ import { SummaryService } from '../../../shared/services/summary.service';
   styleUrls: ['./navigation.component.scss']
 })
 export class NavigationComponent implements OnInit, OnDestroy {
-  @HostBinding('class.isPwdDisplayed') isPwdDisplayed = false;
+  notifications: string[] = [];
+  @HostBinding('class') get class(): string {
+    return 'top-notification-' + this.notifications.length;
+  }
 
   permissions: Permissions;
   enabledFeature$: FeatureTogglesMap$;
@@ -38,6 +42,7 @@ export class NavigationComponent implements OnInit, OnDestroy {
     private authStorageService: AuthStorageService,
     private summaryService: SummaryService,
     private featureToggles: FeatureTogglesService,
+    private telemetryNotificationService: TelemetryNotificationService,
     public prometheusAlertService: PrometheusAlertService
   ) {
     this.permissions = this.authStorageService.getPermissions();
@@ -46,16 +51,23 @@ export class NavigationComponent implements OnInit, OnDestroy {
 
   ngOnInit() {
     this.subs.add(
-      this.summaryService.subscribe((data: any) => {
-        if (!data) {
-          return;
-        }
-        this.summaryData = data;
+      this.summaryService.subscribe((summary) => {
+        this.summaryData = summary;
+      })
+    );
+    /*
+     Note: If you're going to add more top notifications please do not forget to increase
+     the number of generated css-classes in section topNotification settings in the scss
+     file.
+     */
+    this.subs.add(
+      this.authStorageService.isPwdDisplayed$.subscribe((isDisplayed) => {
+        this.showTopNotification('isPwdDisplayed', isDisplayed);
       })
     );
     this.subs.add(
-      this.authStorageService.isPwdDisplayed$.subscribe((isDisplayed) => {
-        this.isPwdDisplayed = isDisplayed;
+      this.telemetryNotificationService.update.subscribe((visible: boolean) => {
+        this.showTopNotification('telemetryNotificationEnabled', visible);
       })
     );
   }
@@ -81,6 +93,19 @@ export class NavigationComponent implements OnInit, OnDestroy {
       this.displayedSubMenu = '';
     } else {
       this.displayedSubMenu = menu;
+    }
+  }
+
+  showTopNotification(name: string, isDisplayed: boolean) {
+    if (isDisplayed) {
+      if (!this.notifications.includes(name)) {
+        this.notifications.push(name);
+      }
+    } else {
+      const index = this.notifications.indexOf(name);
+      if (index >= 0) {
+        this.notifications.splice(index, 1);
+      }
     }
   }
 }

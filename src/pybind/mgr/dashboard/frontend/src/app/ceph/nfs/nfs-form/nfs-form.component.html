@@ -1,4 +1,5 @@
-<div class="cd-col-form">
+<div class="cd-col-form"
+     *cdFormLoading="loading">
   <form name="nfsForm"
         #formDir="ngForm"
         [formGroup]="nfsForm"
@@ -30,16 +31,17 @@
                       value=""
                       i18n>-- Select the cluster --</option>
               <option *ngFor="let cluster of allClusters"
-                      [value]="cluster">{{ cluster }}</option>
+                      [value]="cluster.cluster_id">{{ cluster.cluster_id }}</option>
             </select>
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('cluster_id', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
           </div>
         </div>
 
         <!-- daemons -->
-        <div class="form-group row">
+        <div class="form-group row"
+             *ngIf="clusterType">
           <label class="cd-col-form-label"
                  for="daemons">
             <ng-container i18n>Daemons</ng-container>
@@ -51,7 +53,8 @@
                        type="text"
                        [value]="daemon"
                        disabled />
-                <span class="input-group-append">
+                <span *ngIf="clusterType === 'user'"
+                      class="input-group-append">
                   <button class="btn btn-light"
                           type="button"
                           (click)="removeDaemon(i, daemon)">
@@ -62,7 +65,8 @@
               </div>
             </ng-container>
 
-            <div class="row">
+            <div *ngIf="clusterType === 'user'"
+                 class="row">
               <div class="col-md-12">
                 <cd-select [data]="nfsForm.get('daemons').value"
                            [options]="daemonsSelections"
@@ -72,6 +76,22 @@
                   <i [ngClass]="[icons.add]"></i>
                   <ng-container i18n>Add daemon</ng-container>
                 </cd-select>
+              </div>
+            </div>
+
+            <div *ngIf="clusterType === 'orchestrator'"
+                 class="row">
+              <div class="col-md-12">
+                <button type="button"
+                        class="btn btn-light float-right"
+                        (click)="onToggleAllDaemonsSelection()">
+                  <i [ngClass]="[icons.add]"></i>
+                  <ng-container *ngIf="nfsForm.getValue('daemons').length === 0; else hasDaemons"
+                                i18n>Add all daemons</ng-container>
+                  <ng-template #hasDaemons>
+                    <ng-container i18n>Remove all daemons</ng-container>
+                  </ng-template>
+                </button>
               </div>
             </div>
           </div>
@@ -104,7 +124,7 @@
               </select>
               <span class="invalid-feedback"
                     *ngIf="nfsForm.showError('name', formDir, 'required')"
-                    i18n>Required field</span>
+                    i18n>This field is required.</span>
             </div>
           </div>
 
@@ -134,7 +154,7 @@
               </select>
               <span class="invalid-feedback"
                     *ngIf="nfsForm.showError('rgw_user_id', formDir, 'required')"
-                    i18n>Required field</span>
+                    i18n>This field is required.</span>
             </div>
           </div>
 
@@ -163,7 +183,7 @@
               </select>
               <span class="invalid-feedback"
                     *ngIf="nfsForm.showError('user_id', formDir, 'required')"
-                    i18n>Required field</span>
+                    i18n>This field is required.</span>
             </div>
           </div>
 
@@ -193,12 +213,12 @@
               </select>
               <span class="invalid-feedback"
                     *ngIf="nfsForm.showError('fs_name', formDir, 'required')"
-                    i18n>Required field</span>
+                    i18n>This field is required.</span>
             </div>
           </div>
         </div>
 
-        <!-- Secutiry Label -->
+        <!-- Security Label -->
         <div class="form-group row"
              *ngIf="nfsForm.getValue('name') === 'CEPH'">
           <label class="cd-col-form-label"
@@ -229,7 +249,7 @@
 
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('sec_label_xattr', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
           </div>
         </div>
 
@@ -245,12 +265,12 @@
                    name="path"
                    id="path"
                    formControlName="path"
-                   [typeahead]="pathDataSource"
-                   (typeaheadOnSelect)="pathChangeHandler()"
+                   [ngbTypeahead]="pathDataSource"
+                   (selectItem)="pathChangeHandler()"
                    (blur)="pathChangeHandler()">
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('path', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
 
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('path', formDir, 'pattern')"
@@ -273,13 +293,13 @@
                    name="path"
                    id="path"
                    formControlName="path"
-                   [typeahead]="bucketDataSource"
-                   (typeaheadOnSelect)="bucketChangeHandler()"
+                   [ngbTypeahead]="bucketDataSource"
+                   (selectItem)="bucketChangeHandler()"
                    (blur)="bucketChangeHandler()">
 
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('path', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
 
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('path', formDir, 'pattern')"
@@ -302,7 +322,8 @@
                      class="custom-control-input"
                      id="protocolNfsv3"
                      name="protocolNfsv3"
-                     formControlName="protocolNfsv3">
+                     formControlName="protocolNfsv3"
+                     disabled>
               <label i18n
                      class="custom-control-label"
                      for="protocolNfsv3">NFSv3</label>
@@ -320,7 +341,7 @@
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('protocolNfsv3', formDir, 'required') ||
                   nfsForm.showError('protocolNfsv4', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
           </div>
         </div>
 
@@ -366,7 +387,7 @@
                    formControlName="pseudo">
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('pseudo', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('pseudo', formDir, 'pattern')"
                   i18n>Pseudo needs to start with a '/' and can't contain any of the following: &gt;, &lt;, |, &, ( or ).</span>
@@ -404,12 +425,11 @@
                   *ngIf="nfsForm.getValue('access_type') === 'RW' && nfsForm.getValue('name') === 'RGW'"
                   i18n>The Object Gateway NFS backend has a number of
               limitations which will seriously affect applications writing to
-              the share. Please consult the
-              <a href="{{docsUrl}}"
-                 target="_blank"> documentation</a> for details before enabling write access.</span>
+              the share. Please consult the <cd-doc section="rgw-nfs"></cd-doc>
+              for details before enabling write access.</span>
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('access_type', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
           </div>
         </div>
 
@@ -438,7 +458,7 @@
             </select>
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('squash', formDir,'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
           </div>
         </div>
 
@@ -471,26 +491,24 @@
             <span class="invalid-feedback"
                   *ngIf="nfsForm.showError('transportUDP', formDir, 'required') ||
                   nfsForm.showError('transportTCP', formDir, 'required')"
-                  i18n>Required field</span>
+                  i18n>This field is required.</span>
             <hr>
           </div>
         </div>
 
         <!-- Clients -->
         <cd-nfs-form-client [form]="nfsForm"
+                            [clients]="clients"
                             #nfsClients>
         </cd-nfs-form-client>
 
       </div>
 
       <div class="card-footer">
-        <div class="text-right">
-          <cd-submit-button
-            (submitAction)="submitAction()"
-            i18n="form action button|Example: Create Pool@@formActionButton"
-            [form]="formDir">{{ action | titlecase }} {{ resource | upperFirst }}</cd-submit-button>
-          <cd-back-button></cd-back-button>
-        </div>
+        <cd-form-button-panel (submitActionEvent)="submitAction()"
+                              [form]="nfsForm"
+                              [submitText]="(action | titlecase) + ' ' + (resource | upperFirst)"
+                              wrappingClass="text-right"></cd-form-button-panel>
       </div>
     </div>
   </form>

@@ -92,6 +92,7 @@ public:
     recall_caps_throttle(g_conf().get_val<double>("mds_recall_max_decay_rate")),
     recall_caps_throttle2o(0.5),
     session_cache_liveness(g_conf().get_val<double>("mds_session_cache_liveness_decay_rate")),
+    cap_acquisition(g_conf().get_val<double>("mds_session_cap_acquisition_decay_rate")),
     birth_time(clock::now())
   {
     set_connection(std::move(con));
@@ -113,7 +114,7 @@ public:
     }
   }
 
-  void dump(ceph::Formatter *f) const;
+  void dump(ceph::Formatter *f, bool cap_dump=false) const;
   void push_pv(version_t pv)
   {
     ceph_assert(projected.empty() || projected.back() != pv);
@@ -167,59 +168,52 @@ public:
   auto get_session_cache_liveness() const {
     return session_cache_liveness.get();
   }
+  auto get_cap_acquisition() const {
+    return cap_acquisition.get();
+  }
 
   inodeno_t take_ino(inodeno_t ino = 0) {
     if (ino) {
       if (!info.prealloc_inos.contains(ino))
-	return 0;
-      info.prealloc_inos.erase(ino);
-      if (delegated_inos.contains(ino))
+        return 0;
+      if (delegated_inos.contains(ino)) {
 	delegated_inos.erase(ino);
-    } else {
-      /* Grab first prealloc_ino that isn't delegated */
-      for (const auto& [start, len] : info.prealloc_inos) {
-	for (auto i = start ; i < start + len ; i += 1) {
-	  inodeno_t dstart, dlen;
-	  if (!delegated_inos.contains(i, &dstart, &dlen)) {
-	    ino = i;
-	    info.prealloc_inos.erase(ino);
-	    break;
-	  }
-	  /* skip to end of delegated interval */
-	  i = dstart + dlen - 1;
-	}
-	if (ino)
-	  break;
+      } else if (free_prealloc_inos.contains(ino)) {
+	free_prealloc_inos.erase(ino);
+      } else {
+	ceph_assert(0);
       }
+    } else if (!free_prealloc_inos.empty()) {
+      ino = free_prealloc_inos.range_start();
+      free_prealloc_inos.erase(ino);
     }
-    if (ino)
-      info.used_inos.insert(ino, 1);
     return ino;
   }
-  void delegate_inos(int want, interval_set<inodeno_t>& newinos) {
+
+  void delegate_inos(int want, interval_set<inodeno_t>& inos) {
     want -= (int)delegated_inos.size();
     if (want <= 0)
       return;
 
-    for (const auto& [start, len] : info.prealloc_inos) {
-      for (auto i = start ; i < start + len ; i += 1) {
-	inodeno_t dstart, dlen;
-	if (!delegated_inos.contains(i, &dstart, &dlen)) {
-	  delegated_inos.insert(i);
-	  newinos.insert(i);
-	  if (--want == 0)
-	     return;
-	} else {
-	  /* skip to end of delegated interval */
-	  i = dstart + dlen - 1;
-	}
+    for (auto it = free_prealloc_inos.begin(); it != free_prealloc_inos.end(); ) {
+      if (want < (int)it.get_len()) {
+	inos.insert(it.get_start(), (inodeno_t)want);
+	delegated_inos.insert(it.get_start(), (inodeno_t)want);
+	free_prealloc_inos.erase(it.get_start(), (inodeno_t)want);
+	break;
       }
+      want -= (int)it.get_len();
+      inos.insert(it.get_start(), it.get_len());
+      delegated_inos.insert(it.get_start(), it.get_len());
+      free_prealloc_inos.erase(it++);
+      if (want <= 0)
+	break;
     }
   }
 
   // sans any delegated ones
   int get_num_prealloc_inos() const {
-    return info.prealloc_inos.size() - delegated_inos.size();
+    return free_prealloc_inos.size();
   }
 
   int get_num_projected_prealloc_inos() const {
@@ -289,6 +283,10 @@ public:
     }
   }
 
+  void touch_readdir_cap(uint32_t count) {
+    cap_acquisition.hit(count);
+  }
+
   void touch_cap(Capability *cap) {
     session_cache_liveness.hit(1.0);
     caps.push_front(&cap->item_session_caps);
@@ -354,6 +352,10 @@ public:
     return info.completed_flushes.count(tid);
   }
 
+  uint64_t get_num_caps() const {
+    return caps.size();
+  }
+
   unsigned get_num_completed_flushes() const { return info.completed_flushes.size(); }
   unsigned get_num_trim_flushes_warnings() const {
     return num_trim_flushes_warnings;
@@ -381,6 +383,10 @@ public:
   int check_access(CInode *in, unsigned mask, int caller_uid, int caller_gid,
 		   const std::vector<uint64_t> *gid_list, int new_uid, int new_gid);
 
+  bool fs_name_capable(std::string_view fs_name, unsigned mask) const {
+    return auth_caps.fs_name_capable(fs_name, mask);
+  }
+
   void set_connection(ConnectionRef con) {
     connection = std::move(con);
     auto& c = connection;
@@ -396,6 +402,7 @@ public:
 
   void clear() {
     pending_prealloc_inos.clear();
+    free_prealloc_inos.clear();
     delegated_inos.clear();
     info.clear_meta();
 
@@ -417,6 +424,7 @@ public:
   mutable elist<MDRequestImpl*> requests;
 
   interval_set<inodeno_t> pending_prealloc_inos; // journaling prealloc, will be added to prealloc_inos
+  interval_set<inodeno_t> free_prealloc_inos; //
   interval_set<inodeno_t> delegated_inos; // hand these out to client
 
   xlist<Capability*> caps;     // inodes with caps; front=most recently used
@@ -464,6 +472,9 @@ private:
   // session caps liveness
   DecayCounter session_cache_liveness;
 
+  // cap acquisition via readdir
+  DecayCounter cap_acquisition;
+
   // session start time -- used to track average session time
   // note that this is initialized in the constructor rather
   // than at the time of adding a session to the sessionmap
@@ -491,7 +502,7 @@ public:
   bool match(
       const Session &session,
       std::function<bool(client_t)> is_reconnecting) const;
-  int parse(const std::vector<std::string> &args, std::stringstream *ss);
+  int parse(const std::vector<std::string> &args, std::ostream *ss);
   void set_reconnecting(bool v)
   {
     reconnecting.first = true;

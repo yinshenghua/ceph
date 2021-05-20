@@ -207,7 +207,7 @@ int cls_cxx_read2(cls_method_context_t hctx, int ofs, int len,
   ret = (*pctx)->pg->do_osd_ops(*pctx, ops);
   if (ret < 0)
     return ret;
-  outbl->claim(ops[0].outdata);
+  *outbl = std::move(ops[0].outdata);
   return outbl->length();
 }
 
@@ -284,7 +284,7 @@ int cls_cxx_getxattr(cls_method_context_t hctx, const char *name,
   if (r < 0)
     return r;
 
-  outbl->claim(op.outdata);
+  *outbl = std::move(op.outdata);
   return outbl->length();
 }
 
@@ -436,7 +436,7 @@ int cls_cxx_map_read_header(cls_method_context_t hctx, bufferlist *outbl)
   if (ret < 0)
     return ret;
 
-  outbl->claim(op.outdata);
+  *outbl = std::move(op.outdata);
 
   return 0;
 }
@@ -545,7 +545,7 @@ int cls_cxx_map_write_header(cls_method_context_t hctx, bufferlist *inbl)
   PrimaryLogPG::OpContext **pctx = (PrimaryLogPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   OSDOp& op = ops[0];
-  op.indata.claim(*inbl);
+  op.indata = std::move(*inbl);
 
   op.op.op = CEPH_OSD_OP_OMAPSETHEADER;
 
@@ -682,20 +682,10 @@ int cls_cxx_chunk_write_and_set(cls_method_context_t hctx, int ofs, int len,
   return (*pctx)->pg->do_osd_ops(*pctx, ops);
 }
 
-bool cls_has_chunk(cls_method_context_t hctx, string fp_oid)
+int cls_get_manifest_ref_count(cls_method_context_t hctx, string fp_oid)
 {
   PrimaryLogPG::OpContext *ctx = *(PrimaryLogPG::OpContext **)hctx;
-  if (!ctx->obc->obs.oi.has_manifest()) {
-    return false;
-  }
-
-  for (auto &p : ctx->obc->obs.oi.manifest.chunk_map) {
-    if (p.second.oid.oid.name == fp_oid) {
-      return true;
-    }
-  }
-
-  return false;
+  return ctx->pg->get_manifest_ref_count(ctx->obc, fp_oid);
 }
 
 uint64_t cls_get_osd_min_alloc_size(cls_method_context_t hctx) {

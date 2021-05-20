@@ -1,18 +1,22 @@
+# Disable autopep8 for this file:
+
+# fmt: off
+
 import json
 
 import pytest
 
+import yaml
+
 from ceph.deployment.service_spec import ServiceSpec, NFSServiceSpec, RGWSpec, \
-    ServiceSpecValidationError, IscsiServiceSpec, PlacementSpec
+    IscsiServiceSpec, AlertManagerSpec, HostPlacementSpec, CustomContainerSpec
 
 from orchestrator import DaemonDescription, OrchestratorError
 
 
-def test_spec_octopus():
-    # https://tracker.ceph.com/issues/44934
-    # Those are real user data from early octopus.
-    # Please do not modify those JSON values.
-    specs_text = """[
+@pytest.mark.parametrize(
+    "spec_json",
+    json.loads("""[
 {
   "placement": {
     "count": 1
@@ -68,12 +72,61 @@ def test_spec_octopus():
   "service_type": "rgw",
   "service_id": "default-rgw-realm.eu-central-1.1",
   "rgw_realm": "default-rgw-realm",
-  "rgw_zone": "eu-central-1",
-  "subcluster": "1"
+  "rgw_zone": "eu-central-1"
+},
+{
+  "service_type": "osd",
+  "service_id": "osd_spec_default",
+  "placement": {
+    "host_pattern": "*"
+  },
+  "data_devices": {
+    "model": "MC-55-44-XZ"
+  },
+  "db_devices": {
+    "model": "SSD-123-foo"
+  },
+  "wal_devices": {
+    "model": "NVME-QQQQ-987"
+  }
 }
 ]
-"""
-    dds_text = """[
+""")
+)
+def test_spec_octopus(spec_json):
+    # https://tracker.ceph.com/issues/44934
+    # Those are real user data from early octopus.
+    # Please do not modify those JSON values.
+
+    spec = ServiceSpec.from_json(spec_json)
+
+    # just some verification that we can sill read old octopus specs
+    def convert_to_old_style_json(j):
+        j_c = dict(j.copy())
+        j_c.pop('service_name', None)
+        if 'spec' in j_c:
+            spec = j_c.pop('spec')
+            j_c.update(spec)
+        if 'placement' in j_c:
+            if 'hosts' in j_c['placement']:
+                j_c['placement']['hosts'] = [
+                    {
+                        'hostname': HostPlacementSpec.parse(h).hostname,
+                        'network': HostPlacementSpec.parse(h).network,
+                        'name': HostPlacementSpec.parse(h).name
+                    }
+                    for h in j_c['placement']['hosts']
+                ]
+        j_c.pop('objectstore', None)
+        j_c.pop('filter_logic', None)
+        return j_c
+
+    assert spec_json == convert_to_old_style_json(spec.to_json())
+
+
+@pytest.mark.parametrize(
+    "dd_json",
+    json.loads("""[
     {
         "hostname": "ceph-001",
         "container_id": "d94d7969094d",
@@ -86,7 +139,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.725856",
         "created": "2020-04-02T19:23:08.829543",
-        "started": "2020-04-03T07:29:16.932838" 
+        "started": "2020-04-03T07:29:16.932838",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -100,7 +154,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.725903",
         "created": "2020-04-02T19:23:11.390694",
-        "started": "2020-04-03T07:29:16.910897" 
+        "started": "2020-04-03T07:29:16.910897",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -114,7 +169,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.725950",
         "created": "2020-04-02T19:23:52.025088",
-        "started": "2020-04-03T07:29:16.847972" 
+        "started": "2020-04-03T07:29:16.847972",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -128,7 +184,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.725807",
         "created": "2020-04-02T19:22:18.648584",
-        "started": "2020-04-03T07:29:16.856153" 
+        "started": "2020-04-03T07:29:16.856153",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -142,7 +199,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.725715",
         "created": "2020-04-02T19:22:13.863300",
-        "started": "2020-04-03T07:29:17.206024" 
+        "started": "2020-04-03T07:29:17.206024",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -156,7 +214,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.725996",
         "created": "2020-04-02T19:23:53.880197",
-        "started": "2020-04-03T07:29:16.880044" 
+        "started": "2020-04-03T07:29:16.880044",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -170,7 +229,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.726088",
         "created": "2020-04-02T20:35:02.991435",
-        "started": "2020-04-03T07:29:19.373956" 
+        "started": "2020-04-03T07:29:19.373956",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -184,7 +244,8 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.726134",
         "created": "2020-04-02T20:35:17.142272",
-        "started": "2020-04-03T07:29:19.374002" 
+        "started": "2020-04-03T07:29:19.374002",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
@@ -198,72 +259,87 @@ def test_spec_octopus():
         "status_desc": "running",
         "last_refresh": "2020-04-03T15:31:48.726042",
         "created": "2020-04-02T19:24:10.281163",
-        "started": "2020-04-03T07:29:16.926292" 
+        "started": "2020-04-03T07:29:16.926292",
+        "is_active": false
     },
     {
         "hostname": "ceph-001",
         "daemon_id": "default-rgw-realm.eu-central-1.1.ceph-001.ytywjo",
         "daemon_type": "rgw",
         "status": 1,
-        "status_desc": "starting" 
+        "status_desc": "starting",
+        "is_active": false
     }
-]"""
-    specs_json = json.loads(specs_text)
-    dds_json = json.loads(dds_text)
-    specs = [ServiceSpec.from_json(j) for j in specs_json]
-    dds = [DaemonDescription.from_json(j) for j in dds_json]
+]""")
+)
+def test_dd_octopus(dd_json):
+    # https://tracker.ceph.com/issues/44934
+    # Those are real user data from early octopus.
+    # Please do not modify those JSON values.
 
-    # just some verification that we can sill read old octopus specs
-    def remove_service_name(j):
-        if 'service_name' in j:
-            j_c = j.copy()
-            del j_c['service_name']
-            return j_c
+    # Convert datetime properties to old style.
+    # 2020-04-03T07:29:16.926292Z -> 2020-04-03T07:29:16.926292
+    def convert_to_old_style_json(j):
+        for k in ['last_refresh', 'created', 'started', 'last_deployed',
+                  'last_configured']:
+            if k in j:
+                j[k] = j[k].rstrip('Z')
         return j
-    assert specs_json == [remove_service_name(s.to_json()) for s in specs]
-    assert dds_json == [d.to_json() for d in dds]
+
+    assert dd_json == convert_to_old_style_json(
+        DaemonDescription.from_json(dd_json).to_json())
 
 
 @pytest.mark.parametrize("spec,dd,valid",
-[
+[   # noqa: E128
     # https://tracker.ceph.com/issues/44934
     (
         RGWSpec(
+            service_id="foo",
             rgw_realm="default-rgw-realm",
             rgw_zone="eu-central-1",
-            subcluster='1',
         ),
         DaemonDescription(
             daemon_type='rgw',
-            daemon_id="default-rgw-realm.eu-central-1.1.ceph-001.ytywjo",
+            daemon_id="foo.ceph-001.ytywjo",
             hostname="ceph-001",
         ),
         True
     ),
     (
-        # no subcluster
+        # no realm
         RGWSpec(
-            rgw_realm="default-rgw-realm",
+            service_id="foo.bar",
             rgw_zone="eu-central-1",
         ),
         DaemonDescription(
             daemon_type='rgw',
-            daemon_id="default-rgw-realm.eu-central-1.ceph-001.ytywjo",
+            daemon_id="foo.bar.ceph-001.ytywjo",
             hostname="ceph-001",
         ),
         True
     ),
     (
-        # with tld
+        # no realm or zone
         RGWSpec(
-            rgw_realm="default-rgw-realm",
-            rgw_zone="eu-central-1",
-            subcluster='1',
+            service_id="bar",
         ),
         DaemonDescription(
             daemon_type='rgw',
-            daemon_id="default-rgw-realm.eu-central-1.1.host.domain.tld.ytywjo",
+            daemon_id="bar.host.domain.tld.ytywjo",
             hostname="host.domain.tld",
+        ),
+        True
+    ),
+    (
+        # explicit naming
+        RGWSpec(
+            service_id="realm.zone",
+        ),
+        DaemonDescription(
+            daemon_type='rgw',
+            daemon_id="realm.zone.a",
+            hostname="smithi028",
         ),
         True
     ),
@@ -271,9 +347,20 @@ def test_spec_octopus():
         # without host
         RGWSpec(
             service_type='rgw',
-            rgw_realm="default-rgw-realm",
-            rgw_zone="eu-central-1",
-            subcluster='1',
+            service_id="foo",
+        ),
+        DaemonDescription(
+            daemon_type='rgw',
+            daemon_id="foo.hostname.ytywjo",
+            hostname=None,
+        ),
+        False
+    ),
+    (
+        # without host (2)
+        RGWSpec(
+            service_type='rgw',
+            service_id="default-rgw-realm.eu-central-1.1",
         ),
         DaemonDescription(
             daemon_type='rgw',
@@ -283,16 +370,14 @@ def test_spec_octopus():
         False
     ),
     (
-        # zone contains hostname
-        # https://tracker.ceph.com/issues/45294
+        # service_id contains hostname
+        # (sort of) https://tracker.ceph.com/issues/45294
         RGWSpec(
-            rgw_realm="default.rgw.realm",
-            rgw_zone="ceph.001",
-            subcluster='1',
+            service_id="default.rgw.realm.ceph.001",
         ),
         DaemonDescription(
             daemon_type='rgw',
-            daemon_id="default.rgw.realm.ceph.001.1.ceph.001.ytywjo",
+            daemon_id="default.rgw.realm.ceph.001.ceph.001.ytywjo",
             hostname="ceph.001",
         ),
         True
@@ -321,6 +406,60 @@ def test_spec_octopus():
             daemon_type='mds',
             daemon_id="a.b.c.host1.abc123",
             hostname="host1",
+        ),
+        True
+    ),
+
+    # https://tracker.ceph.com/issues/45617
+    (
+        # daemon_id does not contain hostname
+        ServiceSpec(
+            service_type='mds',
+            service_id="a",
+        ),
+        DaemonDescription(
+            daemon_type='mds',
+            daemon_id="a",
+            hostname="host1",
+        ),
+        True
+    ),
+    (
+        # daemon_id only contains hostname
+        ServiceSpec(
+            service_type='mds',
+            service_id="host1",
+        ),
+        DaemonDescription(
+            daemon_type='mds',
+            daemon_id="host1",
+            hostname="host1",
+        ),
+        True
+    ),
+
+    # https://tracker.ceph.com/issues/45399
+    (
+        # daemon_id only contains hostname
+        ServiceSpec(
+            service_type='mds',
+            service_id="a",
+        ),
+        DaemonDescription(
+            daemon_type='mds',
+            daemon_id="a.host1.abc123",
+            hostname="host1.site",
+        ),
+        True
+    ),
+    (
+        NFSServiceSpec(
+            service_id="a",
+        ),
+        DaemonDescription(
+            daemon_type='nfs',
+            daemon_id="a.host1",
+            hostname="host1.site",
         ),
         True
     ),
@@ -380,7 +519,7 @@ def test_spec_octopus():
         ),
         DaemonDescription(
             daemon_type='nfs',
-            daemon_id="a.abc123",
+            daemon_id="ahost1.abc123",
             hostname="host1",
         ),
         False
@@ -412,6 +551,46 @@ def test_spec_octopus():
         ),
         True
     ),
+    (
+        # fixed daemon id for teuthology.
+        IscsiServiceSpec(
+            service_type='iscsi',
+            service_id='iscsi',
+        ),
+        DaemonDescription(
+            daemon_type='iscsi',
+            daemon_id="iscsi.a",
+            hostname="host1",
+        ),
+        True
+    ),
+
+    (
+        CustomContainerSpec(
+            service_type='container',
+            service_id='hello-world',
+            image='docker.io/library/hello-world:latest',
+        ),
+        DaemonDescription(
+            daemon_type='container',
+            daemon_id='hello-world.mgr0',
+            hostname='mgr0',
+        ),
+        True
+    ),
+
+    (
+        # daemon_id only contains hostname
+        ServiceSpec(
+            service_type='cephadm-exporter',
+        ),
+        DaemonDescription(
+            daemon_type='cephadm-exporter',
+            daemon_id="testhost",
+            hostname="testhost",
+        ),
+        True
+    ),
 ])
 def test_daemon_description_service_name(spec: ServiceSpec,
                                          dd: DaemonDescription,
@@ -422,3 +601,91 @@ def test_daemon_description_service_name(spec: ServiceSpec,
         with pytest.raises(OrchestratorError):
             dd.service_name()
 
+
+def test_alertmanager_spec_1():
+    spec = AlertManagerSpec()
+    assert spec.service_type == 'alertmanager'
+    assert isinstance(spec.user_data, dict)
+    assert len(spec.user_data.keys()) == 0
+
+
+def test_alertmanager_spec_2():
+    spec = AlertManagerSpec(user_data={'default_webhook_urls': ['foo']})
+    assert isinstance(spec.user_data, dict)
+    assert 'default_webhook_urls' in spec.user_data.keys()
+
+
+def test_custom_container_spec():
+    spec = CustomContainerSpec(service_id='hello-world',
+                               image='docker.io/library/hello-world:latest',
+                               entrypoint='/usr/bin/bash',
+                               uid=1000,
+                               gid=2000,
+                               volume_mounts={'foo': '/foo'},
+                               args=['--foo'],
+                               envs=['FOO=0815'],
+                               bind_mounts=[
+                                   [
+                                       'type=bind',
+                                       'source=lib/modules',
+                                       'destination=/lib/modules',
+                                       'ro=true'
+                                   ]
+                               ],
+                               ports=[8080, 8443],
+                               dirs=['foo', 'bar'],
+                               files={
+                                   'foo.conf': 'foo\nbar',
+                                   'bar.conf': ['foo', 'bar']
+                               })
+    assert spec.service_type == 'container'
+    assert spec.entrypoint == '/usr/bin/bash'
+    assert spec.uid == 1000
+    assert spec.gid == 2000
+    assert spec.volume_mounts == {'foo': '/foo'}
+    assert spec.args == ['--foo']
+    assert spec.envs == ['FOO=0815']
+    assert spec.bind_mounts == [
+        [
+            'type=bind',
+            'source=lib/modules',
+            'destination=/lib/modules',
+            'ro=true'
+        ]
+    ]
+    assert spec.ports == [8080, 8443]
+    assert spec.dirs == ['foo', 'bar']
+    assert spec.files == {
+        'foo.conf': 'foo\nbar',
+        'bar.conf': ['foo', 'bar']
+    }
+
+
+def test_custom_container_spec_config_json():
+    spec = CustomContainerSpec(service_id='foo', image='foo', dirs=None)
+    config_json = spec.config_json()
+    for key in ['entrypoint', 'uid', 'gid', 'bind_mounts', 'dirs']:
+        assert key not in config_json
+
+
+def test_ingress_spec():
+    yaml_str = """service_type: ingress
+service_id: rgw.foo
+placement:
+  hosts:
+    - host1
+    - host2
+    - host3
+spec:
+  virtual_ip: 192.168.20.1/24
+  backend_service: rgw.foo
+  frontend_port: 8080
+  monitor_port: 8081
+"""
+    yaml_file = yaml.safe_load(yaml_str)
+    spec = ServiceSpec.from_json(yaml_file)
+    assert spec.service_type == "ingress"
+    assert spec.service_id == "rgw.foo"
+    assert spec.virtual_ip == "192.168.20.1/24"
+    assert spec.frontend_port == 8080
+    assert spec.monitor_port == 8081

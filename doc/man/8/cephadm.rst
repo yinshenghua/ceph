@@ -12,7 +12,7 @@ Synopsis
 | **cephadm**** [-h] [--image IMAGE] [--docker] [--data-dir DATA_DIR]
 |               [--log-dir LOG_DIR] [--logrotate-dir LOGROTATE_DIR]
 |               [--unit-dir UNIT_DIR] [--verbose] [--timeout TIMEOUT]
-|               [--retry RETRY]
+|               [--retry RETRY] [--no-container-init]
 |               {version,pull,inspect-image,ls,list-networks,adopt,rm-daemon,rm-cluster,run,shell,enter,ceph-volume,unit,logs,bootstrap,deploy,check-host,prepare-host,add-repo,rm-repo,install}
 |               ...
 
@@ -21,7 +21,7 @@ Synopsis
 
 | **cephadm** **inspect-image**
 
-| **cephadm** **ls**
+| **cephadm** **ls** [-h] [--no-detail] [--legacy-dir LEGACY_DIR]
 
 | **cephadm** **list-networks**
 
@@ -37,7 +37,7 @@ Synopsis
 | **cephadm** **run** [-h] --name NAME --fsid FSID
 
 | **cephadm** **shell** [-h] [--fsid FSID] [--name NAME] [--config CONFIG]
-                        [--keyring KEYRING] [--env ENV]
+                        [--keyring KEYRING] --mount [MOUNT [MOUNT ...]] [--env ENV]
                         [--] [command [command ...]]
 
 | **cephadm** **enter** [-h] [--fsid FSID] --name NAME [command [command ...]]
@@ -45,6 +45,8 @@ Synopsis
 | **cephadm** **ceph-volume** [-h] [--fsid FSID] [--config-json CONFIG_JSON]
                               [--config CONFIG] [--keyring KEYRING]
                               command [command ...]
+
+| **cephadm** **unit**  [-h] [--fsid FSID] --name NAME command
 
 | **cephadm** **logs** [-h] [--fsid FSID] --name NAME [command [command ...]]
 
@@ -58,19 +60,30 @@ Synopsis
 |                           [--skip-ssh]
 |                           [--initial-dashboard-user INITIAL_DASHBOARD_USER]
 |                           [--initial-dashboard-password INITIAL_DASHBOARD_PASSWORD]
+|                           [--ssl-dashboard-port SSL_DASHBOARD_PORT]
 |                           [--dashboard-key DASHBOARD_KEY]
-|                           [--dashboard-crt DASHBOARD_CRT] [--skip-mon-network]
+|                           [--dashboard-crt DASHBOARD_CRT]
+|                           [--ssh-config SSH_CONFIG]
+|                           [--ssh-private-key SSH_PRIVATE_KEY]
+|                           [--ssh-public-key SSH_PUBLIC_KEY]
+|                           [--ssh-user SSH_USER] [--skip-mon-network]
 |                           [--skip-dashboard] [--dashboard-password-noupdate]
 |                           [--no-minimize-config] [--skip-ping-check]
 |                           [--skip-pull] [--skip-firewalld] [--allow-overwrite]
 |                           [--allow-fqdn-hostname] [--skip-prepare-host]
 |                           [--orphan-initial-daemons] [--skip-monitoring-stack]
+|                           [--apply-spec APPLY_SPEC]
+|                           [--registry-url REGISTRY_URL]
+|                           [--registry-username REGISTRY_USERNAME]
+|                           [--registry-password REGISTRY_PASSWORD]
+|                           [--registry-json REGISTRY_JSON]
+
 
 
 | **cephadm** **deploy** [-h] --name NAME --fsid FSID [--config CONFIG]
 |                        [--config-json CONFIG_JSON] [--keyring KEYRING]
 |                        [--key KEY] [--osd-fsid OSD_FSID] [--skip-firewalld]
-|                        [--reconfig] [--allow-ptrace]
+|                        [--tcp-ports TCP_PORTS] [--reconfig] [--allow-ptrace]
 
 | **cephadm** **check-host** [-h] [--expect-hostname EXPECT_HOSTNAME]
 
@@ -85,6 +98,10 @@ Synopsis
 
 | **cephadm** **install** [-h] [packages [packages ...]]
 
+| **cephadm** **registry-login** [-h] [--registry-url REGISTRY_URL]
+|                                [--registry-username REGISTRY_USERNAME]
+|                                [--registry-password REGISTRY_PASSWORD]
+|                                [--registry-json REGISTRY_JSON] [--fsid FSID]
 
 
 
@@ -136,6 +153,10 @@ Options
 .. option:: --retry RETRY
 
    max number of retries (default: 10)
+
+.. option:: --no-container-init
+
+   do not run podman/docker with `--init` (default: False)
 
 
 Commands
@@ -194,8 +215,13 @@ Arguments:
 * [--skip-ssh                     skip setup of ssh key on local host
 * [--initial-dashboard-user INITIAL_DASHBOARD_USER] Initial user for the dashboard
 * [--initial-dashboard-password INITIAL_DASHBOARD_PASSWORD] Initial password for the initial dashboard user
+* [--ssl-dashboard-port SSL_DASHBOARD_PORT] Port number used to connect with dashboard using SSL
 * [--dashboard-key DASHBOARD_KEY] Dashboard key
 * [--dashboard-crt DASHBOARD_CRT] Dashboard certificate
+* [--ssh-config SSH_CONFIG] SSH config
+* [--ssh-private-key SSH_PRIVATE_KEY] SSH private key
+* [--ssh-public-key SSH_PUBLIC_KEY] SSH public key
+* [--ssh-user SSH_USER]           set user for SSHing to cluster hosts, passwordless sudo will be needed for non-root users'
 * [--skip-mon-network]            set mon public_network based on bootstrap mon ip
 * [--skip-dashboard]              do not enable the Ceph Dashboard
 * [--dashboard-password-noupdate] stop forced dashboard password change
@@ -208,6 +234,11 @@ Arguments:
 * [--skip-prepare-host]           Do not prepare host
 * [--orphan-initial-daemons]      Do not create initial mon, mgr, and crash service specs
 * [--skip-monitoring-stack]       Do not automatically provision monitoring stack] (prometheus, grafana, alertmanager, node-exporter)
+* [--apply-spec APPLY_SPEC]       Apply cluster spec after bootstrap (copy ssh key, add hosts and apply services)
+* [--registry-url REGISTRY_URL]   url of custom registry to login to. e.g. docker.io, quay.io
+* [--registry-username REGISTRY_USERNAME] username of account to login to on custom registry
+* [--registry-password REGISTRY_PASSWORD] password of account to login to on custom registry
+* [--registry-json REGISTRY_JSON] JSON file containing registry login info (see registry-login command documentation)
 
 
 ceph-volume
@@ -255,6 +286,7 @@ Arguments:
 * [--key KEY]                 key for new daemon
 * [--osd-fsid OSD_FSID]       OSD uuid, if creating an OSD container
 * [--skip-firewalld]          Do not configure firewalld
+* [--tcp-ports                List of tcp ports to open in the host firewall
 * [--reconfig]                Reconfigure a previously deployed daemon
 * [--allow-ptrace]            Allow SYS_PTRACE on daemon container
 
@@ -319,6 +351,11 @@ list daemon instances known to cephadm on **this** host::
         },
     ...
 
+Arguments:
+
+* [--no-detail]             Do not include daemon status
+* [--legacy-dir LEGACY_DIR] Base directory for legacy daemon data
+
 logs
 ----
 
@@ -329,6 +366,21 @@ print journald logs for a daemon container::
 This is similar to::
 
     journalctl -u mgr.myhost.ysubfo
+
+Can also specify additional journal arguments::
+
+    cephadm logs --name mgr.myhost.ysubfo -- -n 20 # last 20 lines
+    cephadm logs --name mgr.myhost.ysubfo -- -f # follow the log
+
+
+Positional arguments:
+
+* [command]               command (optional)
+
+Arguments:
+
+* [--fsid FSID]           cluster FSID
+* [--name NAME, -n NAME]  daemon name (type.id)
 
 
 prepare-host
@@ -348,6 +400,34 @@ Pull the ceph image::
 
     cephadm pull
 
+registry-login
+--------------
+
+Give cephadm login information for an authenticated registry (url, username and password).
+Cephadm will attempt to log the calling host into that registry::
+
+      cephadm registry-login --registry-url [REGISTRY_URL] --registry-username [USERNAME]
+                             --registry-password [PASSWORD]
+
+Can also use a JSON file containing the login info formatted as::
+
+      {
+       "url":"REGISTRY_URL",
+       "username":"REGISTRY_USERNAME",
+       "password":"REGISTRY_PASSWORD"
+      }
+
+and turn it in with command::
+
+      cephadm registry-login --registry-json [JSON FILE]
+
+Arguments:
+
+* [--registry-url REGISTRY_URL]   url of registry to login to. e.g. docker.io, quay.io
+* [--registry-username REGISTRY_USERNAME] username of account to login to on registry
+* [--registry-password REGISTRY_PASSWORD] password of account to login to on registry
+* [--registry-json REGISTRY_JSON] JSON file containing login info for custom registry
+* [--fsid FSID]                   cluster FSID
 
 rm-daemon
 ---------
@@ -410,6 +490,7 @@ Arguments:
 * [--name NAME, -n NAME]          daemon name (type.id)
 * [--config CONFIG, -c CONFIG]    ceph.conf to pass through to the container
 * [--keyring KEYRING, -k KEYRING] ceph.keyring to pass through to the container
+* [--mount MOUNT, -m MOUNT]       mount a file or directory under /mnt in the container
 * [--env ENV, -e ENV]             set environment variable
 
 

@@ -12,6 +12,8 @@
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
 #include <seastar/core/shared_mutex.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/core/lowres_clock.hh>
 
 #include "include/ceph_assert.h"
 #include "crimson/osd/scheduler/scheduler.h"
@@ -71,8 +73,11 @@ class blocking_future_detail {
   blocking_future_detail(Blocker *b, Fut &&f)
     : blocker(b), fut(std::move(f)) {}
 
-  template <typename... V, typename... U>
-  friend blocking_future_detail<seastar::future<V...>> make_ready_blocking_future(U&&... args);
+  template <typename V, typename U>
+  friend blocking_future_detail<seastar::future<V>> make_ready_blocking_future(U&& args);
+  template <typename V, typename Exception>
+  friend blocking_future_detail<seastar::future<V>>
+  make_exception_blocking_future(Exception&& e);
 
   template <typename U>
   friend blocking_future_detail<seastar::future<>> join_blocking_futures(U &&u);
@@ -90,14 +95,22 @@ public:
   }
 };
 
-template <typename... T>
-using blocking_future = blocking_future_detail<seastar::future<T...>>;
+template <typename T=void>
+using blocking_future = blocking_future_detail<seastar::future<T>>;
 
-template <typename... V, typename... U>
-blocking_future_detail<seastar::future<V...>> make_ready_blocking_future(U&&... args) {
-  return blocking_future<V...>(
+template <typename V, typename U>
+blocking_future_detail<seastar::future<V>> make_ready_blocking_future(U&& args) {
+  return blocking_future<V>(
     nullptr,
-    seastar::make_ready_future<V...>(std::forward<U>(args)...));
+    seastar::make_ready_future<V>(std::forward<U>(args)));
+}
+
+template <typename V, typename Exception>
+blocking_future_detail<seastar::future<V>>
+make_exception_blocking_future(Exception&& e) {
+  return blocking_future<V>(
+    nullptr,
+    seastar::make_exception_future<V>(e));
 }
 
 /**
@@ -105,40 +118,37 @@ blocking_future_detail<seastar::future<V...>> make_ready_blocking_future(U&&... 
  * why a particular op is not making progress.
  */
 class Blocker {
-protected:
-  virtual void dump_detail(ceph::Formatter *f) const = 0;
-
 public:
-  template <typename... T>
-  blocking_future<T...> make_blocking_future(seastar::future<T...> &&f) {
-    return blocking_future<T...>(this, std::move(f));
+  template <typename T>
+  blocking_future<T> make_blocking_future(seastar::future<T> &&f) {
+    return blocking_future<T>(this, std::move(f));
   }
-
   void dump(ceph::Formatter *f) const;
-
-  virtual const char *get_type_name() const = 0;
-
   virtual ~Blocker() = default;
+
+private:
+  virtual void dump_detail(ceph::Formatter *f) const = 0;
+  virtual const char *get_type_name() const = 0;
 };
 
 template <typename T>
 class BlockerT : public Blocker {
 public:
+  virtual ~BlockerT() = default;
+private:
   const char *get_type_name() const final {
     return T::type_name;
   }
-
-  virtual ~BlockerT() = default;
 };
 
 class AggregateBlocker : public BlockerT<AggregateBlocker> {
   vector<Blocker*> parent_blockers;
-protected:
-  void dump_detail(ceph::Formatter *f) const final;
 public:
   AggregateBlocker(vector<Blocker*> &&parent_blockers)
     : parent_blockers(std::move(parent_blockers)) {}
   static constexpr const char *type_name = "AggregateBlocker";
+private:
+  void dump_detail(ceph::Formatter *f) const final;
 };
 
 template <typename T>
@@ -156,7 +166,7 @@ blocking_future<> join_blocking_futures(T &&t) {
       [](auto &&bf) {
 	return std::move(bf.fut);
       }).then([agg=std::move(agg)] {
-	return seastar::now();
+	return seastar::make_ready_future<>();
       }));
 }
 
@@ -177,8 +187,8 @@ class Operation : public boost::intrusive_ref_counter<
   virtual const char *get_type_name() const = 0;
   virtual void print(std::ostream &) const = 0;
 
-  template <typename... T>
-  seastar::future<T...> with_blocking_future(blocking_future<T...> &&f) {
+  template <typename T>
+  seastar::future<T> with_blocking_future(blocking_future<T> &&f) {
     if (f.fut.available()) {
       return std::move(f.fut);
     }
@@ -194,7 +204,7 @@ class Operation : public boost::intrusive_ref_counter<
   void dump_brief(ceph::Formatter *f);
   virtual ~Operation() = default;
 
- protected:
+ private:
   virtual void dump_detail(ceph::Formatter *f) const = 0;
 
  private:
@@ -225,10 +235,6 @@ std::ostream &operator<<(std::ostream &, const Operation &op);
 
 template <typename T>
 class OperationT : public Operation {
-
-protected:
-  virtual void dump_detail(ceph::Formatter *f) const = 0;
-
 public:
   static constexpr const char *type_name = OP_NAMES[static_cast<int>(T::type)];
   using IRef = boost::intrusive_ptr<T>;
@@ -242,6 +248,9 @@ public:
   }
 
   virtual ~OperationT() = default;
+
+private:
+  virtual void dump_detail(ceph::Formatter *f) const = 0;
 };
 
 /**
@@ -269,6 +278,8 @@ class OperationRegistry {
     static_cast<int>(OperationTypeCode::last_op)
   > op_id_counters = {};
 
+  seastar::timer<seastar::lowres_clock> shutdown_timer;
+  seastar::promise<> shutdown;
 public:
   template <typename T, typename... Args>
   typename T::IRef create_operation(Args&&... args) {
@@ -276,6 +287,21 @@ public:
     registries[static_cast<int>(T::type)].push_back(*op);
     op->set_id(op_id_counters[static_cast<int>(T::type)]++);
     return op;
+  }
+
+  seastar::future<> stop() {
+    shutdown_timer.set_callback([this] {
+	if (std::all_of(registries.begin(),
+			registries.end(),
+			[](auto& opl) {
+			  return opl.empty();
+			})) {
+	  shutdown.set_value();
+	  shutdown_timer.cancel();
+	}
+      });
+    shutdown_timer.arm_periodic(std::chrono::milliseconds(100/*TODO: use option instead*/));
+    return shutdown.get_future();
   }
 };
 
@@ -286,7 +312,8 @@ public:
  * expensive and simply limits the number that can be
  * concurrently active.
  */
-class OperationThrottler : public Blocker, md_config_obs_t {
+class OperationThrottler : public Blocker,
+			private md_config_obs_t {
 public:
   OperationThrottler(ConfigProxy &conf);
 
@@ -319,14 +346,16 @@ public:
       if (cont)
 	return with_throttle_while(op, params, f);
       else
-	return seastar::now();
+	return seastar::make_ready_future<>();
     });
   }
-protected:
+
+private:
   void dump_detail(Formatter *f) const final;
   const char *get_type_name() const final {
     return "OperationThrottler";
   }
+
 private:
   crimson::osd::scheduler::SchedulerRef scheduler;
 
@@ -351,17 +380,13 @@ private:
  * the op ordering is preserved.
  */
 class OrderedPipelinePhase : public Blocker {
-  const char * name;
-
-protected:
-  virtual void dump_detail(ceph::Formatter *f) const final;
+private:
+  void dump_detail(ceph::Formatter *f) const final;
   const char *get_type_name() const final {
     return name;
   }
 
 public:
-  seastar::shared_mutex mutex;
-
   /**
    * Used to encapsulate pipeline residency state.
    */
@@ -393,6 +418,10 @@ public:
   };
 
   OrderedPipelinePhase(const char *name) : name(name) {}
+
+private:
+  const char * name;
+  seastar::shared_mutex mutex;
 };
 
 }
