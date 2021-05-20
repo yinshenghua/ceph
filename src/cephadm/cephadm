@@ -211,6 +211,35 @@ class Monitoring(object):
         },
     }  # type: ignore
 
+    @staticmethod
+    def get_version(container_path, container_id, daemon_type):
+        # type: (str, str, str) -> str
+        """
+        :param: daemon_type Either "prometheus", "alertmanager" or "node-exporter"
+        """
+        assert daemon_type in ('prometheus', 'alertmanager', 'node-exporter')
+        cmd = daemon_type.replace('-', '_')
+        code = -1
+        err = ''
+        version = ''
+        if daemon_type == 'alertmanager':
+            for cmd in ['alertmanager', 'prometheus-alertmanager']:
+                _, err, code = call([
+                        container_path, 'exec', container_id, cmd,
+                        '--version'
+                    ], verbosity=CallVerbosity.SILENT)
+                if code == 0:
+                    break
+            cmd = 'alertmanager'  # reset cmd for version extraction
+        else:
+            _, err, code = call([
+                container_path, 'exec', container_id, cmd, '--version'
+            ])
+        if code == 0 and \
+            err.startswith('%s, version ' % cmd):
+            version = err.split(' ')[2]
+        return version
+
 ##################################
 
 
@@ -2914,8 +2943,15 @@ def command_bootstrap():
     if not cp.has_section('global'):
         cp.add_section('global')
     cp.set('global', 'fsid', fsid);
-    cp.set('global', 'mon host', addr_arg)
+    cp.set('global', 'mon_host', addr_arg)
     cp.set('global', 'container_image', args.image)
+    if not cp.has_section('mon'):
+        cp.add_section('mon')
+    if (
+            not cp.has_option('mon', 'auth_allow_insecure_global_id_reclaim')
+            and not cp.has_option('mon', 'auth allow insecure global id reclaim')
+    ):
+        cp.set('mon', 'auth_allow_insecure_global_id_reclaim', 'false')
     cpf = StringIO()
     cp.write(cpf)
     config = cpf.getvalue()
@@ -3304,7 +3340,7 @@ def command_bootstrap():
                         ssh_key = '/etc/ceph/ceph.pub'
                         if args.ssh_public_key:
                             ssh_key = args.ssh_public_key.name
-                        out, err, code = call_throws(['ssh-copy-id', '-f', '-i', ssh_key, '%s@%s' % (args.ssh_user, split[1])])
+                        out, err, code = call_throws(['sudo', '-u', args.ssh_user, 'ssh-copy-id', '-f', '-i', ssh_key, '-o StrictHostKeyChecking=no', '%s@%s' % (args.ssh_user, split[1])])
 
         mounts = {}
         mounts[pathify(args.apply_spec)] = '/tmp/spec.yml:z'
@@ -3887,14 +3923,8 @@ def list_daemons(detail=True, legacy_dir=None):
                                 elif daemon_type in ['prometheus',
                                                      'alertmanager',
                                                      'node-exporter']:
-                                    cmd = daemon_type.replace('-', '_')
-                                    out, err, code = call(
-                                        [container_path, 'exec', container_id,
-                                         cmd, '--version'])
-                                    if not code and \
-                                       err.startswith('%s, version ' % cmd):
-                                        version = err.split(' ')[2]
-                                        seen_versions[image_id] = version
+                                    version = Monitoring.get_version(container_path, container_id, daemon_type)
+                                    seen_versions[image_id] = version
                                 elif daemon_type == CustomContainer.daemon_type:
                                     # Because a custom container can contain
                                     # everything, we do not know which command
