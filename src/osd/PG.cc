@@ -1360,7 +1360,6 @@ bool PG::sched_scrub()
   // be retried by the OSD later on.
   if (!m_scrubber->reserve_local()) {
     dout(10) << __func__ << ": failed to reserve locally" << dendl;
-    set_reserve_failed();
     return false;
   }
 
@@ -2669,10 +2668,14 @@ std::pair<ghobject_t, bool> PG::do_delete_work(
       max,
       &olist,
       &next);
-    if (!olist.empty()) {
-      dout(0) << __func__ << " additional unexpected onode list"
-              <<" (new onodes has appeared since PG removal started"
-              << olist << dendl;
+    for (auto& oid : olist) {
+      if (oid == pgmeta_oid) {
+        dout(20) << __func__ << " removing pgmeta object " << oid << dendl;
+      } else {
+        dout(0) << __func__ << " additional unexpected onode"
+                <<" new onode has appeared since PG removal started"
+                << oid << dendl;
+      }
     }
   }
 

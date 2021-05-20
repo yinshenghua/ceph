@@ -86,6 +86,7 @@ class LogChannel;
 
 class MOSDPGCreate2;
 class MOSDPGNotify;
+class MOSDPGInfo;
 class MOSDPGRemove;
 class MOSDForceRecovery;
 class MMonGetPurgedSnapsReply;
@@ -1916,6 +1917,7 @@ protected:
   void handle_pg_query_nopg(const MQuery& q);
   void handle_fast_pg_notify(MOSDPGNotify *m);
   void handle_pg_notify_nopg(const MNotifyRec& q);
+  void handle_fast_pg_info(MOSDPGInfo *m);
   void handle_fast_pg_remove(MOSDPGRemove *m);
 
 public:
@@ -2057,6 +2059,7 @@ private:
   float get_osd_snap_trim_sleep();
 
   int get_recovery_max_active();
+  bool maybe_override_options_for_qos();
 
   void scrub_purged_snaps();
   void probe_smart(const std::string& devid, std::ostream& ss);

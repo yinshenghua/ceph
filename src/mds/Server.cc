@@ -2459,7 +2459,7 @@ void Server::handle_osd_map()
    * using osdmap_full_flag(), because we want to know "is the flag set"
    * rather than "does the flag apply to us?" */
   mds->objecter->with_osdmap([this](const OSDMap& o) {
-      auto pi = o.get_pg_pool(mds->mdsmap->get_metadata_pool());
+      auto pi = o.get_pg_pool(mds->get_metadata_pool());
       is_full = pi && pi->has_flag(pg_pool_t::FLAG_FULL);
       dout(7) << __func__ << ": full = " << is_full << " epoch = "
 	      << o.get_epoch() << dendl;
@@ -3327,6 +3327,9 @@ CInode* Server::prepare_new_inode(MDRequestRef& mdr, CDir *dir, inodeno_t useino
     auto _xattrs = CInode::allocate_xattr_map();
     decode_noshare(*_xattrs, p);
     dout(10) << "prepare_new_inode setting xattrs " << *_xattrs << dendl;
+    if (_xattrs->count("encryption.ctx")) {
+      _inode->fscrypt = true;
+    }
     in->reset_xattrs(std::move(_xattrs));
   }
 
@@ -3899,6 +3902,19 @@ void Server::handle_client_lookup_ino(MDRequestRef& mdr,
     return _lookup_snap_ino(mdr);
 
   inodeno_t ino = req->get_filepath().get_ino();
+  auto _ino = ino.val;
+
+  /* It's been observed [1] that a client may lookup a private ~mdsdir inode.
+   * I do not have an explanation for how that happened organically but this
+   * check will ensure that the client can no longer do that.
+   *
+   * [1] https://tracker.ceph.com/issues/49922
+   */
+  if (MDS_IS_PRIVATE_INO(_ino)) {
+    respond_to_request(mdr, -CEPHFS_ESTALE);
+    return;
+  }
+
   CInode *in = mdcache->get_inode(ino);
   if (in && in->state_test(CInode::STATE_PURGING)) {
     respond_to_request(mdr, -CEPHFS_ESTALE);
@@ -4019,7 +4035,7 @@ void Server::_lookup_snap_ino(MDRequestRef& mdr)
   if (parent_ino) {
     diri = mdcache->get_inode(parent_ino);
     if (!diri) {
-      mdcache->open_ino(parent_ino, mds->mdsmap->get_metadata_pool(), new C_MDS_LookupIno2(this, mdr));
+      mdcache->open_ino(parent_ino, mds->get_metadata_pool(), new C_MDS_LookupIno2(this, mdr));
       return;
     }
 
@@ -4051,7 +4067,7 @@ void Server::_lookup_snap_ino(MDRequestRef& mdr)
 
     respond_to_request(mdr, -CEPHFS_ESTALE);
   } else {
-    mdcache->open_ino(vino.ino, mds->mdsmap->get_metadata_pool(), new C_MDS_LookupIno2(this, mdr), false);
+    mdcache->open_ino(vino.ino, mds->get_metadata_pool(), new C_MDS_LookupIno2(this, mdr), false);
   }
 }
 
@@ -5704,6 +5720,10 @@ void Server::handle_set_vxattr(MDRequestRef& mdr, CInode *cur)
     try {
       rank = boost::lexical_cast<mds_rank_t>(value);
       if (rank < 0) rank = MDS_RANK_NONE;
+      else if (rank >= MAX_MDS) {
+        respond_to_request(mdr, -CEPHFS_EDOM);
+        return;
+      }
     } catch (boost::bad_lexical_cast const&) {
       dout(10) << "bad vxattr value, unable to parse int for " << name << dendl;
       respond_to_request(mdr, -CEPHFS_EINVAL);

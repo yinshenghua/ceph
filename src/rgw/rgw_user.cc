@@ -46,10 +46,10 @@ void rgw_get_anon_user(RGWUserInfo& info)
   info.access_keys.clear();
 }
 
-int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::RGWStore* store,
-			    rgw::sal::RGWUser* user, optional_yield y)
+int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::Store* store,
+			    rgw::sal::User* user, optional_yield y)
 {
-  rgw::sal::RGWBucketList user_buckets;
+  rgw::sal::BucketList user_buckets;
 
   CephContext *cct = store->ctx();
   size_t max_entries = cct->_conf->rgw_list_buckets_max_chunk;
@@ -73,7 +73,7 @@ int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::RGWStore* s
         ldpp_dout(dpp, 0) << "ERROR: could not read bucket info: bucket=" << bucket << " ret=" << ret << dendl;
         continue;
       }
-      ret = bucket->sync_user_stats(y);
+      ret = bucket->sync_user_stats(dpp, y);
       if (ret < 0) {
         ldout(cct, 0) << "ERROR: could not sync bucket stats: ret=" << ret << dendl;
         return ret;
@@ -85,7 +85,7 @@ int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::RGWStore* s
     }
   } while (user_buckets.is_truncated());
 
-  ret = user->complete_flush_stats(y);
+  ret = user->complete_flush_stats(dpp, y);
   if (ret < 0) {
     cerr << "ERROR: failed to complete syncing user stats: ret=" << ret << std::endl;
     return ret;
@@ -95,8 +95,8 @@ int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::RGWStore* s
 }
 
 int rgw_user_get_all_buckets_stats(const DoutPrefixProvider *dpp,
-				   rgw::sal::RGWStore *store,
-				   rgw::sal::RGWUser* user,
+				   rgw::sal::Store* store,
+				   rgw::sal::User* user,
 				   map<string, cls_user_bucket_entry>& buckets_usage_map,
 				   optional_yield y)
 {
@@ -107,7 +107,7 @@ int rgw_user_get_all_buckets_stats(const DoutPrefixProvider *dpp,
   int ret;
 
   do {
-    rgw::sal::RGWBucketList buckets;
+    rgw::sal::BucketList buckets;
     ret = user->list_buckets(dpp, marker, string(), max_entries, false, buckets, y);
     if (ret < 0) {
       ldpp_dout(dpp, 0) << "failed to read user buckets: ret=" << ret << dendl;
@@ -387,7 +387,7 @@ int RGWAccessKeyPool::init(RGWUserAdminOpState& op_state)
   return 0;
 }
 
-RGWUserAdminOpState::RGWUserAdminOpState(rgw::sal::RGWStore* store)
+RGWUserAdminOpState::RGWUserAdminOpState(rgw::sal::Store* store)
 {
   user = store->get_user(rgw_user(RGW_USER_ANON_ID));
 }
@@ -613,7 +613,7 @@ int RGWAccessKeyPool::generate_key(const DoutPrefixProvider *dpp, RGWUserAdminOp
 
   std::pair<std::string, RGWAccessKey> key_pair;
   RGWAccessKey new_key;
-  std::unique_ptr<rgw::sal::RGWUser> duplicate_check;
+  std::unique_ptr<rgw::sal::User> duplicate_check;
 
   int key_type = op_state.get_key_type();
   bool gen_access = op_state.will_gen_access();
@@ -1420,7 +1420,7 @@ RGWUser::RGWUser() : caps(this), keys(this), subusers(this)
   init_default();
 }
 
-int RGWUser::init(const DoutPrefixProvider *dpp, rgw::sal::RGWStore *storage,
+int RGWUser::init(const DoutPrefixProvider *dpp, rgw::sal::Store* storage,
 		  RGWUserAdminOpState& op_state, optional_yield y)
 {
   init_default();
@@ -1444,7 +1444,7 @@ void RGWUser::init_default()
   clear_populated();
 }
 
-int RGWUser::init_storage(rgw::sal::RGWStore *storage)
+int RGWUser::init_storage(rgw::sal::Store* storage)
 {
   if (!storage) {
     return -EINVAL;
@@ -1477,7 +1477,7 @@ int RGWUser::init(const DoutPrefixProvider *dpp, RGWUserAdminOpState& op_state, 
     access_key.clear();
   }
 
-  std::unique_ptr<rgw::sal::RGWUser> user;
+  std::unique_ptr<rgw::sal::User> user;
 
   clear_populated();
 
@@ -1491,7 +1491,7 @@ int RGWUser::init(const DoutPrefixProvider *dpp, RGWUserAdminOpState& op_state, 
 
   if (!user_id.empty() && (user_id.compare(RGW_USER_ANON_ID) != 0)) {
     user = store->get_user(user_id);
-    found = (user->load_by_id(dpp, y) >= 0);
+    found = (user->load_user(dpp, y) >= 0);
     op_state.found_by_uid = found;
   }
   if (store->ctx()->_conf.get_val<bool>("rgw_user_unique_email")) {
@@ -1556,7 +1556,7 @@ int RGWUser::update(const DoutPrefixProvider *dpp, RGWUserAdminOpState& op_state
 {
   int ret;
   std::string subprocess_msg;
-  rgw::sal::RGWUser* user = op_state.get_user();
+  rgw::sal::User* user = op_state.get_user();
 
   if (!store) {
     set_err_msg(err_msg, "couldn't initialize storage");
@@ -1565,9 +1565,8 @@ int RGWUser::update(const DoutPrefixProvider *dpp, RGWUserAdminOpState& op_state
 
   RGWUserInfo *pold_info = (is_populated() ? &old_info : nullptr);
 
-  ret = user->store_info(dpp, y, RGWUserCtl::PutParams()
-			 .set_old_info(pold_info)
-			 .set_objv_tracker(&op_state.objv));
+  ret = user->store_user(dpp, y, false, pold_info);
+  op_state.objv = user->get_version_tracker();
   if (ret < 0) {
     set_err_msg(err_msg, "unable to store user info");
     return ret;
@@ -1651,8 +1650,8 @@ int RGWUser::execute_rename(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
     }
   }
 
-  std::unique_ptr<rgw::sal::RGWUser> old_user = store->get_user(op_state.get_user_info().user_id);
-  std::unique_ptr<rgw::sal::RGWUser> new_user = store->get_user(op_state.get_new_uid());
+  std::unique_ptr<rgw::sal::User> old_user = store->get_user(op_state.get_user_info().user_id);
+  std::unique_ptr<rgw::sal::User> new_user = store->get_user(op_state.get_new_uid());
   if (old_user->get_tenant() != new_user->get_tenant()) {
     set_err_msg(err_msg, "users have to be under the same tenant namespace "
                 + old_user->get_tenant() + " != " + new_user->get_tenant());
@@ -1660,15 +1659,12 @@ int RGWUser::execute_rename(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
   }
 
   // create a stub user and write only the uid index and buckets object
-  std::unique_ptr<rgw::sal::RGWUser> user;
+  std::unique_ptr<rgw::sal::User> user;
   user = store->get_user(new_user->get_id());
 
-  RGWObjVersionTracker objv;
   const bool exclusive = !op_state.get_overwrite_new_user(); // overwrite if requested
 
-  ret = user->store_info(dpp, y, RGWUserCtl::PutParams()
-			    .set_objv_tracker(&objv)
-			    .set_exclusive(exclusive));
+  ret = user->store_user(dpp, y, exclusive);
   if (ret == -EEXIST) {
     set_err_msg(err_msg, "user name given by --new-uid already exists");
     return ret;
@@ -1685,7 +1681,7 @@ int RGWUser::execute_rename(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
   string marker;
   CephContext *cct = store->ctx();
   size_t max_buckets = cct->_conf->rgw_list_buckets_max_chunk;
-  rgw::sal::RGWBucketList buckets;
+  rgw::sal::BucketList buckets;
 
   do {
     ret = old_user->list_buckets(dpp, marker, "", max_buckets, false, buckets, y);
@@ -1712,12 +1708,6 @@ int RGWUser::execute_rename(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
         return ret;
       }
 
-      ret = bucket->link(dpp, new_user.get(), y);
-      if (ret < 0) {
-        set_err_msg(err_msg, "failed to link bucket " + bucket->get_name());
-        return ret;
-      }
-
       ret = bucket->chown(dpp, new_user.get(), old_user.get(), y);
       if (ret < 0) {
         set_err_msg(err_msg, "failed to run bucket chown" + cpp_strerror(-ret));
@@ -1731,7 +1721,7 @@ int RGWUser::execute_rename(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
   // associated index objects
   RGWUserInfo& user_info = op_state.get_user_info();
   user_info.user_id = new_user->get_id();
-  op_state.objv = objv;
+  op_state.objv = user->get_version_tracker();
 
   rename_swift_keys(new_user->get_id(), user_info.swift_keys);
 
@@ -1914,14 +1904,14 @@ int RGWUser::execute_remove(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
   int ret;
 
   bool purge_data = op_state.will_purge_data();
-  rgw::sal::RGWUser* user = op_state.get_user();
+  rgw::sal::User* user = op_state.get_user();
 
   if (!op_state.has_existing_user()) {
     set_err_msg(err_msg, "user does not exist");
     return -ENOENT;
   }
 
-  rgw::sal::RGWBucketList buckets;
+  rgw::sal::BucketList buckets;
   string marker;
   CephContext *cct = store->ctx();
   size_t max_buckets = cct->_conf->rgw_list_buckets_max_chunk;
@@ -1951,7 +1941,7 @@ int RGWUser::execute_remove(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
 
   } while (buckets.is_truncated());
 
-  ret = user->remove_info(dpp, y, RGWUserCtl::RemoveParams().set_objv_tracker(&op_state.objv));
+  ret = user->remove_user(dpp, y);
   if (ret < 0) {
     set_err_msg(err_msg, "unable to remove user from RADOS");
     return ret;
@@ -1992,7 +1982,7 @@ int RGWUser::execute_modify(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
   std::string display_name = op_state.get_display_name();
 
   RGWUserInfo user_info;
-  std::unique_ptr<rgw::sal::RGWUser> duplicate_check;
+  std::unique_ptr<rgw::sal::User> duplicate_check;
 
   // ensure that the user info has been populated or is populate-able
   if (!op_state.has_existing_user() && !populated) {
@@ -2068,7 +2058,7 @@ int RGWUser::execute_modify(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
     __u8 suspended = op_state.get_suspension_status();
     user_info.suspended = suspended;
 
-    rgw::sal::RGWBucketList buckets;
+    rgw::sal::BucketList buckets;
 
     if (user_id.empty()) {
       set_err_msg(err_msg, "empty user id passed...aborting");
@@ -2078,7 +2068,7 @@ int RGWUser::execute_modify(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
     string marker;
     CephContext *cct = store->ctx();
     size_t max_buckets = cct->_conf->rgw_list_buckets_max_chunk;
-    std::unique_ptr<rgw::sal::RGWUser> user = store->get_user(user_id);
+    std::unique_ptr<rgw::sal::User> user = store->get_user(user_id);
     do {
       ret = user->list_buckets(dpp, marker, string(), max_buckets, false, buckets, y);
       if (ret < 0) {
@@ -2188,7 +2178,7 @@ int RGWUser::info(RGWUserInfo& fetched_info, std::string *err_msg)
   return 0;
 }
 
-int RGWUser::list(RGWUserAdminOpState& op_state, RGWFormatterFlusher& flusher)
+int RGWUser::list(const DoutPrefixProvider *dpp, RGWUserAdminOpState& op_state, RGWFormatterFlusher& flusher)
 {
   Formatter *formatter = flusher.get_formatter();
   void *handle = nullptr;
@@ -2197,7 +2187,7 @@ int RGWUser::list(RGWUserAdminOpState& op_state, RGWFormatterFlusher& flusher)
     op_state.max_entries = 1000;
   }
 
-  int ret = store->meta_list_keys_init(metadata_key, op_state.marker, &handle);
+  int ret = store->meta_list_keys_init(dpp, metadata_key, op_state.marker, &handle);
   if (ret < 0) {
     return ret;
   }
@@ -2243,7 +2233,7 @@ int RGWUser::list(RGWUserAdminOpState& op_state, RGWFormatterFlusher& flusher)
   return 0;
 }
 
-int RGWUserAdminOp_User::list(rgw::sal::RGWStore *store, RGWUserAdminOpState& op_state,
+int RGWUserAdminOp_User::list(const DoutPrefixProvider *dpp, rgw::sal::Store* store, RGWUserAdminOpState& op_state,
                   RGWFormatterFlusher& flusher)
 {
   RGWUser user;
@@ -2252,7 +2242,7 @@ int RGWUserAdminOp_User::list(rgw::sal::RGWStore *store, RGWUserAdminOpState& op
   if (ret < 0)
     return ret;
 
-  ret = user.list(op_state, flusher);
+  ret = user.list(dpp, op_state, flusher);
   if (ret < 0)
     return ret;
 
@@ -2260,13 +2250,13 @@ int RGWUserAdminOp_User::list(rgw::sal::RGWStore *store, RGWUserAdminOpState& op
 }
 
 int RGWUserAdminOp_User::info(const DoutPrefixProvider *dpp,
-			      rgw::sal::RGWStore *store, RGWUserAdminOpState& op_state,
+			      rgw::sal::Store* store, RGWUserAdminOpState& op_state,
 			      RGWFormatterFlusher& flusher,
 			      optional_yield y)
 {
   RGWUserInfo info;
   RGWUser user;
-  std::unique_ptr<rgw::sal::RGWUser> ruser;
+  std::unique_ptr<rgw::sal::User> ruser;
 
   int ret = user.init(dpp, store, op_state, y);
   if (ret < 0)
@@ -2293,7 +2283,7 @@ int RGWUserAdminOp_User::info(const DoutPrefixProvider *dpp,
   RGWStorageStats stats;
   RGWStorageStats *arg_stats = NULL;
   if (op_state.fetch_stats) {
-    int ret = ruser->read_stats(y, &stats);
+    int ret = ruser->read_stats(dpp, y, &stats);
     if (ret < 0 && ret != -ENOENT) {
       return ret;
     }
@@ -2312,7 +2302,7 @@ int RGWUserAdminOp_User::info(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_User::create(const DoutPrefixProvider *dpp,
-				rgw::sal::RGWStore *store,
+				rgw::sal::Store* store,
 				RGWUserAdminOpState& op_state,
 				RGWFormatterFlusher& flusher, optional_yield y)
 {
@@ -2346,7 +2336,7 @@ int RGWUserAdminOp_User::create(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_User::modify(const DoutPrefixProvider *dpp,
-				rgw::sal::RGWStore *store,
+				rgw::sal::Store* store,
 				RGWUserAdminOpState& op_state,
 				RGWFormatterFlusher& flusher, optional_yield y)
 {
@@ -2379,7 +2369,7 @@ int RGWUserAdminOp_User::modify(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_User::remove(const DoutPrefixProvider *dpp,
-				rgw::sal::RGWStore *store, RGWUserAdminOpState& op_state,
+				rgw::sal::Store* store, RGWUserAdminOpState& op_state,
 				RGWFormatterFlusher& flusher, optional_yield y)
 {
   RGWUserInfo info;
@@ -2397,7 +2387,7 @@ int RGWUserAdminOp_User::remove(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_Subuser::create(const DoutPrefixProvider *dpp,
-				   rgw::sal::RGWStore *store,
+				   rgw::sal::Store* store,
 				   RGWUserAdminOpState& op_state,
 				   RGWFormatterFlusher& flusher,
 				   optional_yield y)
@@ -2432,7 +2422,7 @@ int RGWUserAdminOp_Subuser::create(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_Subuser::modify(const DoutPrefixProvider *dpp,
-				   rgw::sal::RGWStore *store, RGWUserAdminOpState& op_state,
+				   rgw::sal::Store* store, RGWUserAdminOpState& op_state,
 				   RGWFormatterFlusher& flusher, optional_yield y)
 {
   RGWUserInfo info;
@@ -2465,7 +2455,7 @@ int RGWUserAdminOp_Subuser::modify(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_Subuser::remove(const DoutPrefixProvider *dpp,
-				   rgw::sal::RGWStore *store,
+				   rgw::sal::Store* store,
 				   RGWUserAdminOpState& op_state,
 				   RGWFormatterFlusher& flusher,
 				   optional_yield y)
@@ -2488,7 +2478,7 @@ int RGWUserAdminOp_Subuser::remove(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_Key::create(const DoutPrefixProvider *dpp,
-			       rgw::sal::RGWStore *store, RGWUserAdminOpState& op_state,
+			       rgw::sal::Store* store, RGWUserAdminOpState& op_state,
 			       RGWFormatterFlusher& flusher,
 			       optional_yield y)
 {
@@ -2529,7 +2519,7 @@ int RGWUserAdminOp_Key::create(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_Key::remove(const DoutPrefixProvider *dpp,
-			       rgw::sal::RGWStore *store,
+			       rgw::sal::Store* store,
 			       RGWUserAdminOpState& op_state,
 			       RGWFormatterFlusher& flusher,
 			       optional_yield y)
@@ -2552,7 +2542,7 @@ int RGWUserAdminOp_Key::remove(const DoutPrefixProvider *dpp,
 }
 
 int RGWUserAdminOp_Caps::add(const DoutPrefixProvider *dpp,
-			     rgw::sal::RGWStore *store,
+			     rgw::sal::Store* store,
 			     RGWUserAdminOpState& op_state,
 			     RGWFormatterFlusher& flusher, optional_yield y)
 {
@@ -2587,7 +2577,7 @@ int RGWUserAdminOp_Caps::add(const DoutPrefixProvider *dpp,
 
 
 int RGWUserAdminOp_Caps::remove(const DoutPrefixProvider *dpp,
-				rgw::sal::RGWStore *store,
+				rgw::sal::Store* store,
 				RGWUserAdminOpState& op_state,
 				RGWFormatterFlusher& flusher, optional_yield y)
 {
@@ -2887,24 +2877,26 @@ int RGWUserCtl::remove_info(const DoutPrefixProvider *dpp,
   });
 }
 
-int RGWUserCtl::add_bucket(const rgw_user& user,
+int RGWUserCtl::add_bucket(const DoutPrefixProvider *dpp, 
+                           const rgw_user& user,
                            const rgw_bucket& bucket,
                            ceph::real_time creation_time,
 			   optional_yield y)
 
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->add_bucket(op->ctx(), user, bucket, creation_time, y);
+    return svc.user->add_bucket(dpp, op->ctx(), user, bucket, creation_time, y);
   });
 }
 
-int RGWUserCtl::remove_bucket(const rgw_user& user,
+int RGWUserCtl::remove_bucket(const DoutPrefixProvider *dpp, 
+                              const rgw_user& user,
                               const rgw_bucket& bucket,
 			      optional_yield y)
 
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->remove_bucket(op->ctx(), user, bucket, y);
+    return svc.user->remove_bucket(dpp, op->ctx(), user, bucket, y);
   });
 }
 
@@ -2924,7 +2916,7 @@ int RGWUserCtl::list_buckets(const DoutPrefixProvider *dpp,
   }
 
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    int ret = svc.user->list_buckets(op->ctx(), user, marker, end_marker,
+    int ret = svc.user->list_buckets(dpp, op->ctx(), user, marker, end_marker,
                                      max, buckets, is_truncated, y);
     if (ret < 0) {
       return ret;
@@ -2941,44 +2933,46 @@ int RGWUserCtl::list_buckets(const DoutPrefixProvider *dpp,
   });
 }
 
-int RGWUserCtl::flush_bucket_stats(const rgw_user& user,
+int RGWUserCtl::flush_bucket_stats(const DoutPrefixProvider *dpp, 
+                                   const rgw_user& user,
                                    const RGWBucketEnt& ent,
 				   optional_yield y)
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->flush_bucket_stats(op->ctx(), user, ent, y);
+    return svc.user->flush_bucket_stats(dpp, op->ctx(), user, ent, y);
   });
 }
 
-int RGWUserCtl::complete_flush_stats(const rgw_user& user, optional_yield y)
+int RGWUserCtl::complete_flush_stats(const DoutPrefixProvider *dpp, const rgw_user& user, optional_yield y)
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->complete_flush_stats(op->ctx(), user, y);
+    return svc.user->complete_flush_stats(dpp, op->ctx(), user, y);
   });
 }
 
-int RGWUserCtl::reset_stats(const rgw_user& user, optional_yield y)
+int RGWUserCtl::reset_stats(const DoutPrefixProvider *dpp, const rgw_user& user, optional_yield y)
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->reset_bucket_stats(op->ctx(), user, y);
+    return svc.user->reset_bucket_stats(dpp, op->ctx(), user, y);
   });
 }
 
-int RGWUserCtl::read_stats(const rgw_user& user, RGWStorageStats *stats,
+int RGWUserCtl::read_stats(const DoutPrefixProvider *dpp, 
+                           const rgw_user& user, RGWStorageStats *stats,
 			   optional_yield y,
 			   ceph::real_time *last_stats_sync,
 			   ceph::real_time *last_stats_update)
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->read_stats(op->ctx(), user, stats,
+    return svc.user->read_stats(dpp, op->ctx(), user, stats,
 				last_stats_sync, last_stats_update, y);
   });
 }
 
-int RGWUserCtl::read_stats_async(const rgw_user& user, RGWGetUserStats_CB *cb)
+int RGWUserCtl::read_stats_async(const DoutPrefixProvider *dpp, const rgw_user& user, RGWGetUserStats_CB *cb)
 {
   return be_handler->call([&](RGWSI_MetaBackend_Handler::Op *op) {
-    return svc.user->read_stats_async(op->ctx(), user, cb);
+    return svc.user->read_stats_async(dpp, op->ctx(), user, cb);
   });
 }
 

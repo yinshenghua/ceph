@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <algorithm>
 #include <sys/time.h>
+#include <sys/file.h>
 
 #include "common/admin_socket.h"
 #include "common/ceph_context.h"
@@ -425,7 +426,7 @@ int PeerReplayer::build_snap_map(const std::string &dir_path,
   while (entry != NULL) {
     auto d_name = std::string(entry->d_name);
     dout(20) << ": entry=" << d_name << dendl;
-    if (d_name != "." && d_name != "..") {
+    if (d_name != "." && d_name != ".." && d_name.rfind("_", 0) != 0) {
       snaps.emplace(d_name);
     }
 

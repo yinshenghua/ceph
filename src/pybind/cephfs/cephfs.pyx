@@ -622,6 +622,24 @@ cdef class LibCephFS(object):
         if ret != 0:
             raise make_ex(ret, "error calling conf_set")
 
+    def set_mount_timeout(self, timeout):
+        """
+        Set mount timeout
+
+        :param timeout: mount timeout
+        """
+        self.require_state("configuring", "initialized")
+        if not isinstance(timeout, int):
+            raise TypeError('timeout must be an integer')
+        if timeout < 0:
+            raise make_ex(CEPHFS_EINVAL, 'timeout must be greater than or equal to 0')
+        cdef:
+            uint32_t _timeout = timeout
+        with nogil:
+            ret = ceph_set_mount_timeout(self.cluster, _timeout)
+        if ret != 0:
+            raise make_ex(ret, "error setting mount timeout")
+
     def init(self):
         """
         Initialize the filesystem client (but do not mount the filesystem yet)
@@ -2581,9 +2599,9 @@ cdef class LibCephFS(object):
 
     def get_layout(self, fd):
         """
-        Set ceph client session timeout. Must be called before mount.
+        Get the file layout from an open file descriptor.
 
-        :param fd: file descriptor of the file/directory for which to get the layout
+        :param fd: the open file descriptor referring to the file to get the layout of.
         """
 
         if not isinstance(fd, int):

@@ -19,7 +19,6 @@ namespace crimson::os::seastore::onode {
 
 using crimson::os::seastore::Transaction;
 using crimson::os::seastore::TransactionRef;
-using crimson::os::seastore::make_transaction;
 using crimson::os::seastore::laddr_t;
 using crimson::os::seastore::L_ADDR_MIN;
 using crimson::os::seastore::L_ADDR_NULL;
@@ -74,8 +73,13 @@ inline MatchKindCMP toMatchKindCMP(int value) {
 }
 template <typename Type>
 MatchKindCMP toMatchKindCMP(const Type& l, const Type& r) {
-  int match = l - r;
-  return toMatchKindCMP(match);
+  if (l > r) {
+    return MatchKindCMP::GT;
+  } else if (l < r) {
+    return MatchKindCMP::LT;
+  } else {
+    return MatchKindCMP::EQ;
+  }
 }
 
 inline MatchKindCMP toMatchKindCMP(

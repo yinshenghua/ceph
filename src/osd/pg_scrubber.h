@@ -412,10 +412,6 @@ class PgScrubber : public ScrubPgIF, public ScrubMachineListener {
 
   [[nodiscard]] bool is_scrub_active() const final { return m_active; }
 
-  [[nodiscard]] bool get_reserve_failed() const final { return m_reserve_failed; }
-  void set_reserve_failed() final { m_reserve_failed = true; }
-  void clear_reserve_failed() final { m_reserve_failed = false; }
-
  private:
   void reset_internal_state();
 
@@ -540,9 +536,6 @@ class PgScrubber : public ScrubPgIF, public ScrubMachineListener {
 
   bool m_active{false};
 
-  // This PG could not get all the scrub reservations
-  bool m_reserve_failed{false};
-
   eversion_t m_subset_last_update{};
 
   std::unique_ptr<Scrub::Store> m_store;
@@ -566,7 +559,7 @@ class PgScrubber : public ScrubPgIF, public ScrubMachineListener {
   /// Maps from objects with errors to missing peers
   HobjToShardSetMapping m_missing;
 
- private:
+ protected:
   /**
    * 'm_is_deep' - is the running scrub a deep one?
    *
@@ -576,6 +569,33 @@ class PgScrubber : public ScrubPgIF, public ScrubMachineListener {
    * building the scrub maps.
    */
   bool m_is_deep{false};
+
+  /**
+   * If set: affects the backend & scrubber-backend functions called after all
+   * scrub maps are available.
+   *
+   * Replaces code that directly checks PG_STATE_REPAIR (which was meant to be
+   * a "user facing" status display only).
+   */
+  bool m_is_repair{false};
+
+  /**
+   * User-readable summary of the scrubber's current mode of operation. Used for
+   * both osd.*.log and the cluster log.
+   * One of:
+   *    "repair"
+   *    "deep-scrub",
+   *    "scrub
+   *
+   * Note: based on PG_STATE_REPAIR, and not on m_is_repair. I.e. for
+   * auto_repair will show as "deep-scrub" and not as "repair" (until the first error
+   * is detected).
+   */
+  std::string_view m_mode_desc;
+
+  void update_op_mode_text();
+
+private:
 
   /**
    * initiate a deep-scrub after the current scrub ended with errors.

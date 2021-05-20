@@ -153,6 +153,12 @@ if(NOT WIN32)
   target_link_libraries(ceph_bench_log rt)
 endif()
 
+if(WITH_SYSTEMD)
+  add_executable(ceph_bench_journald_logger
+    bench_journald_logger.cc)
+  target_link_libraries(ceph_bench_journald_logger ceph-common)
+endif()
+
 # ceph_test_mutate
 add_executable(ceph_test_mutate
   test_mutate.cc
@@ -269,9 +275,6 @@ if(${WITH_RADOSGW})
 add_executable(ceph_test_librgw_file
   librgw_file.cc
   )
-if(WITH_RADOSGW_FCGI_FRONTEND)
-target_include_directories(ceph_test_librgw_file SYSTEM PRIVATE ${FCGI_INCLUDE_DIR})
-endif(WITH_RADOSGW_FCGI_FRONTEND)
 target_link_libraries(ceph_test_librgw_file
   rgw
   librados
@@ -312,9 +315,6 @@ add_executable(ceph_test_librgw_file_nfsns
   librgw_file_nfsns.cc
   )
 target_include_directories(ceph_test_librgw_file_nfsns SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
-if(WITH_RADOSGW_FCGI_FRONTEND)
-target_include_directories(ceph_test_librgw_file_nfsns SYSTEM PRIVATE ${FCGI_INCLUDE_DIR})
-endif(WITH_RADOSGW_FCGI_FRONTEND)
 target_link_libraries(ceph_test_librgw_file_nfsns
   rgw
   librados
@@ -472,6 +472,20 @@ install(TARGETS
   ceph_test_stress_watch
   DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+add_executable(ceph_test_c2c
+  test_c2c.cc
+  )
+target_link_libraries(ceph_test_c2c
+  global
+  ceph-common
+  pthread
+  ${EXTRALIBS}
+  ${CMAKE_DL_LIBS}
+  )
+install(TARGETS
+  ceph_test_c2c
+  DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 if(WITH_FUSE)
   add_executable(ceph_test_cfuse_cache_invalidate
     test_cfuse_cache_invalidate.cc
@@ -531,6 +545,7 @@ if(NOT WIN32)
   ceph-mon
   get_command_descriptions
   ceph-dencoder
+  ceph-dencoder-modules
   ceph-objectstore-tool
   ceph-kvstore-tool
   ceph-monstore-tool
@@ -605,8 +620,10 @@ if(PROMTOOL_EXECUTABLE)
       "please use a newer prometheus")
   endif()
 else()
-  add_ceph_test(run-promtool-unittests
-    {CMAKE_CURRENT_SOURCE_DIR}/run-promtool-unittests.sh)
+  if(LINUX)
+    add_ceph_test(run-promtool-unittests
+      {CMAKE_CURRENT_SOURCE_DIR}/run-promtool-unittests.sh)
+  endif()
 endif()
 
 set_property(

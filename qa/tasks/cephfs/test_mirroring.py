@@ -234,25 +234,11 @@ class TestMirroring(CephFSTestCase):
         log.debug(f'command returned={res}')
         return json.loads(res)
 
-    def get_mirror_daemon_id(self):
-        ceph_status = json.loads(self.fs.mon_manager.raw_cluster_cmd("status", "--format=json"))
-        log.debug(f'ceph_status: {ceph_status}')
-        daemon_id = None
-        for k in ceph_status['servicemap']['services']['cephfs-mirror']['daemons']:
-            try:
-                daemon_id = int(k)
-                break #nit, only a single mirror daemon is expected -- bail out.
-            except ValueError:
-                pass
-
-        log.debug(f'daemon_id: {daemon_id}')
-        self.assertTrue(daemon_id is not None)
-        return daemon_id
-
-    def get_mirror_daemon_status(self, daemon_id, fs_name, fs_id):
+    def get_mirror_daemon_status(self, fs_name, fs_id):
         daemon_status = json.loads(self.mgr_cluster.mon_manager.raw_cluster_cmd("fs", "snapshot", "mirror", "daemon", "status", fs_name))
         log.debug(f'daemon_status: {daemon_status}')
-        status = daemon_status[str(daemon_id)][str(fs_id)]
+        # running a single mirror daemon is supported
+        status = daemon_status[0]
         log.debug(f'status: {status}')
         return status
 
@@ -666,48 +652,52 @@ class TestMirroring(CephFSTestCase):
     def test_cephfs_mirror_service_daemon_status(self):
         self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
         self.peer_add(self.primary_fs_name, self.primary_fs_id, "client.mirror_remote@ceph", self.secondary_fs_name)
-        peer_uuid = self.get_peer_uuid("client.mirror_remote@ceph")
-
-        daemon_id = self.get_mirror_daemon_id()
 
         time.sleep(30)
-        status = self.get_mirror_daemon_status(daemon_id, self.primary_fs_name, self.primary_fs_id)
+        status = self.get_mirror_daemon_status(self.primary_fs_name, self.primary_fs_id)
+
+        # assumption for this test: mirroring enabled for a single filesystem w/ single
+        # peer
 
         # we have not added any directories
-        self.assertEquals(status['directory_count'], 0)
-
-        peer_stats = status['peers'][peer_uuid]['stats']
-        self.assertEquals(peer_stats['failure_count'], 0)
-        self.assertEquals(peer_stats['recovery_count'], 0)
+        peer = status['filesystems'][0]['peers'][0]
+        self.assertEquals(status['filesystems'][0]['directory_count'], 0)
+        self.assertEquals(peer['stats']['failure_count'], 0)
+        self.assertEquals(peer['stats']['recovery_count'], 0)
 
         # add a non-existent directory for synchronization -- check if its reported
         # in daemon stats
         self.add_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
 
         time.sleep(120)
-        status = self.get_mirror_daemon_status(daemon_id, self.primary_fs_name, self.primary_fs_id)
+        status = self.get_mirror_daemon_status(self.primary_fs_name, self.primary_fs_id)
         # we added one
-        self.assertEquals(status['directory_count'], 1)
-        peer_stats = status['peers'][peer_uuid]['stats']
+        peer = status['filesystems'][0]['peers'][0]
+        self.assertEquals(status['filesystems'][0]['directory_count'], 1)
         # failure count should be reflected
-        self.assertEquals(peer_stats['failure_count'], 1)
-        self.assertEquals(peer_stats['recovery_count'], 0)
+        self.assertEquals(peer['stats']['failure_count'], 1)
+        self.assertEquals(peer['stats']['recovery_count'], 0)
 
         # create the directory, mirror daemon would recover
         self.mount_a.run_shell(["mkdir", "d0"])
 
         time.sleep(120)
-        status = self.get_mirror_daemon_status(daemon_id, self.primary_fs_name, self.primary_fs_id)
-        self.assertEquals(status['directory_count'], 1)
-        peer_stats = status['peers'][peer_uuid]['stats']
+        status = self.get_mirror_daemon_status(self.primary_fs_name, self.primary_fs_id)
+        peer = status['filesystems'][0]['peers'][0]
+        self.assertEquals(status['filesystems'][0]['directory_count'], 1)
         # failure and recovery count should be reflected
-        self.assertEquals(peer_stats['failure_count'], 1)
-        self.assertEquals(peer_stats['recovery_count'], 1)
+        self.assertEquals(peer['stats']['failure_count'], 1)
+        self.assertEquals(peer['stats']['recovery_count'], 1)
 
         self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
 
     def test_mirroring_init_failure(self):
         """Test mirror daemon init failure"""
+
+        # disable mgr mirroring plugin as it would try to load dir map on
+        # on mirroring enabled for a filesystem (an throw up erorrs in
+        # the logs)
+        self.disable_mirroring_module()
 
         # enable mirroring through mon interface -- this should result in the mirror daemon
         # failing to enable mirroring due to absence of `cephfs_mirorr` index object.
@@ -740,13 +730,18 @@ class TestMirroring(CephFSTestCase):
     def test_mirroring_init_failure_with_recovery(self):
         """Test if the mirror daemon can recover from a init failure"""
 
+        # disable mgr mirroring plugin as it would try to load dir map on
+        # on mirroring enabled for a filesystem (an throw up erorrs in
+        # the logs)
+        self.disable_mirroring_module()
+
         # enable mirroring through mon interface -- this should result in the mirror daemon
-        # failing to enable mirroring due to absence of `cephfs_mirorr` index object.
+        # failing to enable mirroring due to absence of `cephfs_mirror` index object.
 
         self.mgr_cluster.mon_manager.raw_cluster_cmd("fs", "mirror", "enable", self.primary_fs_name)
         # need safe_while since non-failed status pops up as mirroring is restarted
         # internally in mirror daemon.
-        with safe_while(sleep=5, tries=10, action='wait for failed state') as proceed:
+        with safe_while(sleep=5, tries=20, action='wait for failed state') as proceed:
             while proceed():
                 try:
                     # verify via asok
@@ -842,4 +837,39 @@ class TestMirroring(CephFSTestCase):
         self.verify_snapshot('d0', 'snap0')
 
         self.remove_directory(self.primary_fs_name, self.primary_fs_id, '/d0')
+        self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+    def test_cephfs_mirror_with_parent_snapshot(self):
+        """Test snapshot synchronization with parent directory snapshots"""
+        self.mount_a.run_shell(["mkdir", "-p", "d0/d1/d2/d3"])
+
+        self.enable_mirroring(self.primary_fs_name, self.primary_fs_id)
+        self.add_directory(self.primary_fs_name, self.primary_fs_id, '/d0/d1/d2/d3')
+        self.peer_add(self.primary_fs_name, self.primary_fs_id, "client.mirror_remote@ceph", self.secondary_fs_name)
+
+        # take a snapshot
+        self.mount_a.run_shell(["mkdir", "d0/d1/d2/d3/.snap/snap0"])
+
+        time.sleep(30)
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               "client.mirror_remote@ceph", '/d0/d1/d2/d3', 'snap0', 1)
+
+        # create snapshots in parent directories
+        self.mount_a.run_shell(["mkdir", "d0/.snap/snap_d0"])
+        self.mount_a.run_shell(["mkdir", "d0/d1/.snap/snap_d1"])
+        self.mount_a.run_shell(["mkdir", "d0/d1/d2/.snap/snap_d2"])
+
+        # try syncing more snapshots
+        self.mount_a.run_shell(["mkdir", "d0/d1/d2/d3/.snap/snap1"])
+        time.sleep(30)
+        self.check_peer_status(self.primary_fs_name, self.primary_fs_id,
+                               "client.mirror_remote@ceph", '/d0/d1/d2/d3', 'snap1', 2)
+
+        self.mount_a.run_shell(["rmdir", "d0/d1/d2/d3/.snap/snap0"])
+        self.mount_a.run_shell(["rmdir", "d0/d1/d2/d3/.snap/snap1"])
+        time.sleep(15)
+        self.check_peer_status_deleted_snap(self.primary_fs_name, self.primary_fs_id,
+                                            "client.mirror_remote@ceph", '/d0/d1/d2/d3', 2)
+
+        self.remove_directory(self.primary_fs_name, self.primary_fs_id, '/d0/d1/d2/d3')
         self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
