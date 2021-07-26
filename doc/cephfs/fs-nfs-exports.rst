@@ -1,3 +1,5 @@
+.. _cephfs-nfs:
+
 =======================
 CephFS Exports over NFS
 =======================
@@ -11,12 +13,14 @@ Requirements
 -  ``nfs-ganesha``, ``nfs-ganesha-ceph``, ``nfs-ganesha-rados-grace`` and
    ``nfs-ganesha-rados-urls`` packages (version 3.3 and above)
 
+.. note:: From Pacific, the nfs mgr module must be enabled prior to use.
+
 Create NFS Ganesha Cluster
 ==========================
 
 .. code:: bash
 
-    $ ceph nfs cluster create <clusterid> [<placement>]
+    $ ceph nfs cluster create <clusterid> [<placement>] [--ingress --virtual-ip <ip>]
 
 This creates a common recovery pool for all NFS Ganesha daemons, new user based on
 ``clusterid``, and a common NFS Ganesha config RADOS object.
@@ -45,24 +49,20 @@ cluster)::
 
     "2 host1,host2"
 
+To deploy NFS with an HA front-end (virtual IP and load balancer), add the
+``--ingress`` flag and specify a virtual IP address. This will deploy a combination
+of keepalived and haproxy to provide an high-availability NFS frontend for the NFS
+service.
+
 For more details, refer :ref:`orchestrator-cli-placement-spec` but keep
 in mind that specifying the placement via a YAML file is not supported.
-
-Update NFS Ganesha Cluster
-==========================
-
-.. code:: bash
-
-    $ ceph nfs cluster update <clusterid> <placement>
-
-This updates the deployed cluster according to the placement value.
 
 Delete NFS Ganesha Cluster
 ==========================
 
 .. code:: bash
 
-    $ ceph nfs cluster delete <clusterid>
+    $ ceph nfs cluster rm <clusterid>
 
 This deletes the deployed cluster.
 
@@ -156,8 +156,8 @@ This removes the user defined configuration.
 Create CephFS Export
 ====================
 
-.. warning:: Currently, the volume/nfs interface is not integrated with dashboard. Both
-   dashboard and volume/nfs interface have different export requirements and
+.. warning:: Currently, the nfs interface is not integrated with dashboard. Both
+   dashboard and nfs interface have different export requirements and
    create exports differently. Management of dashboard created exports is not
    supported.
 
@@ -182,12 +182,14 @@ path is '/'. It need not be unique. Subvolume path can be fetched using:
 
    $ ceph fs subvolume getpath <vol_name> <subvol_name> [--group_name <subvol_group_name>]
 
+.. note:: Export creation is supported only for NFS Ganesha clusters deployed using nfs interface.
+
 Delete CephFS Export
 ====================
 
 .. code:: bash
 
-    $ ceph nfs export delete <clusterid> <binding>
+    $ ceph nfs export rm <clusterid> <binding>
 
 This deletes an export in an NFS Ganesha cluster, where:
 
@@ -318,5 +320,24 @@ grace period. The exports can be mounted by
     $ mount -t nfs -o port=<ganesha-port> <ganesha-host-name>:<ganesha-pseudo-path> <mount-point>
 
 .. note:: Only NFS v4.0+ is supported.
+
+Troubleshooting
+===============
+
+Checking NFS-Ganesha logs with
+
+1) ``cephadm``
+
+   .. code:: bash
+
+      $ cephadm logs --fsid <fsid> --name nfs.<cluster_id>.hostname
+
+2) ``rook``
+
+   .. code:: bash
+
+      $ kubectl logs -n rook-ceph rook-ceph-nfs-<cluster_id>-<node_id> nfs-ganesha
+
+Log level can be changed using `nfs cluster config set` command.
 
 .. _NFS-Ganesha NFS Server: https://github.com/nfs-ganesha/nfs-ganesha/wiki

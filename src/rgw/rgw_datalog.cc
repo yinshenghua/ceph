@@ -730,7 +730,7 @@ int DataLogBackends::list(const DoutPrefixProvider *dpp, int shard, int max_entr
     for (auto& g : gentries) {
       g.log_id = gencursor(gen_id, g.log_id);
     }
-    if (gentries.size() > max_entries)
+    if (int s = gentries.size(); s < 0 || s > max_entries)
       max_entries = 0;
     else
       max_entries -= gentries.size();
@@ -805,6 +805,8 @@ int DataLogBackends::trim_entries(const DoutPrefixProvider *dpp, int shard_id, s
       r = -ENODATA;
     if (r == -ENODATA && be->gen_id < target_gen)
       r = 0;
+    if (be->gen_id == target_gen)
+      break;
     l.lock();
   };
   return r;

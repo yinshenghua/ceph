@@ -202,14 +202,6 @@ export class ServiceFormComponent extends CdForm implements OnInit {
         [
           CdValidators.composeIf(
             {
-              service_type: 'rgw',
-              unmanaged: false,
-              ssl: true
-            },
-            [Validators.required, CdValidators.sslPrivKey()]
-          ),
-          CdValidators.composeIf(
-            {
               service_type: 'iscsi',
               unmanaged: false,
               ssl: true
@@ -281,6 +273,13 @@ export class ServiceFormComponent extends CdForm implements OnInit {
     reader.readAsText(file, 'utf8');
   }
 
+  prePopulateId() {
+    const control: AbstractControl = this.serviceForm.get('service_id');
+    const backendService = this.serviceForm.getValue('backend_service');
+    // Set Id as read-only
+    control.reset({ value: backendService, disabled: true });
+  }
+
   onSubmit() {
     const self = this;
     const values: object = this.serviceForm.value;
@@ -324,7 +323,6 @@ export class ServiceFormComponent extends CdForm implements OnInit {
           serviceSpec['ssl'] = values['ssl'];
           if (values['ssl']) {
             serviceSpec['rgw_frontend_ssl_certificate'] = values['ssl_cert'].trim();
-            serviceSpec['rgw_frontend_ssl_key'] = values['ssl_key'].trim();
           }
           break;
         case 'iscsi':
@@ -345,6 +343,7 @@ export class ServiceFormComponent extends CdForm implements OnInit {
           break;
         case 'ingress':
           serviceSpec['backend_service'] = values['backend_service'];
+          serviceSpec['service_id'] = values['backend_service'];
           if (_.isString(values['virtual_ip']) && !_.isEmpty(values['virtual_ip'])) {
             serviceSpec['virtual_ip'] = values['virtual_ip'].trim();
           }

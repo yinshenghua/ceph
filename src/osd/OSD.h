@@ -319,10 +319,7 @@ public:
     std::lock_guard l(sched_scrub_lock);
     if (sched_scrub_pg.empty())
       return false;
-    std::set<ScrubJob>::const_iterator iter = sched_scrub_pg.lower_bound(next);
-    if (iter == sched_scrub_pg.cend())
-      return false;
-    ++iter;
+    std::set<ScrubJob>::const_iterator iter = sched_scrub_pg.upper_bound(next);
     if (iter == sched_scrub_pg.cend())
       return false;
     *out = *iter;
@@ -2065,6 +2062,7 @@ private:
   float get_osd_snap_trim_sleep();
 
   int get_recovery_max_active();
+  bool maybe_override_options_for_qos();
 
   void scrub_purged_snaps();
   void probe_smart(const std::string& devid, std::ostream& ss);

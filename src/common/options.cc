@@ -3204,18 +3204,22 @@ std::vector<Option> get_global_options() {
 
     Option("osd_snap_trim_sleep", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next snap trim (overrides values below)"),
 
     Option("osd_snap_trim_sleep_hdd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(5)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next snap trim for HDDs"),
 
     Option("osd_snap_trim_sleep_ssd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next snap trim for SSDs"),
 
     Option("osd_snap_trim_sleep_hybrid", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(2)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next snap trim when data is on HDD and journal is on SSD"),
 
     Option("osd_scrub_invalid_stats", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -3437,6 +3441,7 @@ std::vector<Option> get_global_options() {
 
     Option("osd_scrub_sleep", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Duration to inject a delay during scrubbing"),
 
     Option("osd_scrub_extended_sleep", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
@@ -3745,18 +3750,22 @@ std::vector<Option> get_global_options() {
 
     Option("osd_delete_sleep", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next removal transaction (overrides values below)"),
 
     Option("osd_delete_sleep_hdd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(5)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next removal transaction for HDDs"),
 
     Option("osd_delete_sleep_ssd", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(1)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next removal transaction for SSDs"),
 
     Option("osd_delete_sleep_hybrid", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(1)
+    .set_flag(Option::FLAG_RUNTIME)
     .set_description("Time in seconds to sleep before next removal transaction when data is on HDD and journal is on SSD"),
 
     Option("osd_failsafe_full_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
@@ -4078,8 +4087,14 @@ std::vector<Option> get_global_options() {
     .add_see_also("bluestore_cache_autotune")
     .add_see_also("osd_memory_cache_min")
     .add_see_also("osd_memory_base")
+    .add_see_also("osd_memory_target_autotune")
     .set_description("When tcmalloc and cache autotuning is enabled, try to keep this many bytes mapped in memory.")
     .set_long_description("The minimum value must be at least equal to osd_memory_base + osd_memory_cache_min."),
+
+    Option("osd_memory_target_autotune", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(false)
+    .add_see_also("osd_memory_target")
+    .set_description("If enabled, allow orchestrator to automatically tune osd_memory_target"),
 
     Option("osd_memory_target_cgroup_limit_ratio", Option::TYPE_FLOAT, Option::LEVEL_ADVANCED)
     .set_default(0.8)
@@ -5471,7 +5486,7 @@ std::vector<Option> get_global_options() {
     .add_see_also("mgr_module_path"),
 
     Option("mgr_initial_modules", Option::TYPE_STR, Option::LEVEL_BASIC)
-    .set_default("restful iostat")
+    .set_default("restful iostat nfs")
     .set_flag(Option::FLAG_NO_MON_UPDATE)
     .set_flag(Option::FLAG_CLUSTER_CREATE)
     .add_service("mon")
@@ -7159,6 +7174,22 @@ std::vector<Option> get_rgw_options() {
       "rgw_crypt_s3_kms_backend",
       "rgw_crypt_vault_auth",
       "rgw_crypt_vault_addr"}),
+
+    Option("rgw_crypt_vault_verify_ssl", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
+    .set_default(true)
+    .set_description("Should RGW verify the vault server SSL certificate."),
+
+    Option("rgw_crypt_vault_ssl_cacert", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("Path for custom ca certificate for accessing vault server"),
+
+    Option("rgw_crypt_vault_ssl_clientcert", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("Path for customed client certificate for accessing vault server"),
+
+    Option("rgw_crypt_vault_ssl_clientkey", Option::TYPE_STR, Option::LEVEL_ADVANCED)
+    .set_default("")
+    .set_description("Path for private key required for client cert"),
 
     Option("rgw_crypt_kmip_addr", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("")
@@ -9147,6 +9178,12 @@ std::vector<Option> get_cephfs_mirror_options() {
     .set_min(0)
     .set_description("interval to restart failed mirror instances")
     .set_long_description("Interval in seconds to restart failed mirror instances. Setting to zero (0) disables restarting failed mirror instances."),
+
+    Option("cephfs_mirror_mount_timeout", Option::TYPE_SECS, Option::LEVEL_ADVANCED)
+    .set_default(10)
+    .set_min(0)
+    .set_description("timeout for mounting primary/seconday ceph file system")
+    .set_long_description("Timeout in seconds for mounting primary or secondary (remote) ceph file system by the cephfs-mirror daemon. Setting this to a higher value could result in the mirror daemon getting stalled when mounting a file system if the cluster is not reachable. This option is used to override the usual client_mount_timeout."),
     });
 }
 

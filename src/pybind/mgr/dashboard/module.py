@@ -8,7 +8,6 @@ import collections
 import errno
 import logging
 import os
-import socket
 import ssl
 import sys
 import tempfile
@@ -51,7 +50,7 @@ if cherrypy is not None:
     patch_cherrypy(cherrypy.__version__)
 
 # pylint: disable=wrong-import-position
-from .plugins import PLUGIN_MANAGER, debug, feature_toggles  # noqa # pylint: disable=unused-import
+from .plugins import PLUGIN_MANAGER, debug, feature_toggles, motd  # isort:skip # noqa E501 # pylint: disable=unused-import
 
 PLUGIN_MANAGER.hook.init()
 
@@ -109,6 +108,8 @@ class CherryPyConfig(object):
         else:
             server_port = self.get_localized_module_option('ssl_server_port', 8443)  # type: ignore
 
+        if server_addr == '::':
+            server_addr = self.get_mgr_ip()  # type: ignore
         if server_addr is None:
             raise ServerConfigException(
                 'no server_addr configured; '
@@ -193,7 +194,7 @@ class CherryPyConfig(object):
 
         uri = "{0}://{1}:{2}{3}/".format(
             'https' if use_ssl else 'http',
-            socket.getfqdn(server_addr if server_addr != '::' else ''),
+            server_addr,
             server_port,
             self.url_prefix
         )

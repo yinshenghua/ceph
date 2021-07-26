@@ -41,7 +41,8 @@
               <select id="backend_service"
                       name="backend_service"
                       class="form-control custom-select"
-                      formControlName="backend_service">
+                      formControlName="backend_service"
+                      (change)="prePopulateId()">
                 <option *ngIf="services === null"
                         [ngValue]="null"
                         i18n>Loading...</option>
@@ -507,7 +508,7 @@
           </div>
 
           <!-- ssl_key -->
-          <div *ngIf="serviceForm.controls.ssl.value"
+          <div *ngIf="serviceForm.controls.ssl.value && serviceForm.controls.service_type.value !== 'rgw'"
                class="form-group row">
             <label class="cd-col-form-label"
                    for="ssl_key">

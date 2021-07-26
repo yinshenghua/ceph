@@ -86,7 +86,12 @@ RGWObject *RGWRadosBucket::create_object(const rgw_obj_key &key)
   return nullptr;
 }
 
-int RGWRadosBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, std::string prefix, std::string delimiter, bool forward_to_master, req_info* req_info, optional_yield y)
+int RGWRadosBucket::remove_bucket(const DoutPrefixProvider *dpp,
+			       bool delete_children,
+			       std::string prefix,
+			       std::string delimiter,
+			       bool forward_to_master,
+			       req_info* req_info, optional_yield y)
 {
   int ret;
 
@@ -101,13 +106,12 @@ int RGWRadosBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_chi
 
   ListResults results;
 
-  bool is_truncated = false;
   do {
     results.objs.clear();
 
-      ret = list(dpp, params, 1000, results, y);
-      if (ret < 0)
-	return ret;
+    ret = list(dpp, params, 1000, results, y);
+    if (ret < 0)
+      return ret;
 
     if (!results.objs.empty() && !delete_children) {
       ldpp_dout(dpp, -1) << "ERROR: could not remove non-empty bucket " << info.bucket.name <<
@@ -123,7 +127,7 @@ int RGWRadosBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_chi
 	return ret;
       }
     }
-  } while(is_truncated);
+  } while(results.is_truncated);
 
   /* If there's a prefix, then we are aborting multiparts as well */
   if (!prefix.empty()) {
@@ -693,7 +697,16 @@ int RGWRadosObject::RadosReadOp::get_attr(const DoutPrefixProvider *dpp, const c
   return parent_op.get_attr(dpp, name, dest, y);
 }
 
-int RGWRadosObject::delete_object(const DoutPrefixProvider *dpp, RGWObjectCtx* obj_ctx, ACLOwner obj_owner, ACLOwner bucket_owner, ceph::real_time unmod_since, bool high_precision_time, uint64_t epoch, string& version_id, optional_yield y)
+int RGWRadosObject::delete_object(const DoutPrefixProvider *dpp,
+				  RGWObjectCtx* obj_ctx,
+				  ACLOwner obj_owner,
+				  ACLOwner bucket_owner,
+				  ceph::real_time unmod_since,
+				  bool high_precision_time,
+				  uint64_t epoch,
+				  std::string& version_id,
+				  optional_yield y,
+				  bool prevent_versioning)
 {
   int ret = 0;
   RGWRados::Object del_target(store->getRados(), bucket->get_info(), *obj_ctx, get_obj());
@@ -702,7 +715,8 @@ int RGWRadosObject::delete_object(const DoutPrefixProvider *dpp, RGWObjectCtx* o
   del_op.params.olh_epoch = epoch;
   del_op.params.marker_version_id = version_id;
   del_op.params.bucket_owner = bucket_owner.get_id();
-  del_op.params.versioning_status = bucket->get_info().versioning_status();
+  del_op.params.versioning_status =
+    prevent_versioning ? 0 : bucket->get_info().versioning_status();
   del_op.params.obj_owner = obj_owner;
   del_op.params.unmod_since = unmod_since;
   del_op.params.high_precision_time = high_precision_time;
@@ -1008,7 +1022,7 @@ int RGWRadosStore::cluster_stat(RGWClusterStat& stats)
   return ret;
 }
 
-int RGWRadosStore::create_bucket(const DoutPrefixProvider *dpp, 
+int RGWRadosStore::create_bucket(const DoutPrefixProvider *dpp,
                                  RGWUser& u, const rgw_bucket& b,
 				 const string& zonegroup_id,
 				 rgw_placement_rule& placement_rule,

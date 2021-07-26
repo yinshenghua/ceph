@@ -10,12 +10,10 @@ export class ServicesPageHelper extends PageHelper {
 
   columnIndex = {
     service_name: 2,
-    container_image_name: 3,
-    container_image_id: 4,
-    placement: 5,
-    running: 6,
-    size: 7,
-    last_refresh: 8
+    placement: 3,
+    running: 4,
+    size: 5,
+    last_refresh: 6
   };
 
   check_for_service() {
@@ -35,7 +33,7 @@ export class ServicesPageHelper extends PageHelper {
         cy.get('#count').type('1');
       } else if (serviceType === 'ingress') {
         this.selectOption('backend_service', 'rgw.rgw.foo');
-        cy.get('#service_id').type('rgw.rgw.foo');
+        cy.get('#service_id').should('have.value', 'rgw.rgw.foo');
         cy.get('#virtual_ip').type('192.168.20.1/24');
         cy.get('#frontend_port').type('8081');
         cy.get('#monitor_port').type('8082');

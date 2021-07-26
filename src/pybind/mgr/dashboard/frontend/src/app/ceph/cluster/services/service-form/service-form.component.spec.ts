@@ -1,6 +1,7 @@
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { ReactiveFormsModule } from '@angular/forms';
+import { By } from '@angular/platform-browser';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbTypeaheadModule } from '@ng-bootstrap/ng-bootstrap';
@@ -199,7 +200,6 @@ describe('ServiceFormComponent', () => {
           unmanaged: false,
           rgw_frontend_port: 1234,
           rgw_frontend_ssl_certificate: '',
-          rgw_frontend_ssl_key: '',
           ssl: true
         });
       });
@@ -243,6 +243,13 @@ describe('ServiceFormComponent', () => {
           unmanaged: false,
           ssl: false
         });
+      });
+
+      it('should not show private key field', () => {
+        formHelper.setValue('ssl', true);
+        fixture.detectChanges();
+        const ssl_key = fixture.debugElement.query(By.css('#ssl_key'));
+        expect(ssl_key).toBeNull();
       });
     });
 
@@ -335,7 +342,6 @@ describe('ServiceFormComponent', () => {
     describe('should test service ingress', () => {
       beforeEach(() => {
         formHelper.setValue('service_type', 'ingress');
-        formHelper.setValue('service_id', 'rgw.foo');
         formHelper.setValue('backend_service', 'rgw.foo');
         formHelper.setValue('virtual_ip', '192.168.20.1/24');
         formHelper.setValue('ssl', false);
@@ -353,6 +359,12 @@ describe('ServiceFormComponent', () => {
           virtual_interface_networks: null,
           ssl: false
         });
+      });
+
+      it('should pre-populate the service id', () => {
+        component.prePopulateId();
+        const prePopulatedID = component.serviceForm.getValue('service_id');
+        expect(prePopulatedID).toBe('rgw.foo');
       });
 
       it('should submit valid frontend and monitor port', () => {

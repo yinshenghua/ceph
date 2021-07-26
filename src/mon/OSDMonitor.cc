@@ -945,7 +945,7 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
   }
   if (osdmap.stretch_mode_enabled) {
     dout(20) << "Stretch mode enabled in this map" << dendl;
-    mon.maybe_engage_stretch_mode();
+    mon.try_engage_stretch_mode();
     if (osdmap.degraded_stretch_mode) {
       dout(20) << "Degraded stretch mode set in this map" << dendl;
       if (!osdmap.recovering_stretch_mode) {
@@ -959,15 +959,16 @@ void OSDMonitor::update_from_paxos(bool *need_bootstrap)
 	  dout(10) << "Enabling recovery stretch mode in this map" << dendl;
 	  mon.go_recovery_stretch_mode();
 	}
+      } else {
+	mon.set_recovery_stretch_mode();
       }
+    } else {
+      mon.set_healthy_stretch_mode();
     }
     if (marked_osd_down &&
 	(!osdmap.degraded_stretch_mode || osdmap.recovering_stretch_mode)) {
       dout(20) << "Checking degraded stretch mode due to osd changes" << dendl;
       mon.maybe_go_degraded_stretch_mode();
-    }
-    if (osdmap.recovering_stretch_mode && stretch_recovery_triggered.is_zero()) {
-      stretch_recovery_triggered = ceph_clock_now();
     }
   }
 }
@@ -3182,8 +3183,9 @@ bool OSDMonitor::check_failures(utime_t now)
   auto p = failure_info.begin();
   while (p != failure_info.end()) {
     auto& [target_osd, fi] = *p;
-    if (can_mark_down(target_osd)) {
-      found_failure |= check_failure(now, target_osd, fi);
+    if (can_mark_down(target_osd) &&
+	check_failure(now, target_osd, fi)) {
+      found_failure = true;
       ++p;
     } else if (is_failure_stale(now, fi)) {
       dout(10) << " dropping stale failure_info for osd." << target_osd
@@ -6189,6 +6191,13 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
       }
     } else /* var != "all" */  {
       choices_map_t::const_iterator found = ALL_CHOICES.find(var);
+      if (found == ALL_CHOICES.end()) {
+        ss << "pool '" << poolstr
+	       << "': invalid variable: '" << var << "'";
+        r = -EINVAL;
+        goto reply;
+      }
+
       osd_pool_get_choices selected = found->second;
 
       if (!p->is_tier() &&
@@ -14524,6 +14533,23 @@ void OSDMonitor::trigger_recovery_stretch_mode()
     }
   }
   propose_pending();
+}
+
+void OSDMonitor::set_degraded_stretch_mode()
+{
+  stretch_recovery_triggered.set_from_double(0);
+}
+
+void OSDMonitor::set_recovery_stretch_mode()
+{
+  if (stretch_recovery_triggered.is_zero()) {
+    stretch_recovery_triggered = ceph_clock_now();
+  }
+}
+
+void OSDMonitor::set_healthy_stretch_mode()
+{
+  stretch_recovery_triggered.set_from_double(0);
 }
 
 void OSDMonitor::notify_new_pg_digest()
