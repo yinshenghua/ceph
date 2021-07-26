@@ -2,31 +2,30 @@ Vulnerability Management Process
 ================================
 
 #. The report will be acknowledged within three business days.
-#. The team will investigate and update the email thread with relevant
-   information and may ask for additional information or guidance
-   surrounding the reported issue.
+#. The team will investigate the reported issue and will update the email
+   thread with relevant information. The team may ask for additional
+   information regarding the reported issue.
 #. If the team does not confirm the report, no further action will be
    taken and the issue will be closed.
-#. If the team confirms the report, a unique CVE identifier will be
-   assigned and shared with the reporter. The team will take action to
-   fix the issue.
-#. In cases in which a reporter has not chosen a date to disclose the
-   vulnerability, a Ceph security team member will work with the list members
-   to coordinate a release date (CRD). The agreed upon release date
-   will be shared with the reporter.
+#. If the report is confirmed by Ceph team members, a unique CVE identifier
+   will be assigned to the report and then shared with the reporter. The Ceph
+   security team will start working on a fix. 
+#. If a reporter has no disclosure date in mind, a Ceph security team
+   member will coordinate a release date (CRD) with the list members
+   and share the mutually agreed disclosure date with the reporter.
 #. The vulnerability disclosure / release date is set excluding Friday and
    holiday periods.
-#. Embargoes are preferred for "Critical" and "High impact" issues. Embargoes
-   should not be in effect for more than 90 days from the date of the
-   confirmation of the vulnerability, except under unusual circumstances. For
-   "Low" and "Moderate" issues with limited impact and an easy workaround (or
-   in cases where an issue is already public), a unique CVE identifier will be
-   assigned and then a standard patch release process will be followed to fix
-   the vulnerability.
-#. Medium and Low severity issues will be released as part of the next
-   standard release cycle, with at least a 7 days advanced
-   notification to the list members prior to the release date. The CVE
-   fix details will be included in the release notes, which will be
+#. Embargoes are preferred for Critical and High impact
+   issues. Embargo should not be held for more than 90 days from the
+   date of vulnerability confirmation, except under unusual
+   circumstances. For Low and Moderate issues with limited impact and
+   an easy workaround or where an issue that is already public, a
+   standard patch release process will be followed to fix the
+   vulnerability once CVE is assigned.
+#. Fixes for issues of "Medium" and "Low" severity will be released as part of
+   the next standard release cycle. List members will receive seven days of
+   advance notice prior to the release date of these fixes. The details of the
+   CVE fix will be included in the release notes, and the release notes will be
    linked in the public announcement.
 #. Commits will be handled in a private repository for review and
    testing and a new patch version will be released from this private

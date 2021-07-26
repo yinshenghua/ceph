@@ -213,11 +213,9 @@ logging_config = {
         },
         'log_file': {
             'level': 'DEBUG',
-            'class': 'logging.handlers.RotatingFileHandler',
+            'class': 'logging.handlers.WatchedFileHandler',
             'formatter': 'cephadm',
             'filename': '%s/cephadm.log' % LOG_DIR,
-            'maxBytes': 1024000,
-            'backupCount': 1,
         }
     },
     'loggers': {
@@ -282,7 +280,6 @@ class Monitoring(object):
             'args': [
                 '--config.file=/etc/prometheus/prometheus.yml',
                 '--storage.tsdb.path=/prometheus',
-                '--web.listen-address=:{}'.format(port_map['prometheus'][0]),
             ],
             'config-json-files': [
                 'prometheus.yml',
@@ -313,7 +310,6 @@ class Monitoring(object):
             'cpus': '2',
             'memory': '2GB',
             'args': [
-                '--web.listen-address=:{}'.format(port_map['alertmanager'][0]),
                 '--cluster.listen-address=:{}'.format(port_map['alertmanager'][1]),
             ],
             'config-json-files': [
@@ -505,36 +501,6 @@ class NFSGanesha(object):
                 os.fchmod(f.fileno(), 0o600)
                 os.fchown(f.fileno(), uid, gid)
                 f.write(self.rgw.get('keyring', ''))
-
-    def get_rados_grace_container(self, action):
-        # type: (str) -> CephContainer
-        """Container for a ganesha action on the grace db"""
-        entrypoint = '/usr/bin/ganesha-rados-grace'
-
-        assert self.pool
-        args = ['--pool', self.pool]
-        if self.namespace:
-            args += ['--ns', self.namespace]
-        if self.userid:
-            args += ['--userid', self.userid]
-        args += [action, self.get_daemon_name()]
-
-        data_dir = get_data_dir(self.fsid, self.ctx.data_dir,
-                                self.daemon_type, self.daemon_id)
-        volume_mounts = self.get_container_mounts(data_dir)
-        envs = self.get_container_envs()
-
-        logger.info('Creating RADOS grace for action: %s' % action)
-        c = CephContainer(
-            self.ctx,
-            image=self.image,
-            entrypoint=entrypoint,
-            args=args,
-            volume_mounts=volume_mounts,
-            cname=self.get_container_name(desc='grace-%s' % action),
-            envs=envs
-        )
-        return c
 
 ##################################
 
@@ -1042,13 +1008,15 @@ def attempt_bind(ctx, s, address, port):
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((address, port))
-    except (socket.error, OSError) as e:  # py2 and py3
+    except OSError as e:
         if e.errno == errno.EADDRINUSE:
             msg = 'Cannot bind to IP %s port %d: %s' % (address, port, e)
             logger.warning(msg)
             raise PortOccupiedError(msg)
         else:
-            raise e
+            raise Error(e)
+    except Exception as e:
+        raise Error(e)
     finally:
         s.close()
 
@@ -1506,6 +1474,16 @@ def call_timeout(ctx, command, timeout):
 ##################################
 
 
+def json_loads_retry(cli_func):
+    for sleep_secs in [1, 4, 4]:
+        try:
+            return json.loads(cli_func())
+        except json.JSONDecodeError:
+            logger.debug('Invalid JSON. Retrying in %s seconds...' % sleep_secs)
+            time.sleep(sleep_secs)
+    return json.loads(cli_func())
+
+
 def is_available(ctx, what, func):
     # type: (CephadmContext, str, Callable[[], bool]) -> None
     """
@@ -1669,13 +1647,19 @@ def infer_fsid(func):
     """
     If we only find a single fsid in /var/lib/ceph/*, use that
     """
+    @infer_config
     @wraps(func)
     def _infer_fsid(ctx: CephadmContext):
         if ctx.fsid:
             logger.debug('Using specified fsid: %s' % ctx.fsid)
             return func(ctx)
 
-        fsids_set = set()
+        fsids = set()
+
+        cp = read_config(ctx.config)
+        if cp.has_option('global', 'fsid'):
+            fsids.add(cp.get('global', 'fsid'))
+
         daemon_list = list_daemons(ctx, detail=False)
         for daemon in daemon_list:
             if not is_fsid(daemon['fsid']):
@@ -1683,11 +1667,11 @@ def infer_fsid(func):
                 continue
             elif 'name' not in ctx or not ctx.name:
                 # ctx.name not specified
-                fsids_set.add(daemon['fsid'])
+                fsids.add(daemon['fsid'])
             elif daemon['name'] == ctx.name:
                 # ctx.name is a match
-                fsids_set.add(daemon['fsid'])
-        fsids = sorted(fsids_set)
+                fsids.add(daemon['fsid'])
+        fsids = sorted(fsids)
 
         if not fsids:
             # some commands do not always require an fsid
@@ -1708,24 +1692,22 @@ def infer_config(func):
     """
     @wraps(func)
     def _infer_config(ctx: CephadmContext):
+        ctx.config = ctx.config if 'config' in ctx else None
         if ctx.config:
             logger.debug('Using specified config: %s' % ctx.config)
             return func(ctx)
-        config = None
         if ctx.fsid:
-            name = ctx.name
+            name = ctx.name if 'name' in ctx else None
             if not name:
                 daemon_list = list_daemons(ctx, detail=False)
                 for daemon in daemon_list:
-                    if daemon['name'].startswith('mon.'):
+                    if daemon.get('name', '').startswith('mon.'):
                         name = daemon['name']
                         break
             if name:
-                config = '/var/lib/ceph/{}/{}/config'.format(ctx.fsid,
-                                                             name)
-        if config:
-            logger.info('Inferring config %s' % config)
-            ctx.config = config
+                ctx.config = f'/var/lib/ceph/{ctx.fsid}/{name}/config'
+        if ctx.config:
+            logger.info('Inferring config %s' % ctx.config)
         elif os.path.exists(SHELL_DEFAULT_CONF):
             logger.debug('Using default config: %s' % SHELL_DEFAULT_CONF)
             ctx.config = SHELL_DEFAULT_CONF
@@ -2083,10 +2065,11 @@ def check_units(ctx, units, enabler=None):
 
 
 def is_container_running(ctx: CephadmContext, name: str) -> bool:
-    out, err, ret = call_throws(ctx, [
-        ctx.container_engine.path, 'ps',
-        '--format', '{{.Names}}'])
-    return name in out
+    out, err, ret = call(ctx, [
+        ctx.container_engine.path, 'container', 'inspect',
+        '--format', '{{.State.Status}}', name
+    ])
+    return out == 'running'
 
 
 def get_legacy_config_fsid(cluster, legacy_dir=None):
@@ -2165,6 +2148,17 @@ def get_daemon_args(ctx, fsid, daemon_type, daemon_id):
     elif daemon_type in Monitoring.components:
         metadata = Monitoring.components[daemon_type]
         r += metadata.get('args', list())
+        # set ip and port to bind to for nodeexporter,alertmanager,prometheus
+        if daemon_type != 'grafana':
+            ip = ''
+            port = Monitoring.port_map[daemon_type][0]
+            if 'meta_json' in ctx and ctx.meta_json:
+                meta = json.loads(ctx.meta_json) or {}
+                if 'ip' in meta and meta['ip']:
+                    ip = meta['ip']
+                if 'ports' in meta and meta['ports']:
+                    port = meta['ports'][0]
+            r += [f'--web.listen-address={ip}:{port}']
         if daemon_type == 'alertmanager':
             config = get_parm(ctx.config_json)
             peers = config.get('peers', list())  # type: ignore
@@ -2206,7 +2200,9 @@ def create_daemon_dirs(ctx, fsid, daemon_type, daemon_id, uid, gid,
             f.write(keyring)
 
     if daemon_type in Monitoring.components.keys():
-        config_json: Dict[str, Any] = get_parm(ctx.config_json)
+        config_json: Dict[str, Any] = dict()
+        if 'config_json' in ctx:
+            config_json = get_parm(ctx.config_json)
 
         # Set up directories specific to the monitoring component
         config_dir = ''
@@ -2314,8 +2310,8 @@ def get_config_and_keyring(ctx):
         try:
             with open(ctx.config, 'r') as f:
                 config = f.read()
-        except FileNotFoundError:
-            raise Error('config file: %s does not exist' % ctx.config)
+        except FileNotFoundError as e:
+            raise Error(e)
 
     if 'key' in ctx and ctx.key:
         keyring = '[%s]\n\tkey = %s\n' % (ctx.name, ctx.key)
@@ -2323,8 +2319,8 @@ def get_config_and_keyring(ctx):
         try:
             with open(ctx.keyring, 'r') as f:
                 keyring = f.read()
-        except FileNotFoundError:
-            raise Error('keyring file: %s does not exist' % ctx.keyring)
+        except FileNotFoundError as e:
+            raise Error(e)
 
     return config, keyring
 
@@ -2397,6 +2393,7 @@ def get_container_mounts(ctx, fsid, daemon_type, daemon_id,
             ceph_folder = pathify(ctx.shared_ceph_folder)
             if os.path.exists(ceph_folder):
                 mounts[ceph_folder + '/src/ceph-volume/ceph_volume'] = '/usr/lib/python3.6/site-packages/ceph_volume'
+                mounts[ceph_folder + '/src/cephadm/cephadm'] = '/usr/sbin/cephadm'
                 mounts[ceph_folder + '/src/pybind/mgr'] = '/usr/share/ceph/mgr'
                 mounts[ceph_folder + '/src/python-common/ceph'] = '/usr/lib/python3.6/site-packages/ceph'
                 mounts[ceph_folder + '/monitoring/grafana/dashboards'] = '/etc/grafana/dashboards/ceph-dashboard'
@@ -2464,7 +2461,9 @@ def get_container(ctx: CephadmContext,
     entrypoint: str = ''
     name: str = ''
     ceph_args: List[str] = []
-    envs: List[str] = []
+    envs: List[str] = [
+        'TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=134217728',
+    ]
     host_network: bool = True
 
     if container_args is None:
@@ -2495,6 +2494,7 @@ def get_container(ctx: CephadmContext,
         envs.extend(NFSGanesha.get_container_envs())
     elif daemon_type == HAproxy.daemon_type:
         name = '%s.%s' % (daemon_type, daemon_id)
+        container_args.extend(['--user=root'])  # haproxy 2.4 defaults to a different user
     elif daemon_type == Keepalived.daemon_type:
         name = '%s.%s' % (daemon_type, daemon_id)
         envs.extend(Keepalived.get_container_envs())
@@ -2716,6 +2716,35 @@ def _write_container_cmd_to_bash(ctx, file_obj, container, comment=None, backgro
         + (' &' if background else '') + '\n')
 
 
+def clean_cgroup(ctx: CephadmContext, unit_name: str):
+    # systemd may fail to cleanup cgroups from previous stopped unit, which will cause next "systemctl start" to fail.
+    # see https://tracker.ceph.com/issues/50998
+
+    # In bootstrap we set the context fsid at the end.
+    if not ctx.fsid:
+        return
+
+    CGROUPV2_PATH = Path('/sys/fs/cgroup')
+    if not (CGROUPV2_PATH / 'system.slice').exists():
+        # Only unified cgroup is affected, skip if not the case
+        return
+
+    slice_name = 'system-ceph\\x2d{}.slice'.format(ctx.fsid.replace('-', '\\x2d'))
+    cg_path = CGROUPV2_PATH / 'system.slice' / slice_name / f'{unit_name}.service'
+    if not cg_path.exists():
+        return
+
+    def cg_trim(path: Path):
+        for p in path.iterdir():
+            if p.is_dir():
+                cg_trim(p)
+        path.rmdir()
+    try:
+        cg_trim(cg_path)
+    except OSError:
+        logger.warning(f'Failed to trim old cgroups {cg_path}')
+
+
 def deploy_daemon_units(
     ctx: CephadmContext,
     fsid: str,
@@ -2768,11 +2797,6 @@ def deploy_daemon_units(
                     memory_limit=ctx.memory_limit,
                 )
                 _write_container_cmd_to_bash(ctx, f, prestart, 'LVM OSDs use ceph-volume lvm activate')
-        elif daemon_type == NFSGanesha.daemon_type:
-            # add nfs to the rados grace db
-            nfs_ganesha = NFSGanesha.init(ctx, fsid, daemon_id)
-            prestart = nfs_ganesha.get_rados_grace_container('add')
-            _write_container_cmd_to_bash(ctx, f, prestart, 'add daemon to rados grace')
         elif daemon_type == CephIscsi.daemon_type:
             f.write(' '.join(CephIscsi.configfs_mount_umount(data_dir, mount=True)) + '\n')
             ceph_iscsi = CephIscsi.init(ctx, fsid, daemon_id)
@@ -2819,11 +2843,6 @@ def deploy_daemon_units(
                                                     daemon_id),
             )
             _write_container_cmd_to_bash(ctx, f, poststop, 'deactivate osd')
-        elif daemon_type == NFSGanesha.daemon_type:
-            # remove nfs from the rados grace db
-            nfs_ganesha = NFSGanesha.init(ctx, fsid, daemon_id)
-            poststop = nfs_ganesha.get_rados_grace_container('remove')
-            _write_container_cmd_to_bash(ctx, f, poststop, 'remove daemon from rados grace')
         elif daemon_type == CephIscsi.daemon_type:
             # make sure we also stop the tcmu container
             ceph_iscsi = CephIscsi.init(ctx, fsid, daemon_id)
@@ -2862,6 +2881,7 @@ def deploy_daemon_units(
     if enable:
         call_throws(ctx, ['systemctl', 'enable', unit_name])
     if start:
+        clean_cgroup(ctx, unit_name)
         call_throws(ctx, ['systemctl', 'start', unit_name])
 
 
@@ -2974,15 +2994,7 @@ class Firewalld(object):
 def update_firewalld(ctx, daemon_type):
     # type: (CephadmContext, str) -> None
     firewall = Firewalld(ctx)
-
     firewall.enable_service_for(daemon_type)
-
-    fw_ports = []
-
-    if daemon_type in Monitoring.port_map.keys():
-        fw_ports.extend(Monitoring.port_map[daemon_type])  # prometheus etc
-
-    firewall.open_ports(fw_ports)
     firewall.apply_rules()
 
 
@@ -3012,6 +3024,7 @@ def install_sysctl(ctx: CephadmContext, fsid: str, daemon_type: str) -> None:
 
     # apply the sysctl settings
     if lines:
+        Path(ctx.sysctl_dir).mkdir(mode=0o755, exist_ok=True)
         _write(conf, lines)
         call_throws(ctx, ['sysctl', '--system'])
 
@@ -3183,13 +3196,13 @@ class CephContainer:
             'run',
             '--rm',
             '--ipc=host',
+            # some containers (ahem, haproxy) override this, but we want a fast
+            # shutdown always (and, more importantly, a successful exit even if we
+            # fall back to SIGKILL).
+            '--stop-signal=SIGTERM',
         ]
 
         if isinstance(self.ctx.container_engine, Podman):
-            # podman adds the container *name* to /etc/hosts (for 127.0.1.1)
-            # by default, which makes python's socket.getfqdn() return that
-            # instead of a valid hostname.
-            cmd_args.append('--no-hosts')
             if os.path.exists('/etc/ceph/podman-auth.json'):
                 cmd_args.append('--authfile=/etc/ceph/podman-auth.json')
 
@@ -3397,7 +3410,7 @@ def normalize_image_digest(digest):
     #   quay.ceph.io/ceph/ceph -> ceph
     #   docker.io/ubuntu -> no change
     bits = digest.split('/')
-    if '.' not in bits[0] or len(bits) < 3:
+    if '.' not in bits[0] and len(bits) < 3:
         digest = DEFAULT_REGISTRY + '/' + digest
     return digest
 
@@ -3518,7 +3531,7 @@ def prepare_mon_addresses(
                             addr_arg)
             port = int(hasport[0])
             # strip off v1: or v2: prefix
-            addr = re.sub(r'^\w+:', '', addr)
+            addr = re.sub(r'^v\d+:', '', addr)
             base_ip = addr[0:-(len(str(port))) - 1]
             check_ip_port(ctx, base_ip, port)
     else:
@@ -3529,19 +3542,21 @@ def prepare_mon_addresses(
     if not ctx.skip_mon_network:
         # make sure IP is configured locally, and then figure out the
         # CIDR network
+        errmsg = f'Cannot infer CIDR network for mon IP `{base_ip}`'
         for net, ifaces in list_networks(ctx).items():
             ips: List[str] = []
             for iface, ls in ifaces.items():
                 ips.extend(ls)
-            if ipaddress.ip_address(unwrap_ipv6(base_ip)) in \
-                    [ipaddress.ip_address(ip) for ip in ips]:
-                mon_network = net
-                logger.info('Mon IP %s is in CIDR network %s' % (base_ip,
-                                                                 mon_network))
-                break
+            try:
+                if ipaddress.ip_address(unwrap_ipv6(base_ip)) in \
+                        [ipaddress.ip_address(ip) for ip in ips]:
+                    mon_network = net
+                    logger.info(f'Mon IP `{base_ip}` is in CIDR network `{mon_network}`')
+                    break
+            except ValueError as e:
+                logger.warning(f'{errmsg}: {e}')
         if not mon_network:
-            raise Error('Failed to infer CIDR network for mon ip %s; pass '
-                        '--skip-mon-network to configure it later' % base_ip)
+            raise Error(f'{errmsg}: pass --skip-mon-network to configure it later')
 
     return (addr_arg, ipv6, mon_network)
 
@@ -3954,6 +3969,13 @@ def prepare_bootstrap_config(
                 and not cp.has_option('mgr', 'mgr standby modules')
         ):
             cp.set('mgr', 'mgr_standby_modules', 'false')
+    if ctx.log_to_file:
+        cp.set('global', 'log_to_file', 'true')
+        cp.set('global', 'log_to_stderr', 'false')
+        cp.set('global', 'log_to_journald', 'false')
+        cp.set('global', 'mon_cluster_log_to_file', 'true')
+        cp.set('global', 'mon_cluster_log_to_stderr', 'false')
+        cp.set('global', 'mon_cluster_log_to_journald', 'false')
 
     cpf = StringIO()
     cp.write(cpf)
@@ -4047,11 +4069,7 @@ def command_bootstrap(ctx):
             except PermissionError:
                 raise Error(f'Unable to create {dirname} due to permissions failure. Retry with root, or sudo or preallocate the directory.')
 
-    if ctx.config and os.path.exists(ctx.config):
-        with open(ctx.config) as f:
-            user_conf = f.read()
-    else:
-        user_conf = None
+    (user_conf, _) = get_config_and_keyring(ctx)
 
     if not ctx.skip_prepare_host:
         command_prepare_host(ctx)
@@ -4060,12 +4078,15 @@ def command_bootstrap(ctx):
 
     # initial vars
     fsid = ctx.fsid or make_fsid()
+    if not is_fsid(fsid):
+        raise Error('not an fsid: %s' % fsid)
+    logger.info('Cluster fsid: %s' % fsid)
+
     hostname = get_hostname()
     if '.' in hostname and not ctx.allow_fqdn_hostname:
         raise Error('hostname is a fully qualified domain name (%s); either fix (e.g., "sudo hostname %s" or similar) or pass --allow-fqdn-hostname' % (hostname, hostname.split('.')[0]))
     mon_id = ctx.mon_id or hostname
     mgr_id = ctx.mgr_id or generate_service_id()
-    logger.info('Cluster fsid: %s' % fsid)
 
     lock = FileLock(ctx, fsid)
     lock.acquire()
@@ -4080,14 +4101,15 @@ def command_bootstrap(ctx):
 
     image_ver = CephContainer(ctx, ctx.image, 'ceph', ['--version']).run().strip()
     logger.info(f'Ceph version: {image_ver}')
-    image_release = image_ver.split()[4]
-    if (
-        not ctx.allow_mismatched_release
-        and image_release not in [DEFAULT_IMAGE_RELEASE, LATEST_STABLE_RELEASE]
-    ):
-        raise Error(
-            f'Container release {image_release} != cephadm release {DEFAULT_IMAGE_RELEASE}; please use matching version of cephadm (pass --allow-mismatched-release to continue anyway)'
-        )
+
+    if not ctx.allow_mismatched_release:
+        image_release = image_ver.split()[4]
+        if image_release not in \
+                [DEFAULT_IMAGE_RELEASE, LATEST_STABLE_RELEASE]:
+            raise Error(
+                f'Container release {image_release} != cephadm release {DEFAULT_IMAGE_RELEASE};'
+                ' please use matching version of cephadm (pass --allow-mismatched-release to continue anyway)'
+            )
 
     logger.info('Extracting ceph user uid/gid from container image...')
     (uid, gid) = extract_uid_gid(ctx)
@@ -4153,21 +4175,12 @@ def command_bootstrap(ctx):
         # the mgr (e.g. mgr/cephadm/container_image_prometheus)
         # they don't seem to be stored if there isn't a mgr yet.
         # Since re-assimilating the same conf settings should be
-        # idempotent we can just do it aain here.
+        # idempotent we can just do it again here.
         with tempfile.NamedTemporaryFile(buffering=0) as tmp:
             tmp.write(user_conf.encode('utf-8'))
             cli(['config', 'assimilate-conf',
                  '-i', '/var/lib/ceph/user.conf'],
                 {tmp.name: '/var/lib/ceph/user.conf:z'})
-
-    def json_loads_retry(cli_func):
-        for sleep_secs in [1, 4, 4]:
-            try:
-                return json.loads(cli_func())
-            except json.JSONDecodeError:
-                logger.debug('Invalid JSON. Retrying in %s seconds...' % sleep_secs)
-                time.sleep(sleep_secs)
-        return json.loads(cli_func())
 
     # wait for mgr to restart (after enabling a module)
     def wait_for_mgr_restart():
@@ -4387,9 +4400,6 @@ def command_deploy(ctx):
     elif daemon_type in Monitoring.components:
         # monitoring daemon - prometheus, grafana, alertmanager, node-exporter
         # Default Checks
-        if not ctx.reconfig and not redeploy:
-            daemon_ports.extend(Monitoring.port_map[daemon_type])
-
         # make sure provided config-json is sufficient
         config = get_parm(ctx.config_json)  # type: ignore
         required_files = Monitoring.components[daemon_type].get('config-json-files', list())
@@ -4410,8 +4420,8 @@ def command_deploy(ctx):
                       ports=daemon_ports)
 
     elif daemon_type == NFSGanesha.daemon_type:
-        if not ctx.reconfig and not redeploy:
-            daemon_ports.extend(NFSGanesha.port_map.values())
+        if not ctx.reconfig and not redeploy and not daemon_ports:
+            daemon_ports = list(NFSGanesha.port_map.values())
 
         config, keyring = get_config_and_keyring(ctx)
         # TODO: extract ganesha uid/gid (997, 994) ?
@@ -4491,24 +4501,15 @@ def command_run(ctx):
 ##################################
 
 
-def fsid_conf_mismatch(ctx):
-    # type: (CephadmContext) -> bool
-    (config, _) = get_config_and_keyring(ctx)
-    if config:
-        for c in config.split('\n'):
-            if 'fsid = ' in c.strip():
-                if 'fsid = ' + ctx.fsid != c.strip():
-                    return True
-    return False
-
-
 @infer_fsid
 @infer_config
 @infer_image
 def command_shell(ctx):
     # type: (CephadmContext) -> int
-    if fsid_conf_mismatch(ctx):
-        raise Error('fsid does not match ceph conf')
+    cp = read_config(ctx.config)
+    if cp.has_option('global', 'fsid') and \
+       cp.get('global', 'fsid') != ctx.fsid:
+        raise Error('fsid does not match ceph.conf')
 
     if ctx.fsid:
         make_log_dir(ctx, ctx.fsid)
@@ -4569,6 +4570,10 @@ def command_shell(ctx):
                             shutil.copyfile(os.path.join('/etc/skel', f),
                                             os.path.join(home, f))
             mounts[home] = '/root'
+
+    for i in ctx.volume:
+        a, b = i.split(':', 1)
+        mounts[a] = b
 
     c = CephContainer(
         ctx,
@@ -5579,7 +5584,7 @@ def command_rm_cluster(ctx):
         call(ctx, ['systemctl', 'disable', unit_name],
              verbosity=CallVerbosity.DEBUG)
 
-    slice_name = 'system-%s.slice' % (('ceph-%s' % ctx.fsid).replace('-', '\\x2d'))
+    slice_name = 'system-ceph\\x2d{}.slice'.format(ctx.fsid.replace('-', '\\x2d'))
     call(ctx, ['systemctl', 'stop', slice_name],
          verbosity=CallVerbosity.DEBUG)
 
@@ -5605,6 +5610,10 @@ def command_rm_cluster(ctx):
 
     # rm logrotate config
     call_throws(ctx, ['rm', '-f', ctx.logrotate_dir + '/ceph-%s' % ctx.fsid])
+
+    # rm cephadm logrotate config if last cluster on host
+    if not os.listdir(ctx.data_dir):
+        call_throws(ctx, ['rm', '-f', ctx.logrotate_dir + '/cephadm'])
 
     # rm sysctl settings
     sysctl_dir = Path(ctx.sysctl_dir)
@@ -5823,9 +5832,9 @@ class Packager(object):
         if self.ctx.gpg_url:
             return self.ctx.gpg_url
         if self.stable or self.version:
-            return 'https://download.ceph.com/keys/release.asc', 'release'
+            return 'https://download.ceph.com/keys/release.gpg', 'release'
         else:
-            return 'https://download.ceph.com/keys/autobuild.asc', 'autobuild'
+            return 'https://download.ceph.com/keys/autobuild.gpg', 'autobuild'
 
     def enable_service(self, service):
         """
@@ -5863,8 +5872,8 @@ class Apt(Packager):
             logger.error('failed to fetch GPG repo key from %s: %s' % (
                 url, err))
             raise Error('failed to fetch GPG key')
-        key = response.read().decode('utf-8')
-        with open('/etc/apt/trusted.gpg.d/ceph.%s.gpg' % name, 'w') as f:
+        key = response.read()
+        with open('/etc/apt/trusted.gpg.d/ceph.%s.gpg' % name, 'wb') as f:
             f.write(key)
 
         if self.version:
@@ -5880,6 +5889,8 @@ class Apt(Packager):
         logger.info('Installing repo file at %s...' % self.repo_path())
         with open(self.repo_path(), 'w') as f:
             f.write(content)
+
+        self.update()
 
     def rm_repo(self):
         for name in ['autobuild', 'release']:
@@ -5898,11 +5909,15 @@ class Apt(Packager):
         logger.info('Installing packages %s...' % ls)
         call_throws(self.ctx, ['apt-get', 'install', '-y'] + ls)
 
+    def update(self):
+        logger.info('Updating package list...')
+        call_throws(self.ctx, ['apt-get', 'update'])
+
     def install_podman(self):
         if self.distro == 'ubuntu':
             logger.info('Setting up repo for podman...')
             self.add_kubic_repo()
-            call_throws(self.ctx, ['apt-get', 'update'])
+            self.update()
 
         logger.info('Attempting podman install...')
         try:
@@ -6048,6 +6063,13 @@ class YumDnf(Packager):
                                      self.distro_code)
 
     def add_repo(self):
+        if self.distro_code.startswith('fc'):
+            raise Error('Ceph team does not build Fedora specific packages and therefore cannot add repos for this distro')
+        if self.distro_code == 'el7':
+            if self.stable and self.stable >= 'pacific':
+                raise Error('Ceph does not support pacific or later for this version of this linux distro and therefore cannot add a repo for it')
+            if self.version and self.version.split('.')[0] >= '16':
+                raise Error('Ceph does not support 16.y.z or later for this version of this linux distro and therefore cannot add a repo for it')
         if self.stable or self.version:
             content = ''
             for n, t in {
@@ -6214,12 +6236,16 @@ def command_add_repo(ctx: CephadmContext):
             (x, y, z) = ctx.version.split('.')
         except Exception:
             raise Error('version must be in the form x.y.z (e.g., 15.2.0)')
+    if ctx.release:
+        # Pacific =/= pacific in this case, set to undercase to avoid confision
+        ctx.release = ctx.release.lower()
 
     pkg = create_packager(ctx, stable=ctx.release,
                           version=ctx.version,
                           branch=ctx.dev,
                           commit=ctx.dev_commit)
     pkg.add_repo()
+    logger.info('Completed adding repo.')
 
 
 def command_rm_repo(ctx: CephadmContext):
@@ -6333,7 +6359,6 @@ def read_file(path_list, file_name=''):
 class HostFacts():
     _dmi_path_list = ['/sys/class/dmi/id']
     _nic_path_list = ['/sys/class/net']
-    _selinux_path_list = ['/etc/selinux/config']
     _apparmor_path_list = ['/etc/apparmor']
     _disk_vendor_workarounds = {
         '0x1af4': 'Virtio Block Device'
@@ -6690,23 +6715,30 @@ class HostFacts():
         # type: () -> Dict[str, str]
         """Determine the security features enabled in the kernel - SELinux, AppArmor"""
         def _fetch_selinux() -> Dict[str, str]:
-            """Read the selinux config file to determine state"""
+            """Get the selinux status"""
             security = {}
-            for selinux_path in HostFacts._selinux_path_list:
-                if os.path.exists(selinux_path):
-                    selinux_config = read_file([selinux_path]).splitlines()
-                    security['type'] = 'SELinux'
-                    for line in selinux_config:
-                        if line.strip().startswith('#'):
-                            continue
-                        k, v = line.split('=')
-                        security[k] = v
-                    if security['SELINUX'].lower() == 'disabled':
-                        security['description'] = 'SELinux: Disabled'
-                    else:
-                        security['description'] = 'SELinux: Enabled({}, {})'.format(security['SELINUX'], security['SELINUXTYPE'])
-                    return security
-            return {}
+            try:
+                out, err, code = call(self.ctx, ['sestatus'],
+                                      verbosity=CallVerbosity.DEBUG)
+                security['type'] = 'SELinux'
+                status, mode, policy = '', '', ''
+                for line in out.split('\n'):
+                    if line.startswith('SELinux status:'):
+                        k, v = line.split(':')
+                        status = v.strip()
+                    elif line.startswith('Current mode:'):
+                        k, v = line.split(':')
+                        mode = v.strip()
+                    elif line.startswith('Loaded policy name:'):
+                        k, v = line.split(':')
+                        policy = v.strip()
+                if status == 'disabled':
+                    security['description'] = 'SELinux: Disabled'
+                else:
+                    security['description'] = 'SELinux: Enabled({}, {})'.format(mode, policy)
+            except Exception as e:
+                logger.info('unable to get selinux status: %s' % e)
+            return security
 
         def _fetch_apparmor() -> Dict[str, str]:
             """Read the apparmor profiles directly, returning an overview of AppArmor status"""
@@ -7745,6 +7777,11 @@ def _get_parser():
         default=[],
         help='set environment variable')
     parser_shell.add_argument(
+        '--volume', '-v',
+        action='append',
+        default=[],
+        help='set environment variable')
+    parser_shell.add_argument(
         'command', nargs=argparse.REMAINDER,
         help='command (optional)')
     parser_shell.add_argument(
@@ -7906,7 +7943,6 @@ def _get_parser():
         '--ssh-user',
         default='root',
         help='set user for SSHing to cluster hosts, passwordless sudo will be needed for non-root users')
-
     parser_bootstrap.add_argument(
         '--skip-mon-network',
         action='store_true',
@@ -7962,7 +7998,6 @@ def _get_parser():
     parser_bootstrap.add_argument(
         '--apply-spec',
         help='Apply cluster spec after bootstrap (copy ssh key, add hosts and apply services)')
-
     parser_bootstrap.add_argument(
         '--shared_ceph_folder',
         metavar='CEPH_SOURCE_FOLDER',
@@ -8000,6 +8035,10 @@ def _get_parser():
         '--single-host-defaults',
         action='store_true',
         help='adjust configuration defaults to suit a single-host cluster')
+    parser_bootstrap.add_argument(
+        '--log-to-file',
+        action='store_true',
+        help='configure cluster to log to traditional log files in /var/log/ceph/$fsid')
 
     parser_deploy = subparsers.add_parser(
         'deploy', help='deploy a daemon')
@@ -8189,18 +8228,15 @@ def _parse_args(av):
     return args
 
 
-def cephadm_init_ctx(args: List[str]) -> Optional[CephadmContext]:
-
+def cephadm_init_ctx(args: List[str]) -> CephadmContext:
     ctx = CephadmContext()
     ctx.set_args(_parse_args(args))
     return ctx
 
 
-def cephadm_init(args: List[str]) -> Optional[CephadmContext]:
-
+def cephadm_init(args: List[str]) -> CephadmContext:
     global logger
     ctx = cephadm_init_ctx(args)
-    assert ctx is not None
 
     # Logger configuration
     if not os.path.exists(LOG_DIR):
@@ -8208,14 +8244,22 @@ def cephadm_init(args: List[str]) -> Optional[CephadmContext]:
     dictConfig(logging_config)
     logger = logging.getLogger()
 
+    if not os.path.exists(ctx.logrotate_dir + '/cephadm'):
+        with open(ctx.logrotate_dir + '/cephadm', 'w') as f:
+            f.write("""# created by cephadm
+/var/log/ceph/cephadm.log {
+    rotate 7
+    daily
+    compress
+    missingok
+    notifempty
+}
+""")
+
     if ctx.verbose:
         for handler in logger.handlers:
             if handler.name == 'console':
                 handler.setLevel(logging.DEBUG)
-
-    if not ctx.has_function():
-        sys.stderr.write('No command specified; pass -h or --help for usage\n')
-        return None
 
     return ctx
 
@@ -8231,14 +8275,15 @@ def main():
     av = sys.argv[1:]
 
     ctx = cephadm_init(av)
-    if not ctx:  # error, exit
+    if not ctx.has_function():
+        sys.stderr.write('No command specified; pass -h or --help for usage\n')
         sys.exit(1)
 
     try:
         # podman or docker?
         ctx.container_engine = find_container_engine(ctx)
         if ctx.func not in \
-                [command_check_host, command_prepare_host, command_add_repo]:
+                [command_check_host, command_prepare_host, command_add_repo, command_install]:
             check_container_engine(ctx)
         # command handler
         r = ctx.func(ctx)

@@ -6282,9 +6282,29 @@ void Client::_close_sessions()
   }
 }
 
+void Client::flush_mdlog_sync(Inode *in)
+{
+  if (in->unsafe_ops.empty()) {
+    return;
+  }
+
+  std::set<mds_rank_t> anchor;
+  for (auto &&p : in->unsafe_ops) {
+    anchor.emplace(p->mds);
+  }
+  if (in->auth_cap) {
+    anchor.emplace(in->auth_cap->session->mds_num);
+  }
+
+  for (auto &rank : anchor) {
+    auto session = &mds_sessions.at(rank);
+    flush_mdlog(session);
+  }
+}
+
 void Client::flush_mdlog_sync()
 {
-  if (mds_requests.empty()) 
+  if (mds_requests.empty())
     return;
   for (auto &p : mds_sessions) {
     flush_mdlog(&p.second);
@@ -10536,7 +10556,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   } else ldout(cct, 10) << "no metadata needs to commit" << dendl;
 
   if (!syncdataonly && !in->unsafe_ops.empty()) {
-    flush_mdlog_sync();
+    flush_mdlog_sync(in);
 
     MetaRequest *req = in->unsafe_ops.back();
     ldout(cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
@@ -10774,7 +10794,7 @@ int Client::statfs(const char *path, struct statvfs *stbuf,
   if (data_pools.size() == 1) {
     objecter->get_fs_stats(stats, data_pools[0], &cond);
   } else {
-    objecter->get_fs_stats(stats, boost::optional<int64_t>(), &cond);
+    objecter->get_fs_stats(stats, std::optional<int64_t>(), &cond);
   }
 
   lock.unlock();
@@ -12735,6 +12755,14 @@ size_t Client::_vxattrcb_snap_btime(Inode *in, char *val, size_t size)
       (long unsigned)in->snap_btime.nsec());
 }
 
+size_t Client::_vxattrcb_caps(Inode *in, char *val, size_t size)
+{
+  int issued;
+
+  in->caps_issued(&issued);
+  return snprintf(val, size, "%s/0x%x", ccap_string(issued).c_str(), issued);
+}
+
 bool Client::_vxattrcb_mirror_info_exists(Inode *in)
 {
   // checking one of the xattrs would suffice
@@ -12841,6 +12869,13 @@ const Client::VXattr Client::_dir_vxattrs[] = {
     exists_cb: &Client::_vxattrcb_mirror_info_exists,
     flags: 0,
   },
+  {
+    name: "ceph.caps",
+    getxattr_cb: &Client::_vxattrcb_caps,
+    readonly: true,
+    exists_cb: NULL,
+    flags: 0,
+  },
   { name: "" }     /* Required table terminator */
 };
 
@@ -12862,6 +12897,13 @@ const Client::VXattr Client::_file_vxattrs[] = {
     getxattr_cb: &Client::_vxattrcb_snap_btime,
     readonly: true,
     exists_cb: &Client::_vxattrcb_snap_btime_exists,
+    flags: 0,
+  },
+  {
+    name: "ceph.caps",
+    getxattr_cb: &Client::_vxattrcb_caps,
+    readonly: true,
+    exists_cb: NULL,
     flags: 0,
   },
   { name: "" }     /* Required table terminator */
@@ -14389,8 +14431,6 @@ int Client::ll_sync_inode(Inode *in, bool syncdataonly)
   return _fsync(in, syncdataonly);
 }
 
-#ifdef FALLOC_FL_PUNCH_HOLE
-
 int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -14512,15 +14552,6 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   put_cap_ref(in, CEPH_CAP_FILE_WR);
   return r;
 }
-#else
-
-int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
-{
-  return -CEPHFS_EOPNOTSUPP;
-}
-
-#endif
-
 
 int Client::ll_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
@@ -14959,7 +14990,7 @@ void Client::ms_handle_remote_reset(Connection *con)
       mds_rank_t mds = MDS_RANK_NONE;
       MetaSession *s = NULL;
       for (auto &p : mds_sessions) {
-	if (mdsmap->get_addrs(p.first) == con->get_peer_addrs()) {
+	if (mdsmap->have_inst(p.first) && mdsmap->get_addrs(p.first) == con->get_peer_addrs()) {
 	  mds = p.first;
 	  s = &p.second;
 	}

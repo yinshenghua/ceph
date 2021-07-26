@@ -441,6 +441,8 @@ void MDCache::create_empty_hierarchy(MDSGather *gather)
   rootdir->commit(0, gather->new_sub());
 
   root->store(gather->new_sub());
+  root->mark_dirty_parent(mds->mdlog->get_current_segment(), true);
+  root->store_backtrace(gather->new_sub());
 }
 
 void MDCache::create_mydir_hierarchy(MDSGather *gather)
@@ -6360,14 +6362,19 @@ void MDCache::identify_files_to_recover()
 
 void MDCache::start_files_to_recover()
 {
+  int count = 0;
   for (CInode *in : rejoin_check_q) {
     if (in->filelock.get_state() == LOCK_XLOCKSNAP)
       mds->locker->issue_caps(in);
     mds->locker->check_inode_max_size(in);
+    if (!(++count % 1000))
+      mds->heartbeat_reset();
   }
   rejoin_check_q.clear();
   for (CInode *in : rejoin_recover_q) {
     mds->locker->file_recover(&in->filelock);
+    if (!(++count % 1000))
+      mds->heartbeat_reset();
   }
   if (!rejoin_recover_q.empty()) {
     rejoin_recover_q.clear();
@@ -8147,7 +8154,7 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
   if (mdr)
     mdr->snapid = snapid;
 
-  client_t client = (mdr && mdr->reqid.name.is_client()) ? mdr->reqid.name.num() : -1;
+  client_t client = mdr ? mdr->get_client() : -1;
 
   if (mds->logger) mds->logger->inc(l_mds_traverse);
 
@@ -12513,21 +12520,21 @@ void MDCache::dump_tree(CInode *in, const int cur_depth, const int max_depth, Fo
   f->close_section();
 }
 
-int MDCache::dump_cache(std::string_view file_name)
+int MDCache::dump_cache(std::string_view file_name, double timeout)
 {
-  return dump_cache(file_name, NULL);
+  return dump_cache(file_name, NULL, timeout);
 }
 
-int MDCache::dump_cache(Formatter *f)
+int MDCache::dump_cache(Formatter *f, double timeout)
 {
-  return dump_cache(std::string_view(""), f);
+  return dump_cache(std::string_view(""), f, timeout);
 }
 
 /**
  * Dump the metadata cache, either to a Formatter, if
  * provided, else to a plain text file.
  */
-int MDCache::dump_cache(std::string_view fn, Formatter *f)
+int MDCache::dump_cache(std::string_view fn, Formatter *f, double timeout)
 {
   int r = 0;
 
@@ -12613,22 +12620,50 @@ int MDCache::dump_cache(std::string_view fn, Formatter *f)
     return 1;
   };
 
+  auto start = mono_clock::now();
+  int64_t count = 0;
   for (auto &p : inode_map) {
     r = dump_func(p.second);
     if (r < 0)
       goto out;
+    if (!(++count % 1000) &&
+	timeout > 0 &&
+	std::chrono::duration<double>(mono_clock::now() - start).count() > timeout) {
+      r = -ETIMEDOUT;
+      goto out;
+    }
   }
   for (auto &p : snap_inode_map) {
     r = dump_func(p.second);
     if (r < 0)
       goto out;
+    if (!(++count % 1000) &&
+		timeout > 0 &&
+	std::chrono::duration<double>(mono_clock::now() - start).count() > timeout) {
+      r = -ETIMEDOUT;
+      goto out;
+    }
+
   }
   r = 0;
 
  out:
   if (f) {
+    if (r == -ETIMEDOUT)
+    {
+      f->close_section();
+      f->open_object_section("result");
+      f->dump_string("error", "the operation timeout");
+    }
     f->close_section();  // inodes
   } else {
+    if (r == -ETIMEDOUT)
+    {
+      CachedStackStringStream css;
+      *css << "error : the operation timeout" << std::endl;
+      auto sv = css->strv();
+      r = safe_write(fd, sv.data(), sv.size());
+    }
     ::close(fd);
   }
   return r;

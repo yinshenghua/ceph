@@ -46,6 +46,8 @@
 
 namespace rgw::sal {
 
+RadosObject::~RadosObject() {}
+
 static int decode_policy(CephContext* cct,
                          bufferlist& bl,
                          RGWAccessControlPolicy* policy)
@@ -215,6 +217,8 @@ Object* RadosBucket::create_object(const rgw_obj_key &key)
   return nullptr;
 }
 
+RadosBucket::~RadosBucket() {}
+
 int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
 			       bool delete_children,
 			       std::string prefix,
@@ -288,7 +292,7 @@ int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
   RGWPubSub::Bucket ps_bucket(&ps, info.bucket);
   const auto ps_ret = ps_bucket.remove_notifications(dpp, y);
   if (ps_ret < 0 && ps_ret != -ENOENT) {
-    lderr(store->ctx()) << "ERROR: unable to remove notifications from bucket. ret=" << ps_ret << dendl;
+    ldpp_dout(dpp, -1) << "ERROR: unable to remove notifications from bucket. ret=" << ps_ret << dendl;
   }
 
   ret = store->ctl()->bucket->unlink_bucket(info.owner, info.bucket, y, dpp, false);
@@ -336,6 +340,7 @@ int RadosBucket::get_bucket_info(const DoutPrefixProvider* dpp, optional_yield y
   if (ret == 0) {
     bucket_version = ep_ot.read_version;
     ent.placement_rule = info.placement_rule;
+    ent.bucket = info.bucket; // we looked up bucket_id
   }
   return ret;
 }
@@ -474,10 +479,10 @@ int RadosBucket::check_empty(const DoutPrefixProvider* dpp, optional_yield y)
   return store->getRados()->check_bucket_empty(dpp, info, y);
 }
 
-int RadosBucket::check_quota(RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota, uint64_t obj_size,
+int RadosBucket::check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota, uint64_t obj_size,
 				optional_yield y, bool check_size_only)
 {
-    return store->getRados()->check_quota(owner->get_id(), get_key(),
+    return store->getRados()->check_quota(dpp, owner->get_id(), get_key(),
 					  user_quota, bucket_quota, obj_size, y, check_size_only);
 }
 
@@ -539,7 +544,7 @@ int RadosBucket::purge_instance(const DoutPrefixProvider* dpp)
            << "): " << cpp_strerror(-ret) << std::endl;
       return ret;
     }
-    ret = store->getRados()->bi_remove(bs);
+    ret = store->getRados()->bi_remove(dpp, bs);
     if (ret < 0) {
       cerr << "ERROR: failed to remove bucket index object: "
            << cpp_strerror(-ret) << std::endl;
@@ -932,9 +937,10 @@ std::unique_ptr<Completions> RadosStore::get_completions(void)
 
 std::unique_ptr<Notification> RadosStore::get_notification(rgw::sal::Object* obj,
 							    struct req_state* s,
-							    rgw::notify::EventType event_type)
+							    rgw::notify::EventType event_type,
+                                                            const std::string* object_name)
 {
-  return std::unique_ptr<Notification>(new RadosNotification(s, this, obj, s, event_type));
+  return std::unique_ptr<Notification>(new RadosNotification(s, this, obj, s, event_type, object_name));
 }
 
 std::unique_ptr<GCChain> RadosStore::get_gc_chain(rgw::sal::Object* obj)
@@ -992,10 +998,10 @@ int RadosStore::log_op(const DoutPrefixProvider *dpp, std::string& oid, bufferli
   return ret;
 }
 
-int RadosStore::register_to_service_map(const std::string& daemon_type,
+int RadosStore::register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 					   const map<std::string, std::string>& meta)
 {
-  return rados->register_to_service_map(daemon_type, meta);
+  return rados->register_to_service_map(dpp, daemon_type, meta);
 }
 
 void RadosStore::get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota)
@@ -1053,9 +1059,9 @@ int RadosStore::meta_list_keys_init(const DoutPrefixProvider *dpp, const std::st
   return ctl()->meta.mgr->list_keys_init(dpp, section, marker, phandle);
 }
 
-int RadosStore::meta_list_keys_next(void* handle, int max, list<std::string>& keys, bool* truncated)
+int RadosStore::meta_list_keys_next(const DoutPrefixProvider *dpp, void* handle, int max, list<std::string>& keys, bool* truncated)
 {
-  return ctl()->meta.mgr->list_keys_next(handle, max, keys, truncated);
+  return ctl()->meta.mgr->list_keys_next(dpp, handle, max, keys, truncated);
 }
 
 void RadosStore::meta_list_keys_complete(void* handle)
@@ -1574,13 +1580,16 @@ int RadosObject::RadosDeleteOp::delete_obj(const DoutPrefixProvider* dpp, option
   return ret;
 }
 
-int RadosObject::delete_object(const DoutPrefixProvider* dpp, RGWObjectCtx* obj_ctx, optional_yield y)
+int RadosObject::delete_object(const DoutPrefixProvider* dpp,
+			       RGWObjectCtx* obj_ctx,
+			       optional_yield y,
+			       bool prevent_versioning)
 {
   RGWRados::Object del_target(store->getRados(), bucket->get_info(), *obj_ctx, get_obj());
   RGWRados::Object::Delete del_op(&del_target);
 
   del_op.params.bucket_owner = bucket->get_info().owner;
-  del_op.params.versioning_status = bucket->get_info().versioning_status();
+  del_op.params.versioning_status = prevent_versioning ? 0 : bucket->get_info().versioning_status();
 
   return del_op.delete_obj(y, dpp);
 }
@@ -1615,10 +1624,10 @@ int RadosObject::RadosStatOp::stat_async(const DoutPrefixProvider *dpp)
   return parent_op.stat_async(dpp);
 }
 
-int RadosObject::RadosStatOp::wait()
+int RadosObject::RadosStatOp::wait(const DoutPrefixProvider *dpp)
 {
   result.obj = source;
-  int ret =  parent_op.wait();
+  int ret =  parent_op.wait(dpp);
   if (ret < 0)
     return ret;
 
@@ -1719,6 +1728,7 @@ RadosObject::RadosWriteOp::RadosWriteOp(RadosObject* _source, RGWObjectCtx* _rct
 int RadosObject::RadosWriteOp::prepare(optional_yield y)
 {
   op_target.set_versioning_disabled(params.versioning_disabled);
+  op_target.set_meta_placement_rule(params.pmeta_placement_rule);
   parent_op.meta.mtime = params.mtime;
   parent_op.meta.rmattrs = params.rmattrs;
   parent_op.meta.data = params.data;
@@ -1912,9 +1922,9 @@ int RadosNotification::publish_reserve(const DoutPrefixProvider *dpp, RGWObjTags
 }
 
 int RadosNotification::publish_commit(const DoutPrefixProvider* dpp, uint64_t size,
-				     const ceph::real_time& mtime, const std::string& etag)
+				     const ceph::real_time& mtime, const std::string& etag, const std::string& version)
 {
-  return rgw::notify::publish_commit(obj, size, mtime, etag, event_type, res, dpp);
+  return rgw::notify::publish_commit(obj, size, mtime, etag, version, event_type, res, dpp);
 }
 
 void RadosGCChain::update(const DoutPrefixProvider *dpp, RGWObjManifest* manifest)

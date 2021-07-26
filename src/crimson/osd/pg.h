@@ -164,9 +164,9 @@ public:
   }
 
   void send_cluster_message(
-    int osd, MessageRef m,
+    int osd, MessageURef m,
     epoch_t epoch, bool share_map_update=false) final {
-    (void)shard_services.send_to_osd(osd, m, epoch);
+    (void)shard_services.send_to_osd(osd, std::move(m), epoch);
   }
 
   void send_pg_created(pg_t pgid) final {
@@ -465,7 +465,6 @@ public:
     int acting_primary,
     const pg_history_t& history,
     const PastIntervals& pim,
-    bool backfill,
     ceph::os::Transaction &t);
 
   seastar::future<> read_state(crimson::os::FuturizedStore* store);
@@ -556,17 +555,9 @@ private:
     const hobject_t &oid,
     RWState::State type);
 
-  void do_peering_event(
-    const boost::statechart::event_base &evt,
-    PeeringCtx &rctx);
   void fill_op_params_bump_pg_version(
     osd_op_params_t& osd_op_p,
     const bool user_modify);
-  interruptible_future<Ref<MOSDOpReply>> handle_failed_op(
-    const std::error_code& e,
-    ObjectContextRef obc,
-    const OpsExecuter& ox,
-    const MOSDOp& m) const;
   using do_osd_ops_ertr = crimson::errorator<
    crimson::ct_error::eagain>;
   using do_osd_ops_iertr =
@@ -577,7 +568,7 @@ private:
   using pg_rep_op_fut_t =
     std::tuple<interruptible_future<>,
                do_osd_ops_iertr::future<Ret>>;
-  do_osd_ops_iertr::future<pg_rep_op_fut_t<Ref<MOSDOpReply>>> do_osd_ops(
+  do_osd_ops_iertr::future<pg_rep_op_fut_t<MURef<MOSDOpReply>>> do_osd_ops(
     Ref<MOSDOp> m,
     ObjectContextRef obc,
     const OpInfo &op_info);
@@ -595,12 +586,12 @@ private:
     do_osd_ops_failure_func_t failure_func);
   template <class Ret, class SuccessFunc, class FailureFunc>
   do_osd_ops_iertr::future<pg_rep_op_fut_t<Ret>> do_osd_ops_execute(
-    OpsExecuter&& ox,
+    seastar::lw_shared_ptr<OpsExecuter> ox,
     std::vector<OSDOp>& ops,
     const OpInfo &op_info,
     SuccessFunc&& success_func,
     FailureFunc&& failure_func);
-  interruptible_future<Ref<MOSDOpReply>> do_pg_ops(Ref<MOSDOp> m);
+  interruptible_future<MURef<MOSDOpReply>> do_pg_ops(Ref<MOSDOp> m);
   std::tuple<interruptible_future<>, interruptible_future<>>
   submit_transaction(
     const OpInfo& op_info,

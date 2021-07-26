@@ -82,6 +82,16 @@ file system.  If any files have layouts for the removed data pool, the file
 data will become unavailable. The default data pool (when creating the file
 system) cannot be removed.
 
+::
+
+    fs rename <file system name> <new file system name> [--yes-i-really-mean-it]
+
+Rename a Ceph file system. This also changes the application tags on the data
+pools and metadata pool of the file system to the new file system name.
+The CephX IDs authorized to the old file system name need to be reauthorized
+to the new name. Any on-going operations of the clients using these IDs may be
+disrupted. Mirroring is expected to be disabled on the file system.
+
 
 Settings
 --------
@@ -385,3 +395,14 @@ This removes a rank from the failed set.
 
 This command resets the file system state to defaults, except for the name and
 pools. Non-zero ranks are saved in the stopped set.
+
+
+::
+
+    fs new <file system name> <metadata pool name> <data pool name> --fscid <fscid> --force
+
+This command creates a file system with a specific **fscid** (file system cluster ID).
+You may want to do this when an application expects the file system's ID to be
+stable after it has been recovered, e.g., after monitor databases are lost and
+rebuilt. Consequently, file system IDs don't always keep increasing with newer
+file systems.

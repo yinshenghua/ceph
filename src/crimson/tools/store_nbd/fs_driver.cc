@@ -159,8 +159,10 @@ seastar::future<> FSDriver::close()
 
 void FSDriver::init()
 {
+  fs.reset();
   fs = FuturizedStore::create(
     config.get_fs_type(),
     *config.path,
-    crimson::common::local_conf().get_config_values());
+    crimson::common::local_conf().get_config_values(),
+    alien);
 }

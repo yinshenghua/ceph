@@ -799,6 +799,7 @@ public:
   vinodeno_t map_faked_ino(ino_t ino);
 
   //notify the mds to flush the mdlog
+  void flush_mdlog_sync(Inode *in);
   void flush_mdlog_sync();
   void flush_mdlog(MetaSession *session);
 
@@ -1411,6 +1412,8 @@ private:
 
   bool _vxattrcb_snap_btime_exists(Inode *in);
   size_t _vxattrcb_snap_btime(Inode *in, char *val, size_t size);
+
+  size_t _vxattrcb_caps(Inode *in, char *val, size_t size);
 
   bool _vxattrcb_mirror_info_exists(Inode *in);
   size_t _vxattrcb_mirror_info(Inode *in, char *val, size_t size);

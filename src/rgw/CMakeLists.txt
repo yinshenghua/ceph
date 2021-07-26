@@ -54,6 +54,7 @@ set(librgw_common_srcs
   rgw_bucket_layout.cc
   rgw_bucket_sync.cc
   rgw_cache.cc
+  rgw_d3n_datacache.cc
   rgw_common.cc
   rgw_compression.cc
   rgw_etag_verifier.cc
@@ -281,7 +282,7 @@ endif()
 list(APPEND rgw_libs ${LUA_LIBRARIES})
 
 if(WITH_RADOSGW_LUA_PACKAGES)
-  list(APPEND rgw_libs Boost::filesystem)
+  list(APPEND rgw_libs Boost::filesystem StdFilesystem::filesystem)
 endif()
 
 set(rgw_schedulers_srcs

@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from functools import wraps, reduce
 
 from typing import TypeVar, Generic, List, Optional, Union, Tuple, Iterator, Callable, Any, \
-    Sequence, Dict, cast
+    Sequence, Dict, cast, Mapping
 
 try:
     from typing import Protocol  # Protocol was added in Python 3.8
@@ -348,6 +348,14 @@ class Orchestrator(object):
         Remove a host from the orchestrator inventory.
 
         :param host: hostname
+        """
+        raise NotImplementedError()
+
+    def drain_host(self, hostname: str) -> OrchResult[str]:
+        """
+        drain all daemons from a host
+
+        :param hostname: hostname
         """
         raise NotImplementedError()
 
@@ -728,6 +736,10 @@ def service_to_daemon_types(stype: str) -> List[str]:
     return mapping[stype]
 
 
+KNOWN_DAEMON_TYPES: List[str] = list(
+    sum((service_to_daemon_types(t) for t in ServiceSpec.KNOWN_SERVICE_TYPES), []))
+
+
 class UpgradeStatusSpec(object):
     # Orchestrator's report on what's going on with any ongoing upgrade
     def __init__(self) -> None:
@@ -794,6 +806,8 @@ class DaemonDescription(object):
                  ports: Optional[List[int]] = None,
                  ip: Optional[str] = None,
                  deployed_by: Optional[List[str]] = None,
+                 rank: Optional[int] = None,
+                 rank_generation: Optional[int] = None,
                  ) -> None:
 
         # Host is at the same granularity as InventoryHost
@@ -815,6 +829,10 @@ class DaemonDescription(object):
         # This is the <foo> in mds.<foo>, the ID that will appear
         # in the FSMap/ServiceMap.
         self.daemon_id: Optional[str] = daemon_id
+
+        # Some daemon types have a numeric rank assigned
+        self.rank: Optional[int] = rank
+        self.rank_generation: Optional[int] = rank_generation
 
         self._service_name: Optional[str] = service_name
 
@@ -943,6 +961,7 @@ class DaemonDescription(object):
         out: Dict[str, Any] = OrderedDict()
         out['daemon_type'] = self.daemon_type
         out['daemon_id'] = self.daemon_id
+        out['service_name'] = self._service_name
         out['hostname'] = self.hostname
         out['container_id'] = self.container_id
         out['container_image_id'] = self.container_image_id
@@ -959,6 +978,8 @@ class DaemonDescription(object):
         out['is_active'] = self.is_active
         out['ports'] = self.ports
         out['ip'] = self.ip
+        out['rank'] = self.rank
+        out['rank_generation'] = self.rank_generation
 
         for k in ['last_refresh', 'created', 'started', 'last_deployed',
                   'last_configured']:
@@ -1027,7 +1048,7 @@ class DaemonDescription(object):
 
     @staticmethod
     def yaml_representer(dumper: 'yaml.SafeDumper', data: 'DaemonDescription') -> Any:
-        return dumper.represent_dict(data.to_json().items())
+        return dumper.represent_dict(cast(Mapping, data.to_json().items()))
 
 
 yaml.add_representer(DaemonDescription, DaemonDescription.yaml_representer)
@@ -1050,7 +1071,6 @@ class ServiceDescription(object):
                  spec: ServiceSpec,
                  container_image_id: Optional[str] = None,
                  container_image_name: Optional[str] = None,
-                 rados_config_location: Optional[str] = None,
                  service_url: Optional[str] = None,
                  last_refresh: Optional[datetime.datetime] = None,
                  created: Optional[datetime.datetime] = None,
@@ -1065,10 +1085,6 @@ class ServiceDescription(object):
         # (image name)
         self.container_image_id = container_image_id      # image hash
         self.container_image_name = container_image_name  # image friendly name
-
-        # Location of the service configuration when stored in rados
-        # object. Format: "rados://<pool>/[<namespace/>]<object>"
-        self.rados_config_location = rados_config_location
 
         # If the service exposes REST-like API, this attribute should hold
         # the URL.
@@ -1108,7 +1124,6 @@ class ServiceDescription(object):
         status = {
             'container_image_id': self.container_image_id,
             'container_image_name': self.container_image_name,
-            'rados_config_location': self.rados_config_location,
             'service_url': self.service_url,
             'size': self.size,
             'running': self.running,
@@ -1131,7 +1146,6 @@ class ServiceDescription(object):
         status = {
             'container_image_id': self.container_image_id,
             'container_image_name': self.container_image_name,
-            'rados_config_location': self.rados_config_location,
             'service_url': self.service_url,
             'size': self.size,
             'running': self.running,
@@ -1165,8 +1179,8 @@ class ServiceDescription(object):
         return cls(spec=spec, events=events, **c_status)
 
     @staticmethod
-    def yaml_representer(dumper: 'yaml.SafeDumper', data: 'DaemonDescription') -> Any:
-        return dumper.represent_dict(data.to_json().items())
+    def yaml_representer(dumper: 'yaml.SafeDumper', data: 'ServiceDescription') -> Any:
+        return dumper.represent_dict(cast(Mapping, data.to_json().items()))
 
 
 yaml.add_representer(ServiceDescription, ServiceDescription.yaml_representer)

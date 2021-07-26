@@ -4,7 +4,6 @@
 #include "crimson/os/seastore/logging.h"
 
 #include "crimson/os/seastore/onode_manager/staged-fltree/fltree_onode_manager.h"
-#include "crimson/os/seastore/onode_manager/staged-fltree/stages/key_layout.h"
 
 namespace crimson::os::seastore::onode {
 
@@ -12,14 +11,7 @@ FLTreeOnodeManager::contains_onode_ret FLTreeOnodeManager::contains_onode(
   Transaction &trans,
   const ghobject_t &hoid)
 {
-  return tree.contains(
-    trans, hoid
-  ).handle_error(
-    contains_onode_ertr::pass_further{},
-    crimson::ct_error::assert_all{
-      "Invalid error in FLTreeOnodeManager::contains_onode"
-    }
-  );
+  return tree.contains(trans, hoid);
 }
 
 FLTreeOnodeManager::get_onode_ret FLTreeOnodeManager::get_onode(
@@ -39,12 +31,7 @@ FLTreeOnodeManager::get_onode_ret FLTreeOnodeManager::get_onode(
     return seastar::make_ready_future<OnodeRef>(
       val
     );
-  }).handle_error(
-    get_onode_ertr::pass_further{},
-    crimson::ct_error::assert_all{
-      "Invalid error in FLTreeOnodeManager::get_onode"
-    }
-  );
+  });
 }
 
 FLTreeOnodeManager::get_or_create_onode_ret
@@ -53,10 +40,6 @@ FLTreeOnodeManager::get_or_create_onode(
   const ghobject_t &hoid)
 {
   LOG_PREFIX(FLTreeOnodeManager::get_or_create_onode);
-  if (hoid.hobj.oid.name.length() + hoid.hobj.nspace.length()
-      > key_view_t::MAX_NS_OID_LENGTH) {
-    return crimson::ct_error::value_too_large::make();
-  }
   return tree.insert(
     trans, hoid,
     OnodeTree::tree_value_config_t{sizeof(onode_layout_t)}
@@ -71,12 +54,7 @@ FLTreeOnodeManager::get_or_create_onode(
     return seastar::make_ready_future<OnodeRef>(
       val
     );
-  }).handle_error(
-    get_or_create_onode_ertr::pass_further{},
-    crimson::ct_error::assert_all{
-      "Invalid error in FLTreeOnodeManager::get_or_create_onode"
-    }
-  );
+  });
 }
 
 FLTreeOnodeManager::get_or_create_onodes_ret
@@ -107,7 +85,7 @@ FLTreeOnodeManager::write_dirty_ret FLTreeOnodeManager::write_dirty(
 {
   return crimson::do_for_each(
     onodes,
-    [this, &trans](auto &onode) -> OnodeTree::btree_future<> {
+    [this, &trans](auto &onode) -> eagain_future<> {
       auto &flonode = static_cast<FLTreeOnode&>(*onode);
       switch (flonode.status) {
       case FLTreeOnode::status_t::MUTATED: {
@@ -123,12 +101,7 @@ FLTreeOnodeManager::write_dirty_ret FLTreeOnodeManager::write_dirty(
       default:
         __builtin_unreachable();
       }
-    }).handle_error(
-      write_dirty_ertr::pass_further{},
-      crimson::ct_error::assert_all{
-        "Invalid error in FLTreeOnodeManager::write_dirty"
-      }
-    );
+    });
 }
 
 FLTreeOnodeManager::erase_onode_ret FLTreeOnodeManager::erase_onode(
@@ -154,18 +127,19 @@ FLTreeOnodeManager::list_onodes_ret FLTreeOnodeManager::list_onodes(
         std::move(cursor),
         list_onodes_bare_ret(),
         [this, &trans, end] (auto& to_list, auto& current_cursor, auto& ret) {
-      using get_next_ertr = typename OnodeTree::btree_ertr;
-      return crimson::do_until(
+      return crimson::repeat(
           [this, &trans, end, &to_list, &current_cursor, &ret] () mutable
-          -> get_next_ertr::future<bool> {
+          -> eagain_future<seastar::stop_iteration> {
         if (current_cursor.is_end() ||
             current_cursor.get_ghobj() >= end) {
           std::get<1>(ret) = end;
-          return seastar::make_ready_future<bool>(true);
+          return seastar::make_ready_future<seastar::stop_iteration>(
+            seastar::stop_iteration::yes);
         }
         if (to_list == 0) {
           std::get<1>(ret) = current_cursor.get_ghobj();
-          return seastar::make_ready_future<bool>(true);
+          return seastar::make_ready_future<seastar::stop_iteration>(
+            seastar::stop_iteration::yes);
         }
         std::get<0>(ret).emplace_back(current_cursor.get_ghobj());
         return tree.get_next(trans, current_cursor
@@ -174,19 +148,14 @@ FLTreeOnodeManager::list_onodes_ret FLTreeOnodeManager::list_onodes(
           // accelerate tree lookup.
           --to_list;
           current_cursor = next_cursor;
-          return seastar::make_ready_future<bool>(false);
+          return seastar::stop_iteration::no;
         });
       }).safe_then([&ret] () mutable {
         return seastar::make_ready_future<list_onodes_bare_ret>(
             std::move(ret));
       });
     });
-  }).handle_error(
-    list_onodes_ertr::pass_further{},
-    crimson::ct_error::assert_all{
-      "Invalid error in FLTreeOnodeManager::list_onodes"
-    }
-  );
+  });
 }
 
 FLTreeOnodeManager::~FLTreeOnodeManager() {}
