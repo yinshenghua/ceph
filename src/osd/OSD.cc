@@ -993,7 +993,7 @@ float OSDService::compute_adjusted_ratio(osd_stat_t new_stat, float *pratio,
 				         uint64_t adjust_used)
 {
   *pratio =
-   ((float)new_stat.statfs.get_used()) / ((float)new_stat.statfs.total);
+   ((float)new_stat.statfs.get_used_raw()) / ((float)new_stat.statfs.total);
 
   if (adjust_used) {
     dout(20) << __func__ << " Before kb_used() " << new_stat.statfs.kb_used()  << dendl;
@@ -1014,7 +1014,7 @@ float OSDService::compute_adjusted_ratio(osd_stat_t new_stat, float *pratio,
   if (backfill_adjusted) {
     dout(20) << __func__ << " backfill adjusted " << new_stat << dendl;
   }
-  return ((float)new_stat.statfs.get_used()) / ((float)new_stat.statfs.total);
+  return ((float)new_stat.statfs.get_used_raw()) / ((float)new_stat.statfs.total);
 }
 
 bool OSDService::check_osdmap_full(const set<pg_shard_t> &missing_on)
@@ -8019,20 +8019,26 @@ void OSD::sched_scrub()
 void OSD::resched_all_scrubs()
 {
   dout(10) << __func__ << ": start" << dendl;
-  OSDService::ScrubJob scrub;
-  if (service.first_scrub_stamp(&scrub)) {
-    do {
-      dout(20) << __func__ << ": examine " << scrub.pgid << dendl;
-
-      PGRef pg = _lookup_lock_pg(scrub.pgid);
+  const vector<spg_t> pgs = [this] {
+    vector<spg_t> pgs;
+    OSDService::ScrubJob job;
+    if (service.first_scrub_stamp(&job)) {
+      do {
+        pgs.push_back(job.pgid);
+      } while (service.next_scrub_stamp(job, &job));
+    }
+    return pgs;
+  }();
+  for (auto& pgid : pgs) {
+      dout(20) << __func__ << ": examine " << pgid << dendl;
+      PGRef pg = _lookup_lock_pg(pgid);
       if (!pg)
 	continue;
       if (!pg->scrubber.must_scrub && !pg->scrubber.need_auto) {
-        dout(20) << __func__ << ": reschedule " << scrub.pgid << dendl;
+        dout(15) << __func__ << ": reschedule " << pgid << dendl;
         pg->on_info_history_change();
       }
       pg->unlock();
-    } while (service.next_scrub_stamp(scrub, &scrub));
   }
   dout(10) << __func__ << ": done" << dendl;
 }
