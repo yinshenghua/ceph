@@ -34,7 +34,7 @@ namespace rgw::dmclock {
 struct RGWProcessEnv {
   rgw::sal::Store* store;
   RGWREST *rest;
-  OpsLogSocket *olog;
+  OpsLogSink *olog;
   int port;
   std::string uri_prefix;
   std::shared_ptr<rgw::auth::StrategyRegistry> auth_registry;
@@ -44,12 +44,12 @@ class RGWFrontendConfig;
 class RGWRequest;
 
 class RGWProcess {
-  deque<RGWRequest*> m_req_queue;
+  std::deque<RGWRequest*> m_req_queue;
 protected:
   CephContext *cct;
   rgw::sal::Store* store;
   rgw_auth_registry_ptr_t auth_registry;
-  OpsLogSocket* olog;
+  OpsLogSink* olog;
   ThreadPool m_tp;
   Throttle req_throttle;
   RGWREST* rest;
@@ -157,7 +157,7 @@ public:
   void run() override;
   void checkpoint();
   void handle_request(const DoutPrefixProvider *dpp, RGWRequest* req) override;
-  void gen_request(const string& method, const string& resource,
+  void gen_request(const std::string& method, const std::string& resource,
 		  int content_length, std::atomic<bool>* fail_flag);
 
   void set_access_key(RGWAccessKey& key) { access_key = key; }
@@ -169,7 +169,7 @@ extern int process_request(rgw::sal::Store* store,
                            const std::string& frontend_prefix,
                            const rgw_auth_registry_t& auth_registry,
                            RGWRestfulIO* client_io,
-                           OpsLogSocket* olog,
+                           OpsLogSink* olog,
                            optional_yield y,
                            rgw::dmclock::Scheduler *scheduler,
                            std::string* user,

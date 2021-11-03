@@ -390,9 +390,13 @@ function TEST_auto_repair_bluestore_tag() {
     # Launch a cluster with 3 seconds scrub interval
     run_mon $dir a || return 1
     run_mgr $dir x || return 1
+    # Set scheduler to "wpq" until there's a reliable way to query scrub states
+    # with "--osd-scrub-sleep" set to 0. The "mclock_scheduler" overrides the
+    # scrub sleep to 0 and as a result the checks in the test fail.
     local ceph_osd_args="--osd-scrub-auto-repair=true \
             --osd_deep_scrub_randomize_ratio=0 \
-            --osd-scrub-interval-randomize-ratio=0"
+            --osd-scrub-interval-randomize-ratio=0 \
+            --osd-op-queue=wpq"
     for id in $(seq 0 2) ; do
         run_osd $dir $id $ceph_osd_args || return 1
     done
@@ -4669,8 +4673,6 @@ EOF
           "primary": false
         },
         {
-          "data_digest": "0x00000000",
-          "omap_digest": "0xffffffff",
           "object_info": {
             "oid": {
               "oid": "EOBJ5",
@@ -4707,6 +4709,7 @@ EOF
           },
           "size": 4096,
           "errors": [
+            "read_error",
             "size_mismatch_info",
             "obj_size_info_mismatch"
           ],
@@ -4759,6 +4762,7 @@ EOF
         "watchers": {}
       },
       "union_shard_errors": [
+        "read_error",
         "size_mismatch_info",
         "obj_size_info_mismatch"
       ],
@@ -5437,8 +5441,8 @@ EOF
           "size": 4096,
           "shard": 0,
           "errors": [
+            "read_error",
             "size_mismatch_info",
-            "ec_size_error",
             "obj_size_info_mismatch"
           ],
           "osd": 1,
@@ -5489,8 +5493,8 @@ EOF
         "watchers": {}
       },
       "union_shard_errors": [
+        "read_error",
         "size_mismatch_info",
-        "ec_size_error",
         "obj_size_info_mismatch"
       ],
       "errors": [

@@ -46,7 +46,7 @@ struct MetaSession {
   int mds_state = MDSMap::STATE_NULL;
   bool readonly = false;
 
-  list<Context*> waiting_for_open;
+  std::list<Context*> waiting_for_open;
 
   xlist<Cap*> caps;
   xlist<Inode*> flushing_caps;
@@ -68,4 +68,5 @@ struct MetaSession {
       ceph_seq_t mseq, epoch_t osd_barrier);
 };
 
+using MetaSessionRef = std::shared_ptr<MetaSession>;
 #endif

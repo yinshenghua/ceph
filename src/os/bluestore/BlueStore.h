@@ -59,7 +59,6 @@
 class Allocator;
 class FreelistManager;
 class BlueStoreRepairer;
-
 //#define DEBUG_CACHE
 //#define DEBUG_DEFERRED
 
@@ -67,7 +66,7 @@ class BlueStoreRepairer;
 
 // constants for Buffer::optimize()
 #define MAX_BUFFER_SLOP_RATIO_DEN  8  // so actually 1/N
-
+#define CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
 
 enum {
   l_bluestore_first = 732430,
@@ -126,6 +125,7 @@ enum {
   l_bluestore_write_small_bytes,
   l_bluestore_write_small_unused,
   l_bluestore_write_deferred,
+  l_bluestore_write_deferred_bytes,
   l_bluestore_write_small_pre_read,
   l_bluestore_write_new,
   l_bluestore_txc,
@@ -144,6 +144,7 @@ enum {
   l_bluestore_omap_get_values_lat,
   l_bluestore_clist_lat,
   l_bluestore_remove_lat,
+  l_bluestore_allocate_hist,
   l_bluestore_last
 };
 
@@ -951,6 +952,8 @@ public:
 
     /// split a blob (and referring extents)
     BlobRef split_blob(BlobRef lb, uint32_t blob_offset, uint32_t pos);
+
+    void provide_shard_info_to_onode(bufferlist v, uint32_t shard_id);
   };
 
   /// Compressed Blob Garbage collector
@@ -1146,11 +1149,28 @@ public:
       return !pinned;
     }
 
-    const std::string& get_omap_prefix();
-    void get_omap_header(std::string *out);
-    void get_omap_key(const std::string& key, std::string *out);
+    static const std::string& calc_omap_prefix(uint8_t flags);
+    static void calc_omap_header(uint8_t flags, const Onode* o,
+      std::string* out);
+    static void calc_omap_key(uint8_t flags, const Onode* o,
+      const std::string& key, std::string* out);
+    static void calc_omap_tail(uint8_t flags, const Onode* o,
+      std::string* out);
+
+    const std::string& get_omap_prefix() {
+      return calc_omap_prefix(onode.flags);
+    }
+    void get_omap_header(std::string* out) {
+      calc_omap_header(onode.flags, this, out);
+    }
+    void get_omap_key(const std::string& key, std::string* out) {
+      calc_omap_key(onode.flags, this, key, out);
+    }
+    void get_omap_tail(std::string* out) {
+      calc_omap_tail(onode.flags, this, out);
+    }
+
     void rewrite_omap_key(const std::string& old, std::string *out);
-    void get_omap_tail(std::string *out);
     void decode_omap_key(const std::string& key, std::string *user_key);
 
 #ifdef HAVE_LIBZBD
@@ -1583,16 +1603,13 @@ public:
     std::set<OnodeRef> modified_objects;  ///< objects we modified (and need a ref)
 
 #ifdef HAVE_LIBZBD
-    // A map from onode to a vector of object offset.  For new objects created
-    // in the transaction we append the new offset to the vector, for
-    // overwritten objects we append the negative of the previous ondisk offset
-    // followed by the new offset, and for truncated objects we append the
-    // negative of the previous ondisk offset.  We need to maintain a vector of
-    // offsets because *within the same transaction* an object may be truncated
-    // and then written again, or an object may be overwritten multiple times to
-    // different zones.  See _zoned_update_cleaning_metadata function for how
-    // this map is used.
-    std::map<OnodeRef, std::vector<int64_t>> zoned_onode_to_offset_map;
+    // zone refs to add/remove.  each zone ref is a (zone, offset) tuple.  The offset
+    // is the first offset in the zone that the onode touched; subsequent writes
+    // to that zone do not generate additional refs.  This is a bit imprecise but
+    // is sufficient to generate reasonably sequential reads when doing zone
+    // cleaning with less metadata than a ref for every extent.
+    std::map<std::pair<OnodeRef, uint32_t>, uint64_t> new_zone_offset_refs;
+    std::map<std::pair<OnodeRef, uint32_t>, uint64_t> old_zone_offset_refs;
 #endif
     
     std::set<SharedBlobRef> shared_blobs;  ///< these need to be updated/written
@@ -1668,28 +1685,13 @@ public:
     }
 
 #ifdef HAVE_LIBZBD
-    void zoned_note_new_object(OnodeRef &o) {
-      auto [_, ok] = zoned_onode_to_offset_map.emplace(
-	  std::pair<OnodeRef, std::vector<int64_t>>(o, {o->zoned_get_ondisk_starting_offset()}));
-      ceph_assert(ok);
+    void note_write_zone_offset(OnodeRef& o, uint32_t zone, uint64_t offset) {
+      o->onode.zone_offset_refs[zone] = offset;
+      new_zone_offset_refs[std::make_pair(o, zone)] = offset;
     }
-
-    void zoned_note_updated_object(OnodeRef &o, int64_t prev_offset) {
-      int64_t new_offset = o->zoned_get_ondisk_starting_offset();
-      auto [it, ok] = zoned_onode_to_offset_map.emplace(
-	  std::pair<OnodeRef, std::vector<int64_t>>(o, {-prev_offset, new_offset}));
-      if (!ok) {
-	it->second.push_back(-prev_offset);
-	it->second.push_back(new_offset);
-      }
-    }
-
-    void zoned_note_truncated_object(OnodeRef &o, int64_t offset) {
-      auto [it, ok] = zoned_onode_to_offset_map.emplace(
-	    std::pair<OnodeRef, std::vector<int64_t>>(o, {-offset}));
-      if (!ok) {
-	it->second.push_back(-offset);
-      }
+    void note_release_zone_offset(OnodeRef& o, uint32_t zone, uint64_t offset) {
+      old_zone_offset_refs[std::make_pair(o, zone)] = offset;
+      o->onode.zone_offset_refs.erase(zone);
     }
 #endif
 
@@ -2029,6 +2031,7 @@ public:
     bool apply_defer();
   };
 
+  bool has_null_fm();
   // --------------------------------------------------------
   // members
 private:
@@ -2041,7 +2044,8 @@ private:
   std::string freelist_type;
   FreelistManager *fm = nullptr;
 
-  bluefs_shared_alloc_context_t shared_alloc;
+  Allocator *alloc = nullptr;   ///< allocator consumed by BlueStore
+  bluefs_shared_alloc_context_t shared_alloc; ///< consumed by BlueFS (may be == alloc)
 
   uuid_d fsid;
   int path_fd = -1;  ///< open handle to $path
@@ -2127,6 +2131,10 @@ private:
   static_assert(std::numeric_limits<uint8_t>::max() >
 		std::numeric_limits<decltype(min_alloc_size)>::digits,
 		"not enough bits for min_alloc_size");
+
+  // smr-only
+  uint64_t zone_size = 0;              ///< number of SMR zones 
+  uint64_t first_sequential_zone = 0;  ///< first SMR zone that is sequential-only
 
   enum {
     // Please preserve the order since it's DB persistent
@@ -2382,11 +2390,13 @@ private:
 	       bool to_repair_db=false,
 	       bool read_only = false);
   void _close_db(bool read_only);
-  int _open_fm(KeyValueDB::Transaction t, bool read_only);
+  void _close_db_leave_bluefs();
+  int _open_fm(KeyValueDB::Transaction t, bool read_only, bool fm_restore = false);
   void _close_fm();
   int _write_out_fm_meta(uint64_t target_size);
   int _create_alloc();
-  int _init_alloc();
+  int _init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments);
+  void _post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments);
   void _close_alloc();
   int _open_collections();
   void _fsck_collections(int64_t* errors);
@@ -2395,14 +2405,6 @@ private:
   int _setup_block_symlink_or_file(std::string name, std::string path, uint64_t size,
 				   bool create);
 
-#ifdef HAVE_LIBZBD
-  // Functions related to zoned storage.
-  uint64_t _zoned_piggyback_device_parameters_onto(uint64_t min_alloc_size);
-  int _zoned_check_config_settings();
-  void _zoned_update_cleaning_metadata(TransContext *txc);
-  std::string _zoned_key(uint64_t offset, const ghobject_t *oid);
-#endif
-
 public:
   utime_t get_deferred_last_submitted() {
     std::lock_guard l(deferred_lock);
@@ -2410,13 +2412,13 @@ public:
   }
 
   static int _write_bdev_label(CephContext* cct,
-			       std::string path, bluestore_bdev_label_t label);
-  static int _read_bdev_label(CephContext* cct, std::string path,
+			       const std::string &path, bluestore_bdev_label_t label);
+  static int _read_bdev_label(CephContext* cct, const std::string &path,
 			      bluestore_bdev_label_t *label);
 private:
   int _check_or_set_bdev_label(std::string path, uint64_t size, std::string desc,
 			       bool create);
-  int _set_bdev_label_size(const string& path, uint64_t size);
+  int _set_bdev_label_size(const std::string& path, uint64_t size);
 
   int _open_super_meta();
 
@@ -2426,6 +2428,7 @@ private:
   void _dump_alloc_on_failure();
 
   CollectionRef _get_collection(const coll_t& cid);
+  CollectionRef _get_collection_by_oid(const ghobject_t& oid);
   void _queue_reap_collection(CollectionRef& c);
   void _reap_collections();
   void _update_cache_logger();
@@ -2476,10 +2479,13 @@ private:
   void _zoned_cleaner_start();
   void _zoned_cleaner_stop();
   void _zoned_cleaner_thread();
-  void _zoned_clean_zone(uint64_t zone_num);
+  void _zoned_clean_zone(uint64_t zone_num,
+			 class ZonedAllocator *a,
+			 class ZonedFreelistManager *f);
+  void _clean_some(ghobject_t oid, uint32_t zone_num);
 #endif
 
-  bluestore_deferred_op_t *_get_deferred_op(TransContext *txc);
+  bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, uint64_t len);
   void _deferred_queue(TransContext *txc);
 public:
   void deferred_try_submit();
@@ -2696,7 +2702,7 @@ public:
   int expand_devices(std::ostream& out);
   std::string get_device_path(unsigned id);
 
-  int dump_bluefs_sizes(ostream& out);
+  int dump_bluefs_sizes(std::ostream& out);
 
 public:
   int statfs(struct store_statfs_t *buf,
@@ -2984,6 +2990,8 @@ public:
   /// methods to inject various errors fsck can repair
   void inject_broken_shared_blob_key(const std::string& key,
 			 const ceph::buffer::list& bl);
+  void inject_no_shared_blob_key();
+
   void inject_leaked(uint64_t len);
   void inject_false_free(coll_t cid, ghobject_t oid);
   void inject_statfs(const std::string& key, const store_statfs_t& new_statfs);
@@ -3082,7 +3090,7 @@ private:
     std::lock_guard l(qlock);
     disk_size_mismatch_alert = s;
   }
-  void _set_spurious_read_errors_alert(const string& s) {
+  void _set_spurious_read_errors_alert(const std::string& s) {
     std::lock_guard l(qlock);
     spurious_read_errors_alert = s;
   }
@@ -3357,7 +3365,7 @@ private:
 			unsigned bits);
 
   void _collect_allocation_stats(uint64_t need, uint32_t alloc_size,
-                                 size_t extents);
+                                 const PExtentVector&);
   void _record_allocation_stats();
 private:
   uint64_t probe_count = 0;
@@ -3397,6 +3405,7 @@ public:
 
     mempool_dynamic_bitset* used_blocks;
     uint64_t_btree_t* used_omap_head;
+    std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs;
 
     ceph::mutex* sb_info_lock;
     sb_info_map_t& sb_info;
@@ -3414,7 +3423,8 @@ public:
                    uint64_t& _num_spanning_blobs,
                    mempool_dynamic_bitset* _ub,
                    uint64_t_btree_t* _used_omap_head,
-                   ceph::mutex* _sb_info_lock,
+		   std::vector<std::unordered_map<ghobject_t, uint64_t>> *_zone_refs,
+		   ceph::mutex* _sb_info_lock,
                    sb_info_map_t& _sb_info,
                    store_statfs_t& _store_statfs,
                    per_pool_statfs& _pool_statfs,
@@ -3428,6 +3438,7 @@ public:
       num_spanning_blobs(_num_spanning_blobs),
       used_blocks(_ub),
       used_omap_head(_used_omap_head),
+      zone_refs(_zone_refs),
       sb_info_lock(_sb_info_lock),
       sb_info(_sb_info),
       expected_store_statfs(_store_statfs),
@@ -3446,8 +3457,99 @@ public:
     mempool::bluestore_fsck::list<std::string>* expecting_shards,
     std::map<BlobRef, bluestore_blob_t::unused_t>* referenced,
     const BlueStore::FSCK_ObjectCtx& ctx);
-
+#ifdef CEPH_BLUESTORE_TOOL_RESTORE_ALLOCATION
+  int  push_allocation_to_rocksdb();
+  int  read_allocation_from_drive_for_bluestore_tool(bool test_store_and_restore);
+  int  read_allocation_from_drive_for_fsck() { return read_allocation_from_drive_for_bluestore_tool(false); }
+#endif
 private:
+#define MAX_BLOBS_IN_ONODE 128
+  struct  read_alloc_stats_t {
+    //read_alloc_stats_t() { memset(&this, 0, sizeof(read_alloc_stats_t)); }
+    uint32_t onode_count             = 0;
+    uint32_t shard_count             = 0;
+
+    uint32_t skipped_repeated_extent = 0;
+    uint32_t skipped_illegal_extent  = 0;
+
+    uint32_t collection_search       = 0;
+    uint32_t pad_limit_count         = 0;
+
+    uint64_t shared_blobs_count      = 0;
+    uint64_t compressed_blob_count   = 0;
+    uint64_t spanning_blob_count     = 0;
+    uint64_t insert_count            = 0;
+    uint64_t extent_count            = 0;
+
+    uint64_t saved_inplace_count     = 0;
+    uint32_t merge_insert_count      = 0;
+    uint32_t merge_inplace_count     = 0;
+
+    std::array<uint32_t, MAX_BLOBS_IN_ONODE+1>blobs_in_onode = {};
+    //uint32_t blobs_in_onode[MAX_BLOBS_IN_ONODE+1];
+  };
+
+  friend std::ostream& operator<<(std::ostream& out, const read_alloc_stats_t& stats) {
+    out << "==========================================================" << std::endl;
+    out << "NCB::onode_count             = " ;out.width(10);out << stats.onode_count << std::endl
+	<< "NCB::shard_count             = " ;out.width(10);out << stats.shard_count << std::endl
+	<< "NCB::shared_blobs_count      = " ;out.width(10);out << stats.shared_blobs_count << std::endl
+	<< "NCB::compressed_blob_count   = " ;out.width(10);out << stats.compressed_blob_count << std::endl
+	<< "NCB::spanning_blob_count     = " ;out.width(10);out << stats.spanning_blob_count << std::endl
+	<< "NCB::collection search       = " ;out.width(10);out << stats.collection_search << std::endl
+	<< "NCB::skipped_repeated_extent = " ;out.width(10);out << stats.skipped_repeated_extent << std::endl
+	<< "NCB::skipped_illegal_extent  = " ;out.width(10);out << stats.skipped_illegal_extent << std::endl
+	<< "NCB::extent_count            = " ;out.width(10);out << stats.extent_count << std::endl
+	<< "NCB::insert_count            = " ;out.width(10);out << stats.insert_count << std::endl;
+
+    if (stats.merge_insert_count) {
+      out << "NCB::merge_insert_count      = " ;out.width(10);out << stats.merge_insert_count  << std::endl;
+    }
+    if (stats.merge_inplace_count ) {
+      out << "NCB::merge_inplace_count     = " ;out.width(10);out << stats.merge_inplace_count << std::endl;
+      out << "NCB::saved_inplace_count     = " ;out.width(10);out << stats.saved_inplace_count << std::endl;
+      out << "NCB::saved inplace per call  = " ;out.width(10);out << stats.saved_inplace_count/stats.merge_inplace_count << std::endl;
+    }
+    out << "==========================================================" << std::endl;
+
+    for (unsigned i = 0; i < MAX_BLOBS_IN_ONODE; i++ ) {
+      if (stats.blobs_in_onode[i]) {
+	out << "NCB::We had " ;out.width(9); out << stats.blobs_in_onode[i]
+	    << " ONodes with "; out.width(3); out << i << " blobs" << std::endl;
+      }
+    }
+
+    if (stats.blobs_in_onode[MAX_BLOBS_IN_ONODE]) {
+      out << "NCB::We had " ;out.width(9);out << stats.blobs_in_onode[MAX_BLOBS_IN_ONODE]
+	  << " ONodes with more than " << MAX_BLOBS_IN_ONODE << " blobs" << std::endl;
+    }
+    return out;
+  }
+
+  int  compare_allocators(Allocator* alloc1, Allocator* alloc2, uint64_t req_extent_count, uint64_t memory_target);
+  Allocator* create_bitmap_allocator(uint64_t bdev_size);
+  int  add_existing_bluefs_allocation(Allocator* allocator, read_alloc_stats_t& stats);
+  int  allocator_add_restored_entries(Allocator *allocator, const void *buff, unsigned extent_count, uint64_t *p_read_alloc_size,
+				      uint64_t  *p_extent_count, const void *v_header, BlueFS::FileReader *p_handle, uint64_t offset);
+
+  int  copy_allocator(Allocator* src_alloc, Allocator *dest_alloc, uint64_t* p_num_entries);
+  int  store_allocator(Allocator* allocator);
+  int  invalidate_allocation_file_on_bluefs();
+  int  __restore_allocator(Allocator* allocator, uint64_t *num, uint64_t *bytes);
+  int  restore_allocator(Allocator* allocator, uint64_t *num, uint64_t *bytes);
+  int  read_allocation_from_drive_on_startup();
+  int  reconstruct_allocations(Allocator* allocator, read_alloc_stats_t &stats);
+  int  read_allocation_from_onodes(Allocator* allocator, read_alloc_stats_t& stats);
+  int  commit_to_null_manager();
+  int  commit_to_real_manager();
+  int  db_cleanup(int ret);
+  int  reset_fm_for_restore();
+  int  verify_rocksdb_allocations(Allocator *allocator);
+  Allocator* clone_allocator_without_bluefs(Allocator *src_allocator);
+  Allocator* initialize_allocator_from_freelist(FreelistManager *real_fm);
+  void copy_allocator_content_to_fm(Allocator *allocator, FreelistManager *real_fm);
+  void read_allocation_from_single_onode(Allocator* allocator, BlueStore::OnodeRef& onode_ref, read_alloc_stats_t&  stats);
+
   void _fsck_check_object_omap(FSCKDepth depth,
     OnodeRef& o,
     const BlueStore::FSCK_ObjectCtx& ctx);
@@ -3614,6 +3716,7 @@ public:
       return false;
     }
   };
+
 public:
   void fix_per_pool_omap(KeyValueDB *db, int);
   bool remove_key(KeyValueDB *db, const std::string& prefix, const std::string& key);

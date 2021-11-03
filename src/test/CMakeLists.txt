@@ -1,7 +1,7 @@
 include(AddCephTest)
 
-set(UNITTEST_LIBS GMock::Main GMock::GMock GTest::GTest ${CMAKE_THREAD_LIBS_INIT} 
-    ${GSSAPI_LIBRARIES} ${OPENLDAP_LIBRARIES} ${CMAKE_DL_LIBS})
+set(UNITTEST_LIBS GMock::Main GMock::GMock GTest::GTest ${CMAKE_THREAD_LIBS_INIT}
+    ${GSSAPI_LIBRARIES} ${CMAKE_DL_LIBS})
 
 if(WIN32)
   # Needed by Boost.
@@ -64,7 +64,9 @@ if(NOT WIN32)
   add_subdirectory(libcephsqlite)
   add_subdirectory(client)
   add_subdirectory(mon)
-  add_subdirectory(mgr)
+  if(WITH_MGR)
+    add_subdirectory(mgr)
+  endif()
   add_subdirectory(msgr)
   add_subdirectory(neorados)
   add_subdirectory(objectstore)
@@ -73,7 +75,7 @@ if(NOT WIN32)
   add_subdirectory(osd)
   add_subdirectory(osdc)
   add_subdirectory(immutable_object_cache)
-endif()
+endif(NOT WIN32)
 
 if(WITH_RADOSGW)
   set(rgw_libs rgw_a)
@@ -163,7 +165,7 @@ endif()
 add_executable(ceph_test_mutate
   test_mutate.cc
   )
-target_link_libraries(ceph_test_mutate global librados ${BLKID_LIBRARIES} 
+target_link_libraries(ceph_test_mutate global librados ${BLKID_LIBRARIES}
   ${CMAKE_DL_LIBS})
 
 if(NOT WIN32)
@@ -386,9 +388,11 @@ add_executable(test_rgw_ldap
 target_link_libraries(test_rgw_ldap
   librados
   ceph-common
-  ${OPENLDAP_LIBRARIES}
-  ${UNITTEST_LIBS}
-  )
+  ${UNITTEST_LIBS})
+if(WITH_OPENLDAP)
+  target_link_libraries(test_rgw_ldap
+    OpenLDAP::OpenLDAP)
+endif()
 endif(${WITH_RADOSGW})
 
 # ceph_multi_stress_watch
@@ -618,7 +622,7 @@ if(PROMTOOL_EXECUTABLE)
     OUTPUT_QUIET)
   if(NOT rc)
     add_ceph_test(run-promtool-unittests
-      ${PROMTOOL_EXECUTABLE} test rules ${CMAKE_SOURCE_DIR}/monitoring/prometheus/alerts/test_alerts.yml)
+      ${PROMTOOL_EXECUTABLE} test rules ${CMAKE_SOURCE_DIR}/monitoring/prometheus/tests/test_alerts.yml)
   elseif(NOT promtool_executable_checked)
     message(WARNING "'${PROMTOOL_EXECUTABLE} test rules' does not work, "
       "please use a newer prometheus")
@@ -980,4 +984,6 @@ add_ceph_unittest(unittest_any)
 add_executable(unittest_weighted_shuffle test_weighted_shuffle.cc)
 add_ceph_unittest(unittest_weighted_shuffle)
 
+add_executable(unittest_intarith test_intarith.cc)
+add_ceph_unittest(unittest_intarith)
 #make check ends here

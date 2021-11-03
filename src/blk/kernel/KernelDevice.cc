@@ -238,6 +238,11 @@ int KernelDevice::open(const string& p)
     }
   }
 
+  r = _post_open();
+  if (r < 0) {
+    goto out_fail;
+  }
+
   r = _aio_start();
   if (r < 0) {
     goto out_fail;
@@ -290,6 +295,7 @@ void KernelDevice::close()
   dout(1) << __func__ << dendl;
   _aio_stop();
   _discard_stop();
+  _pre_close();
 
   if (vdo_fd >= 0) {
     VOID_TEMP_FAILURE_RETRY(::close(vdo_fd));
@@ -915,7 +921,7 @@ int KernelDevice::write(
       bl.rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)) {
     dout(20) << __func__ << " rebuilding buffer to be aligned" << dendl;
   }
-  dout(40) << "data: ";
+  dout(40) << "data:\n";
   bl.hexdump(*_dout);
   *_dout << dendl;
 
@@ -944,7 +950,7 @@ int KernelDevice::aio_write(
       bl.rebuild_aligned_size_and_memory(block_size, block_size, IOV_MAX)) {
     dout(20) << __func__ << " rebuilding buffer to be aligned" << dendl;
   }
-  dout(40) << "data: ";
+  dout(40) << "data:\n";
   bl.hexdump(*_dout);
   *_dout << dendl;
 
@@ -1064,14 +1070,14 @@ int KernelDevice::read(uint64_t off, uint64_t len, bufferlist *pbl,
     } else {
       r = -errno;
     }
-    derr << __func__ << " 0x" << std::hex << off << "~" << left
+    derr << __func__ << " 0x" << std::hex << off << "~" << std::left
          << std::dec << " error: " << cpp_strerror(r) << dendl;
     goto out;
   }
   ceph_assert((uint64_t)r == len);
   pbl->push_back(std::move(p));
 
-  dout(40) << "data: ";
+  dout(40) << "data:\n"; 
   pbl->hexdump(*_dout);
   *_dout << dendl;
 
@@ -1141,7 +1147,7 @@ int KernelDevice::direct_read_unaligned(uint64_t off, uint64_t len, char *buf)
   ceph_assert((uint64_t)r == aligned_len);
   memcpy(buf, p.c_str() + (off - aligned_off), len);
 
-  dout(40) << __func__ << " data: ";
+  dout(40) << __func__ << " data:\n";
   bufferlist bl;
   bl.append(buf, len);
   bl.hexdump(*_dout);
@@ -1214,7 +1220,7 @@ int KernelDevice::read_random(uint64_t off, uint64_t len, char *buf,
     ceph_assert((uint64_t)r == len);
   }
 
-  dout(40) << __func__ << " data: ";
+  dout(40) << __func__ << " data:\n";
   bufferlist bl;
   bl.append(buf, len);
   bl.hexdump(*_dout);

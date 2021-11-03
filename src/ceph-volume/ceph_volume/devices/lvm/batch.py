@@ -325,6 +325,7 @@ class Batch(object):
             nargs='*',
             default=[],
             help='Reuse existing OSD ids',
+            type=common.valid_osd_id
         )
         self.args = parser.parse_args(argv)
         self.parser = parser
@@ -518,10 +519,11 @@ class Batch(object):
         # fill up uneven distributions across fast devices: 5 osds and 2 fast
         # devices? create 3 slots on each device rather then deploying
         # heterogeneous osds
-        if (requested_osds - len(lvm_devs)) % len(phys_devs):
-            fast_slots_per_device = int((requested_osds - len(lvm_devs)) / len(phys_devs)) + 1
+        slot_divider = max(1, len(phys_devs))
+        if (requested_osds - len(lvm_devs)) % slot_divider:
+            fast_slots_per_device = int((requested_osds - len(lvm_devs)) / slot_divider) + 1
         else:
-            fast_slots_per_device = int((requested_osds - len(lvm_devs)) / len(phys_devs))
+            fast_slots_per_device = int((requested_osds - len(lvm_devs)) / slot_divider)
 
 
         ret.extend(get_physical_fast_allocs(phys_devs,

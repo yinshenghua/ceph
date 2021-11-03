@@ -4,6 +4,7 @@
 #ifndef CEPH_LIBRBD_CACHE_PARENT_WRITE_LOG
 #define CEPH_LIBRBD_CACHE_PARENT_WRITE_LOG
 
+#include "common/Timer.h"
 #include "common/RWLock.h"
 #include "common/WorkQueue.h"
 #include "common/AsyncOpTracker.h"
@@ -20,7 +21,6 @@
 #include <list>
 
 class Context;
-class SafeTimer;
 
 namespace librbd {
 
@@ -341,7 +341,9 @@ protected:
       std::map<uint64_t, bool> &missing_sync_points,
       std::map<uint64_t,
       std::shared_ptr<pwl::SyncPointLogEntry>> &sync_point_entries,
-      pwl::DeferredContexts &later, uint32_t alloc_size);
+      pwl::DeferredContexts &later);
+  virtual void inc_allocated_cached_bytes(
+      std::shared_ptr<pwl::GenericLogEntry> log_entry) = 0;
   Context *construct_flush_entry(
       const std::shared_ptr<pwl::GenericLogEntry> log_entry, bool invalidating);
   void process_writeback_dirty_entries();
@@ -366,11 +368,11 @@ protected:
                                pwl::DeferredContexts &later) = 0;
   virtual void collect_read_extents(
       uint64_t read_buffer_offset, LogMapEntry<GenericWriteLogEntry> map_entry,
-      std::vector<WriteLogCacheEntry*> &log_entries_to_read,
+      std::vector<std::shared_ptr<GenericWriteLogEntry>> &log_entries_to_read,
       std::vector<bufferlist*> &bls_to_read, uint64_t entry_hit_length,
       Extent hit_extent, pwl::C_ReadRequest *read_ctx) = 0;
   virtual void complete_read(
-      std::vector<WriteLogCacheEntry*> &log_entries_to_read,
+      std::vector<std::shared_ptr<GenericWriteLogEntry>> &log_entries_to_read,
       std::vector<bufferlist*> &bls_to_read, Context *ctx) = 0;
   virtual void write_data_to_buffer(
       std::shared_ptr<pwl::WriteLogEntry> ws_entry,
@@ -386,10 +388,9 @@ protected:
   virtual void persist_last_flushed_sync_gen() {}
   virtual void reserve_cache(C_BlockIORequestT *req, bool &alloc_succeeds,
                              bool &no_space) {}
-  virtual Context *construct_flush_entry_ctx(
-      const std::shared_ptr<pwl::GenericLogEntry> log_entry) {
-    return nullptr;
-  }
+  virtual void construct_flush_entries(pwl::GenericLogEntries entries_to_flush,
+					DeferredContexts &post_unlock,
+					bool has_write_entry) = 0;
   virtual uint64_t get_max_extent() {
     return 0;
   }

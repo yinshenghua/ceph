@@ -33,9 +33,11 @@ MDS_PERF_QUERY_COUNTERS_MAP = OrderedDict({'cap_hit': 0,
                                            'dentry_lease': 4,
                                            'opened_files': 5,
                                            'pinned_icaps': 6,
-                                           'opened_inodes': 7})
+                                           'opened_inodes': 7,
+                                           'read_io_sizes': 8,
+                                           'write_io_sizes': 9})
 MDS_PERF_QUERY_COUNTERS = [] # type: List[str]
-MDS_GLOBAL_PERF_QUERY_COUNTERS = ['cap_hit', 'read_latency', 'write_latency', 'metadata_latency', 'dentry_lease', 'opened_files', 'pinned_icaps', 'opened_inodes'] # type: List[str]
+MDS_GLOBAL_PERF_QUERY_COUNTERS = ['cap_hit', 'read_latency', 'write_latency', 'metadata_latency', 'dentry_lease', 'opened_files', 'pinned_icaps', 'opened_inodes', 'read_io_sizes', 'write_io_sizes'] # type: List[str]
 
 QUERY_EXPIRE_INTERVAL = timedelta(minutes=1)
 
@@ -126,7 +128,12 @@ class FSPerfStats(object):
     def notify(self, cmdtag):
         self.log.debug("cmdtag={0}".format(cmdtag))
         with self.meta_lock:
-            result = self.client_metadata['in_progress'].pop(cmdtag)
+            try:
+                result = self.client_metadata['in_progress'].pop(cmdtag)
+            except KeyError:
+                self.log.warn(f"cmdtag {cmdtag} not found in client metadata")
+                return
+
             client_meta = result[1].wait()
             if client_meta[0] != 0:
                 self.log.warn("failed to fetch client metadata from rank {0}, err={1}".format(

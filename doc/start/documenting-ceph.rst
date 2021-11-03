@@ -270,10 +270,10 @@ the following packages are required:
 	<table cellpadding="10"><colgroup><col width="30%"><col width="30%"><col width="30%"></colgroup><tbody valign="top"><tr><td><h3>Debian/Ubuntu</h3>
 
 - gcc
-- python-dev
-- python-pip
-- python-virtualenv
-- python-sphinx
+- python3-dev
+- python3-pip
+- python3-sphinx
+- pytnon3-venv
 - libxml2-dev
 - libxslt1-dev
 - doxygen
@@ -288,7 +288,6 @@ the following packages are required:
 - gcc
 - python-devel
 - python-pip
-- python-virtualenv
 - python-docutils
 - python-jinja2
 - python-pygments
@@ -307,7 +306,6 @@ the following packages are required:
 - gcc
 - python-devel
 - python-pip
-- python-virtualenv
 - python-docutils
 - python-jinja2
 - python-pygments
@@ -328,14 +326,14 @@ distributions, execute the following:
 
 .. prompt:: bash $
 
-	sudo apt-get install gcc python-dev python-pip python-virtualenv libxml2-dev libxslt-dev doxygen graphviz ant ditaa
+	sudo apt-get install gcc python-dev python-pip libxml2-dev libxslt-dev doxygen graphviz ant ditaa
 	sudo apt-get install python-sphinx
 
 For Fedora distributions, execute the following:
 
 .. prompt:: bash $
 
-   sudo yum install gcc python-devel python-pip python-virtualenv libxml2-devel libxslt-devel doxygen graphviz ant
+   sudo yum install gcc python-devel python-pip libxml2-devel libxslt-devel doxygen graphviz ant
    sudo pip install html2text
    sudo yum install python-jinja2 python-pygments python-docutils python-sphinx
    sudo yum install jericho-html ditaa
@@ -353,7 +351,7 @@ For CentOS/RHEL distributions, execute the following:
 
 .. prompt:: bash $
 
-	sudo yum install gcc python-devel python-pip python-virtualenv libxml2-devel libxslt-devel doxygen graphviz ant
+	sudo yum install gcc python-devel python-pip libxml2-devel libxslt-devel doxygen graphviz ant
 	sudo pip install html2text
 
 For CentOS/RHEL distributions, the remaining python packages are not available
@@ -413,7 +411,7 @@ Ceph documentation commits are simple, but follow a strict convention:
 - The comment summary MUST be one line only. (strict)
 - Additional comments MAY follow a blank line after the summary, 
   but should be terse.
-- A commit MAY include ``Fixes: #{bug number}``.
+- A commit MAY include ``Fixes: https://tracker.ceph.com/issues/{bug number}``.
 - Commits MUST include ``Signed-off-by: Firstname Lastname <email>``. (strict)
 
 .. tip:: Follow the foregoing convention particularly where it says 
@@ -431,7 +429,7 @@ The following comment includes a reference to a bug. ::
 
 	doc: Fixes a spelling error and a broken hyperlink.
 
-	Fixes: #1234
+	Fixes: https://tracker.ceph.com/issues/1234
 	
 	Signed-off-by: John Doe <john.doe@gmail.com>
 
@@ -512,9 +510,8 @@ Pull`_ approach.
 Notify Us
 ---------
 
-After you make a pull request, please email ceph-docs@redhat.com.
-
-
+In case The PR did not got a review within in a resonable timeframe, please get in touch
+with the corresponding component lead of the :ref:`clt`.
 
 Documentation Style Guide
 =========================
