@@ -274,7 +274,7 @@ void rgw_pubsub_s3_event::dump(Formatter *f) const {
         Formatter::ObjectSection sub_s(*f, "object");
         encode_json("key", object_key, f);
         encode_json("size", object_size, f);
-        encode_json("etag", object_etag, f);
+        encode_json("eTag", object_etag, f);
         encode_json("versionId", object_versionId, f);
         encode_json("sequencer", object_sequencer, f);
         encode_json("metadata", x_meta_map, f);
@@ -602,6 +602,17 @@ int RGWPubSub::Bucket::remove_notification(const DoutPrefixProvider *dpp, const 
 
   bucket_topics.topics.erase(topic_name);
 
+  if (bucket_topics.topics.empty()) {
+    // no more topics - delete the notification object of the bucket
+    ret = ps->remove(dpp, bucket_meta_obj, &objv_tracker, y);
+    if (ret < 0 && ret != -ENOENT) {
+      ldout(ps->store->ctx(), 1) << "ERROR: failed to remove bucket topics: ret=" << ret << dendl;
+      return ret;
+    }
+    return 0;
+  }
+
+  // write back the notifications without the deleted one
   ret = write_topics(dpp, bucket_topics, &objv_tracker, y);
   if (ret < 0) {
     ldpp_dout(dpp, 1) << "ERROR: failed to write topics info: ret=" << ret << dendl;
@@ -630,7 +641,7 @@ int RGWPubSub::Bucket::remove_notifications(const DoutPrefixProvider *dpp, optio
     }
   }
 
-  // delete all notification of on a bucket
+  // delete the notification object of the bucket
   ret = ps->remove(dpp, bucket_meta_obj, nullptr, y);
   if (ret < 0 && ret != -ENOENT) {
     ldpp_dout(dpp, 1) << "ERROR: failed to remove bucket topics: ret=" << ret << dendl;

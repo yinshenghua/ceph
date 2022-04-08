@@ -11,7 +11,7 @@ except ImportError:
     pass
 
 from cephadm import CephadmOrchestrator
-from orchestrator import raise_if_exception, OrchResult, HostSpec
+from orchestrator import raise_if_exception, OrchResult, HostSpec, DaemonDescriptionStatus
 from tests import mock
 
 
@@ -42,7 +42,6 @@ def with_cephadm_module(module_options=None, store=None):
     with mock.patch("cephadm.module.CephadmOrchestrator.get_ceph_option", get_ceph_option),\
             mock.patch("cephadm.services.osd.RemoveUtil._run_mon_cmd"), \
             mock.patch("cephadm.module.CephadmOrchestrator.get_osdmap"), \
-            mock.patch("cephadm.services.osd.OSDService.get_osdspec_affinity", return_value='test_spec'), \
             mock.patch("cephadm.module.CephadmOrchestrator.remote"):
 
         m = CephadmOrchestrator.__new__(CephadmOrchestrator)
@@ -55,6 +54,14 @@ def with_cephadm_module(module_options=None, store=None):
             m.mock_store_set('_ceph_get', 'mon_map', {
                 'modified': datetime_to_str(datetime_now()),
                 'fsid': 'foobar',
+            })
+        if '_ceph_get/mgr_map' not in store:
+            m.mock_store_set('_ceph_get', 'mgr_map', {
+                'services': {
+                    'dashboard': 'http://[::1]:8080',
+                    'prometheus': 'http://[::1]:8081'
+                },
+                'modules': ['dashboard', 'prometheus'],
             })
         for k, v in store.items():
             m._ceph_set_store(k, v)
@@ -70,14 +77,13 @@ def wait(m, c):
 
 
 @contextmanager
-def with_host(m: CephadmOrchestrator, name, addr='1.2.3.4', refresh_hosts=True):
-    # type: (CephadmOrchestrator, str) -> None
+def with_host(m: CephadmOrchestrator, name, addr='1::4', refresh_hosts=True, rm_with_force=True):
     with mock.patch("cephadm.utils.resolve_ip", return_value=addr):
         wait(m, m.add_host(HostSpec(hostname=name)))
         if refresh_hosts:
             CephadmServe(m)._refresh_hosts_and_daemons()
         yield
-        wait(m, m.remove_host(name))
+        wait(m, m.remove_host(name, force=rm_with_force))
 
 
 def assert_rm_service(cephadm: CephadmOrchestrator, srv_name):
@@ -97,7 +103,7 @@ def assert_rm_service(cephadm: CephadmOrchestrator, srv_name):
 
 
 @contextmanager
-def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=None, host: str = '') -> Iterator[List[str]]:
+def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=None, host: str = '', status_running=False) -> Iterator[List[str]]:
     if spec.placement.is_empty() and host:
         spec.placement = PlacementSpec(hosts=[host], count=1)
     if meth is not None:
@@ -112,14 +118,23 @@ def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=No
 
     CephadmServe(cephadm_module)._apply_all_services()
 
+    if status_running:
+        make_daemons_running(cephadm_module, spec.service_name())
+
     dds = wait(cephadm_module, cephadm_module.list_daemons())
     own_dds = [dd for dd in dds if dd.service_name() == spec.service_name()]
-    if host:
+    if host and spec.service_type != 'osd':
         assert own_dds
 
     yield [dd.name() for dd in own_dds]
 
     assert_rm_service(cephadm_module, spec.service_name())
+
+
+def make_daemons_running(cephadm_module, service_name):
+    own_dds = cephadm_module.cache.get_daemons_by_service(service_name)
+    for dd in own_dds:
+        dd.status = DaemonDescriptionStatus.running  # We're changing the reference
 
 
 def _deploy_cephadm_binary(host):

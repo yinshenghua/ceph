@@ -16,6 +16,7 @@
 #include <typeinfo>
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/likely.h"
 #include "common/async/blocked_completion.h"
 
 #include "messages/MClientRequestForward.h"
@@ -477,9 +478,9 @@ private:
 MDSRank::MDSRank(
     mds_rank_t whoami_,
     std::string fs_name_,
-    ceph::mutex &mds_lock_,
+    ceph::fair_mutex &mds_lock_,
     LogChannelRef &clog_,
-    SafeTimer &timer_,
+    CommonSafeTimer<ceph::fair_mutex> &timer_,
     Beacon &beacon_,
     std::unique_ptr<MDSMap>& mdsmap_,
     Messenger *msgr,
@@ -1418,11 +1419,27 @@ void MDSRank::send_message(const ref_t<Message>& m, const ConnectionRef& c)
   c->send_message2(m);
 }
 
+class C_MDS_RetrySendMessageMDS : public MDSInternalContext {
+public:
+  C_MDS_RetrySendMessageMDS(MDSRank* mds, mds_rank_t who, ref_t<Message> m)
+    : MDSInternalContext(mds), who(who), m(std::move(m)) {}
+  void finish(int r) override {
+    mds->send_message_mds(m, who);
+  }
+private:
+  mds_rank_t who;
+  ref_t<Message> m;
+};
+
 
 void MDSRank::send_message_mds(const ref_t<Message>& m, mds_rank_t mds)
 {
   if (!mdsmap->is_up(mds)) {
     dout(10) << "send_message_mds mds." << mds << " not up, dropping " << *m << dendl;
+    return;
+  } else if (mdsmap->is_bootstrapping(mds)) {
+    dout(5) << __func__ << "mds." << mds << " is bootstrapping, deferring " << *m << dendl;
+    wait_for_bootstrapped_peer(mds, new C_MDS_RetrySendMessageMDS(this, mds, m));
     return;
   }
 
@@ -1729,8 +1746,12 @@ void MDSRank::replay_start()
 {
   dout(1) << "replay_start" << dendl;
 
-  if (is_standby_replay())
+  if (is_standby_replay()) {
     standby_replaying = true;
+    if (unlikely(g_conf().get_val<bool>("mds_standby_replay_damaged"))) {
+      damaged();
+    }
+  }
 
   // Check if we need to wait for a newer OSD map before starting
   bool const ready = objecter->with_osdmap(
@@ -1921,6 +1942,17 @@ void MDSRank::resolve_done()
   snapclient->sync(new C_MDSInternalNoop);
 }
 
+void MDSRank::apply_blocklist(const std::set<entity_addr_t> &addrs, epoch_t epoch) {
+  auto victims = server->apply_blocklist(addrs);
+  dout(4) << __func__ << ": killed " << victims << " blocklisted sessions ("
+          << addrs.size() << " blocklist entries, "
+          << sessionmap.get_sessions().size() << ")" << dendl;
+  if (victims) {
+    set_osd_epoch_barrier(epoch);
+  }
+}
+
+
 void MDSRank::reconnect_start()
 {
   dout(1) << "reconnect_start" << dendl;
@@ -1938,13 +1970,8 @@ void MDSRank::reconnect_start()
       o.get_blocklist(&blocklist);
       epoch = o.get_epoch();
   });
-  auto killed = server->apply_blocklist(blocklist);
-  dout(4) << "reconnect_start: killed " << killed << " blocklisted sessions ("
-          << blocklist.size() << " blocklist entries, "
-          << sessionmap.get_sessions().size() << ")" << dendl;
-  if (killed) {
-    set_osd_epoch_barrier(epoch);
-  }
+
+  apply_blocklist(blocklist, epoch);
 
   server->reconnect_clients(new C_MDS_VoidFn(this, &MDSRank::reconnect_done));
   finish_contexts(g_ceph_context, waiting_for_reconnect);
@@ -2232,9 +2259,16 @@ void MDSRankDispatcher::handle_mds_map(
 
   if (oldstate != state) {
     // update messenger.
-    if (state == MDSMap::STATE_STANDBY_REPLAY) {
+    auto sleep_rank_change = g_conf().get_val<double>("mds_sleep_rank_change");
+    if (unlikely(sleep_rank_change > 0)) {
+      // This is to trigger a race where another rank tries to connect to this
+      // MDS before an update to the messenger "myname" is processed. This race
+      // should be closed by ranks holding messages until the rank is out of a
+      // "bootstrapping" state.
+      usleep(sleep_rank_change);
+    } if (state == MDSMap::STATE_STANDBY_REPLAY) {
       dout(1) << "handle_mds_map i am now mds." << mds_gid << "." << incarnation
-	      << " replaying mds." << whoami << "." << incarnation << dendl;
+          << " replaying mds." << whoami << "." << incarnation << dendl;
       messenger->set_myname(entity_name_t::MDS(mds_gid));
     } else {
       dout(1) << "handle_mds_map i am now mds." << whoami << "." << incarnation << dendl;
@@ -2419,6 +2453,33 @@ void MDSRankDispatcher::handle_mds_map(
     if (it != waiting_for_active_peer.end()) {
       queue_waiters(it->second);
       waiting_for_active_peer.erase(it);
+    }
+  }
+
+  // did someone leave a "bootstrapping" state? We can't connect until then to
+  // allow messenger "myname" updates.
+  {
+    std::vector<mds_rank_t> erase;
+    for (auto& [rank, queue] : waiting_for_bootstrapping_peer) {
+      auto state = mdsmap->get_state(rank);
+      if (state > MDSMap::STATE_REPLAY) {
+        queue_waiters(queue);
+        erase.push_back(rank);
+      }
+    }
+    for (const auto& rank : erase) {
+      waiting_for_bootstrapping_peer.erase(rank);
+    }
+  }
+  // for testing...
+  if (unlikely(g_conf().get_val<bool>("mds_connect_bootstrapping"))) {
+    std::set<mds_rank_t> bootstrapping;
+    mdsmap->get_mds_set(bootstrapping, MDSMap::STATE_REPLAY);
+    mdsmap->get_mds_set(bootstrapping, MDSMap::STATE_CREATING);
+    mdsmap->get_mds_set(bootstrapping, MDSMap::STATE_STARTING);
+    for (const auto& rank : bootstrapping) {
+      auto m = make_message<MMDSMap>(monc->get_fsid(), *mdsmap);
+      send_message_mds(std::move(m), rank);
     }
   }
 
@@ -3034,6 +3095,9 @@ void MDSRank::command_dump_tree(const cmdmap_t &cmdmap, std::ostream &ss, Format
   std::string root;
   int64_t depth;
   cmd_getval(cmdmap, "root", root);
+  if (root.empty()) {
+    root = "/";
+  }
   if (!cmd_getval(cmdmap, "depth", depth))
     depth = -1;
   std::lock_guard l(mds_lock);
@@ -3439,16 +3503,16 @@ void MDSRankDispatcher::handle_osd_map()
 
   purge_queue.update_op_limit(*mdsmap);
 
-  std::set<entity_addr_t> newly_blocklisted;
-  objecter->consume_blocklist_events(&newly_blocklisted);
-  auto epoch = objecter->with_osdmap([](const OSDMap &o){return o.get_epoch();});
-  dout(4) << "handle_osd_map epoch " << epoch << ", "
-          << newly_blocklisted.size() << " new blocklist entries" << dendl;
-  auto victims = server->apply_blocklist(newly_blocklisted);
-  if (victims) {
-    set_osd_epoch_barrier(epoch);
+  // it's ok if replay state is reached via standby-replay, the
+  // reconnect state will journal blocklisted clients (journal
+  // is opened for writing in `replay_done` before moving to
+  // up:resolve).
+  if (!is_replay()) {
+    std::set<entity_addr_t> newly_blocklisted;
+    objecter->consume_blocklist_events(&newly_blocklisted);
+    auto epoch = objecter->with_osdmap([](const OSDMap &o){return o.get_epoch();});
+    apply_blocklist(newly_blocklisted, epoch);
   }
-
 
   // By default the objecter only requests OSDMap updates on use,
   // we would like to always receive the latest maps in order to
@@ -3612,9 +3676,9 @@ bool MDSRank::evict_client(int64_t session_id,
 MDSRankDispatcher::MDSRankDispatcher(
     mds_rank_t whoami_,
     std::string fs_name_,
-    ceph::mutex &mds_lock_,
+    ceph::fair_mutex &mds_lock_,
     LogChannelRef &clog_,
-    SafeTimer &timer_,
+    CommonSafeTimer<ceph::fair_mutex> &timer_,
     Beacon &beacon_,
     std::unique_ptr<MDSMap> &mdsmap_,
     Messenger *msgr,
@@ -3692,6 +3756,7 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_session_max_caps_throttle_ratio",
     "mds_cap_acquisition_throttle_retry_request_time",
     "mds_alternate_name_max",
+    "mds_dir_max_entries",
     NULL
   };
   return KEYS;

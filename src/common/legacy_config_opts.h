@@ -305,6 +305,8 @@ OPTION(mon_debug_unsafe_allow_tier_with_nonempty_snaps, OPT_BOOL)
 OPTION(mon_osd_blocklist_default_expire, OPT_DOUBLE) // default one hour
 OPTION(mon_osd_crush_smoke_test, OPT_BOOL)
 
+OPTION(mgr_max_pg_num_change, OPT_INT)
+
 OPTION(paxos_stash_full_interval, OPT_INT)   // how often (in commits) to stash a full copy of the PaxosService state
 OPTION(paxos_max_join_drift, OPT_INT) // max paxos iterations before we must first sync the monitor stores
 OPTION(paxos_propose_interval, OPT_DOUBLE)  // gather updates for this long before proposing a map update
@@ -574,6 +576,7 @@ OPTION(osd_pool_default_flag_hashpspool, OPT_BOOL)   // use new pg hashing to pr
 OPTION(osd_pool_default_flag_nodelete, OPT_BOOL) // pool can't be deleted
 OPTION(osd_pool_default_flag_nopgchange, OPT_BOOL) // pool's pg and pgp num can't be changed
 OPTION(osd_pool_default_flag_nosizechange, OPT_BOOL) // pool's size and min size can't be changed
+OPTION(osd_pool_default_flag_bulk, OPT_BOOL)
 OPTION(osd_pool_default_hit_set_bloom_fpp, OPT_FLOAT)
 OPTION(osd_pool_default_cache_target_dirty_ratio, OPT_FLOAT)
 OPTION(osd_pool_default_cache_target_dirty_high_ratio, OPT_FLOAT)
@@ -606,6 +609,7 @@ OPTION(osd_max_markdown_count, OPT_INT)
 OPTION(osd_op_pq_max_tokens_per_priority, OPT_U64)
 OPTION(osd_op_pq_min_cost, OPT_U64)
 OPTION(osd_recover_clone_overlap, OPT_BOOL)   // preserve clone_overlap during recovery/migration
+OPTION(osd_aggregated_slow_ops_logging, OPT_BOOL)
 OPTION(osd_op_num_threads_per_shard, OPT_INT)
 OPTION(osd_op_num_threads_per_shard_hdd, OPT_INT)
 OPTION(osd_op_num_threads_per_shard_ssd, OPT_INT)
@@ -1036,6 +1040,7 @@ OPTION(bluestore_debug_fsck_abort, OPT_BOOL)
 OPTION(bluestore_debug_omit_kv_commit, OPT_BOOL)
 OPTION(bluestore_debug_permit_any_bdev_label, OPT_BOOL)
 OPTION(bluestore_debug_random_read_err, OPT_DOUBLE)
+OPTION(bluestore_debug_legacy_omap, OPT_BOOL)
 OPTION(bluestore_debug_inject_bug21040, OPT_BOOL)
 OPTION(bluestore_debug_inject_csum_err_probability, OPT_FLOAT)
 OPTION(bluestore_fsck_error_on_no_per_pool_stats, OPT_BOOL)
@@ -1405,6 +1410,7 @@ OPTION(rgw_usage_max_user_shards, OPT_INT)
 OPTION(rgw_enable_ops_log, OPT_BOOL) // enable logging every rgw operation
 OPTION(rgw_enable_usage_log, OPT_BOOL) // enable logging bandwidth usage
 OPTION(rgw_ops_log_rados, OPT_BOOL) // whether ops log should go to rados
+OPTION(rgw_ops_log_file_path, OPT_STR) // path to file where ops log can go
 OPTION(rgw_ops_log_socket_path, OPT_STR) // path to unix domain socket where ops log can go
 OPTION(rgw_ops_log_data_backlog, OPT_INT) // max data backlog for ops log
 OPTION(rgw_fcgi_socket_backlog, OPT_INT) // socket  backlog for fcgi
@@ -1445,7 +1451,6 @@ OPTION(rgw_data_log_num_shards, OPT_INT) // number of objects to keep data chang
 OPTION(rgw_data_log_obj_prefix, OPT_STR) //
 
 OPTION(rgw_bucket_quota_ttl, OPT_INT) // time for cached bucket stats to be cached within rgw instance
-OPTION(rgw_bucket_quota_soft_threshold, OPT_DOUBLE) // threshold from which we don't rely on cached info for quota decisions
 OPTION(rgw_bucket_quota_cache_size, OPT_INT) // number of entries in bucket quota cache
 OPTION(rgw_bucket_default_quota_max_objects, OPT_INT) // number of objects allowed
 OPTION(rgw_bucket_default_quota_max_size, OPT_LONGLONG) // Max size of object in bytes

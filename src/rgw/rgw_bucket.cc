@@ -385,9 +385,7 @@ int rgw_remove_bucket_bypass_gc(rgw::sal::RGWRadosStore *store, rgw_bucket& buck
   if (ret < 0)
     return ret;
 
-  string prefix, delimiter;
-
-  ret = abort_bucket_multiparts(dpp, store, cct, info, prefix, delimiter);
+  ret = abort_bucket_multiparts(dpp, store, cct, info);
   if (ret < 0) {
     return ret;
   }
@@ -1024,7 +1022,7 @@ int RGWBucket::sync(RGWBucketAdminOpState& op_state, map<string, bufferlist> *at
 {
   if (!store->svc()->zone->is_meta_master()) {
     set_err_msg(err_msg, "ERROR: failed to update bucket sync: only allowed on meta master zone");
-    return EINVAL;
+    return -EINVAL;
   }
   bool sync = op_state.will_sync_bucket();
   if (sync) {
@@ -1279,7 +1277,7 @@ int RGWBucketAdminOp::remove_bucket(rgw::sal::RGWRadosStore *store, RGWBucketAdm
   if (bypass_gc)
     ret = rgw_remove_bucket_bypass_gc(store, bucket->get_key(), op_state.get_max_aio(), keep_index_consistent, y, dpp);
   else
-    ret = bucket->remove_bucket(dpp, op_state.will_delete_children(), string(), string(),
+    ret = bucket->remove_bucket(dpp, op_state.will_delete_children(),
 				false, nullptr, y);
 
   return ret;
@@ -2207,6 +2205,8 @@ static void get_md5_digest(const RGWBucketEntryPoint *be, string& md5_digest) {
    f->flush(bl);
 
    MD5 hash;
+   // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+   hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
    hash.Update((const unsigned char *)bl.c_str(), bl.length());
    hash.Final(m);
 
@@ -3186,7 +3186,6 @@ int RGWBucketCtl::chown(rgw::sal::RGWRadosStore *store, RGWBucketInfo& bucket_in
                         const rgw_user& user_id, const std::string& display_name,
                         const std::string& marker, optional_yield y, const DoutPrefixProvider *dpp)
 {
-  RGWObjectCtx obj_ctx(store);
   std::vector<rgw_bucket_dir_entry> objs;
   map<string, bool> common_prefixes;
 
@@ -3204,6 +3203,7 @@ int RGWBucketCtl::chown(rgw::sal::RGWRadosStore *store, RGWBucketInfo& bucket_in
   //Loop through objects and update object acls to point to bucket owner
 
   do {
+    RGWObjectCtx obj_ctx(store);
     objs.clear();
     int ret = list_op.list_objects(dpp, max_entries, &objs, &common_prefixes, &is_truncated, y);
     if (ret < 0) {

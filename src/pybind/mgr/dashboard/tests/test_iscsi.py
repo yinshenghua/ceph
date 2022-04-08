@@ -17,11 +17,8 @@ from ..controllers.iscsi import Iscsi, IscsiTarget
 from ..rest_client import RequestException
 from ..services.iscsi_client import IscsiClient
 from ..services.orchestrator import OrchClient
+from ..tests import CLICommandTestMixin, CmdException, ControllerTestCase, KVStoreMockMixin
 from ..tools import NotificationQueue, TaskManager
-from . import CLICommandTestMixin  # pylint: disable=no-name-in-module
-from . import CmdException  # pylint: disable=no-name-in-module
-from . import ControllerTestCase  # pylint: disable=no-name-in-module
-from . import KVStoreMockMixin  # pylint: disable=no-name-in-module
 
 
 class IscsiTestCli(unittest.TestCase, CLICommandTestMixin):
@@ -48,7 +45,7 @@ class IscsiTestCli(unittest.TestCase, CLICommandTestMixin):
                           inbuf='')
 
         self.assertEqual(ctx.exception.retcode, -errno.EINVAL)
-        self.assertEqual(str(ctx.exception), ERROR_MSG_NO_INPUT_FILE)
+        self.assertIn(ERROR_MSG_NO_INPUT_FILE, str(ctx.exception))
 
     def test_cli_add_gateway(self):
         self.exec_cmd('iscsi-gateway-add', name='node1',
@@ -84,9 +81,6 @@ class IscsiTestController(ControllerTestCase, KVStoreMockMixin):
         TaskManager.init()
         OrchClient.instance().available = lambda: False
         mgr.rados.side_effect = None
-        # pylint: disable=protected-access
-        Iscsi._cp_config['tools.authenticate.on'] = False
-        IscsiTarget._cp_config['tools.authenticate.on'] = False
         cls.setup_controllers([Iscsi, IscsiTarget])
 
     @classmethod

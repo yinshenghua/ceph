@@ -254,9 +254,9 @@ bool MDCache::shutdown()
 // ====================================================================
 // some inode functions
 
-void MDCache::add_inode(CInode *in) 
+void MDCache::add_inode(CInode *in)
 {
-  // add to lru, inode map
+  // add to inode map
   if (in->last == CEPH_NOSNAP) {
     auto &p = inode_map[in->ino()];
     ceph_assert(!p); // should be no dup inos!
@@ -3732,8 +3732,9 @@ bool MDCache::expire_recursive(CInode *in, expiremap &expiremap)
       return true;
     }
 
-    for (auto &it : subdir->items) {
-      CDentry *dn = it.second;
+    for (auto it = subdir->items.begin(); it != subdir->items.end();) {
+      CDentry *dn = it->second;
+      it++;
       CDentry::linkage_t *dnl = dn->get_linkage();
       if (dnl->is_primary()) {
 	CInode *tin = dnl->get_inode();
@@ -5327,7 +5328,7 @@ void MDCache::rejoin_open_ino_finish(inodeno_t ino, int ret)
   cap_imports_num_opening--;
 
   if (cap_imports_num_opening == 0) {
-    if (rejoin_gather.empty())
+    if (rejoin_gather.empty() && rejoin_ack_gather.count(mds->get_nodeid()))
       rejoin_gather_finish();
     else if (rejoin_gather.count(mds->get_nodeid()))
       process_imported_caps();
@@ -5349,7 +5350,7 @@ void MDCache::rejoin_open_sessions_finish(map<client_t,pair<Session*,uint64_t> >
   dout(10) << "rejoin_open_sessions_finish" << dendl;
   mds->server->finish_force_open_sessions(session_map);
   rejoin_session_map.swap(session_map);
-  if (rejoin_gather.empty())
+  if (rejoin_gather.empty() && rejoin_ack_gather.count(mds->get_nodeid()))
     rejoin_gather_finish();
 }
 
@@ -5973,7 +5974,7 @@ bool MDCache::open_undef_inodes_dirfrags()
   MDSGatherBuilder gather(g_ceph_context,
       new MDSInternalContextWrapper(mds,
 	new LambdaContext([this](int r) {
-	    if (rejoin_gather.empty())
+	    if (rejoin_gather.empty() && rejoin_ack_gather.count(mds->get_nodeid()))
 	      rejoin_gather_finish();
 	  })
 	)
@@ -8551,10 +8552,12 @@ CInode *MDCache::cache_traverse(const filepath& fp)
 
   CInode *in;
   unsigned depth = 0;
+  char mdsdir_name[16];
+  sprintf(mdsdir_name, "~mds%d", mds->get_nodeid());
 
   if (fp.get_ino()) {
     in = get_inode(fp.get_ino());
-  } else if (fp.depth() > 0 && fp[0] == "~mdsdir") {
+  } else if (fp.depth() > 0 && (fp[0] == "~mdsdir" || fp[0] == mdsdir_name)) {
     in = myin;
     depth = 1;
   } else {
@@ -13242,7 +13245,9 @@ void MDCache::upkeep_main(void)
         if (active_with_clients) {
           trim_client_leases();
         }
-        trim();
+        if (is_open()) {
+          trim();
+        }
         if (active_with_clients) {
           auto recall_flags = Server::RecallFlags::ENFORCE_MAX|Server::RecallFlags::ENFORCE_LIVENESS;
           if (cache_toofull()) {

@@ -232,7 +232,7 @@ class RGWBucket {
     virtual RGWObject* create_object(const rgw_obj_key& key /* Attributes */) = 0;
     virtual RGWAttrs& get_attrs(void) { return attrs; }
     virtual int set_attrs(RGWAttrs a) { attrs = a; return 0; }
-    virtual int remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, std::string prefix, std::string delimiter, bool forward_to_master, req_info* req_info, optional_yield y) = 0;
+    virtual int remove_bucket(const DoutPrefixProvider *dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y) = 0;
     virtual RGWAccessControlPolicy& get_acl(void) = 0;
     virtual int set_acl(const DoutPrefixProvider *dpp, RGWAccessControlPolicy& acl, optional_yield y) = 0;
     virtual int get_bucket_info(const DoutPrefixProvider *dpp, optional_yield y) = 0;
@@ -409,6 +409,10 @@ class RGWObject {
 	bool completeMultipart{false};
 	bool appendable{false};
 	RGWAttrs* attrs{nullptr};
+	// In MultipartObjectProcessor::complete, we need this parameter
+	// to tell the exact placement rule since it may be different from
+	// bucket.placement_rule when Storage Class is specified explicitly
+	const rgw_placement_rule *pmeta_placement_rule{nullptr};
       } params;
 
       virtual ~WriteOp() = default;
@@ -474,7 +478,7 @@ class RGWObject {
     bool empty() const { return key.empty(); }
     const std::string &get_name() const { return key.name; }
 
-    virtual int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx, RGWBucket& bucket, RGWObjState **state, optional_yield y, bool follow_olh = false) = 0;
+    virtual int get_obj_state(const DoutPrefixProvider *dpp, RGWObjectCtx *rctx, RGWBucket& bucket, RGWObjState **state, optional_yield y, bool follow_olh = true) = 0;
     virtual int set_obj_attrs(const DoutPrefixProvider *dpp, RGWObjectCtx* rctx, RGWAttrs* setattrs, RGWAttrs* delattrs, optional_yield y, rgw_obj* target_obj = NULL) = 0;
     virtual int get_obj_attrs(RGWObjectCtx *rctx, optional_yield y, const DoutPrefixProvider *dpp, rgw_obj* target_obj = NULL) = 0;
     virtual int modify_obj_attrs(RGWObjectCtx *rctx, const char *attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider *dpp) = 0;

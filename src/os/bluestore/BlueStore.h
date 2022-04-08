@@ -126,6 +126,7 @@ enum {
   l_bluestore_write_small_bytes,
   l_bluestore_write_small_unused,
   l_bluestore_write_deferred,
+  l_bluestore_write_deferred_bytes,
   l_bluestore_write_small_pre_read,
   l_bluestore_write_new,
   l_bluestore_txc,
@@ -1064,6 +1065,7 @@ public:
     MEMPOOL_CLASS_HELPERS();
 
     std::atomic_int nref;  ///< reference count
+    std::atomic_int put_nref = {0};
     Collection *c;
     ghobject_t oid;
 
@@ -1146,11 +1148,28 @@ public:
       return !pinned;
     }
 
-    const std::string& get_omap_prefix();
-    void get_omap_header(std::string *out);
-    void get_omap_key(const std::string& key, std::string *out);
+    static const std::string& calc_omap_prefix(uint8_t flags);
+    static void calc_omap_header(uint8_t flags, const Onode* o,
+      std::string* out);
+    static void calc_omap_key(uint8_t flags, const Onode* o,
+      const std::string& key, std::string* out);
+    static void calc_omap_tail(uint8_t flags, const Onode* o,
+      std::string* out);
+
+    const std::string& get_omap_prefix() {
+      return calc_omap_prefix(onode.flags);
+    }
+    void get_omap_header(std::string* out) {
+      calc_omap_header(onode.flags, this, out);
+    }
+    void get_omap_key(const std::string& key, std::string* out) {
+      calc_omap_key(onode.flags, this, key, out);
+    }
+    void get_omap_tail(std::string* out) {
+      calc_omap_tail(onode.flags, this, out);
+    }
+
     void rewrite_omap_key(const std::string& old, std::string *out);
-    void get_omap_tail(std::string *out);
     void decode_omap_key(const std::string& key, std::string *user_key);
 
     // Return the offset of an object on disk.  This function is intended *only*
@@ -2486,7 +2505,7 @@ private:
   void _zoned_cleaner_thread();
   void _zoned_clean_zone(uint64_t zone_num);
 
-  bluestore_deferred_op_t *_get_deferred_op(TransContext *txc);
+  bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, uint64_t len);
   void _deferred_queue(TransContext *txc);
 public:
   void deferred_try_submit();
@@ -2513,8 +2532,7 @@ public:
 
 private:
   int _fsck_check_extents(
-    const coll_t& cid,
-    const ghobject_t& oid,
+    std::string_view ctx_descr,
     const PExtentVector& extents,
     bool compressed,
     mempool_dynamic_bitset &used_blocks,
@@ -2528,6 +2546,10 @@ private:
     int64_t& errors,
     int64_t &warnings,
     BlueStoreRepairer* repairer);
+  void _fsck_repair_shared_blobs(
+    BlueStoreRepairer& repairer,
+    shared_blob_2hash_tracker_t& sb_ref_counts,
+    sb_info_space_efficient_map_t& sb_info);
 
   int _fsck(FSCKDepth depth, bool repair);
   int _fsck_on_open(BlueStore::FSCKDepth depth, bool repair);
@@ -2991,6 +3013,9 @@ public:
   /// methods to inject various errors fsck can repair
   void inject_broken_shared_blob_key(const std::string& key,
 			 const ceph::buffer::list& bl);
+  void inject_no_shared_blob_key();
+  void inject_stray_shared_blob_key(uint64_t sbid);
+
   void inject_leaked(uint64_t len);
   void inject_false_free(coll_t cid, ghobject_t oid);
   void inject_statfs(const std::string& key, const store_statfs_t& new_statfs);
@@ -3003,6 +3028,10 @@ public:
   void inject_legacy_omap();
   // resets per_pool_omap | pgmeta_omap for onode
   void inject_legacy_omap(coll_t cid, ghobject_t oid);
+
+  void inject_bluefs_file(std::string_view dir,
+			  std::string_view name,
+			  size_t new_size);
 
   void compact() override {
     ceph_assert(db);
@@ -3377,21 +3406,10 @@ private:
   inline bool _use_rotational_settings();
 
 public:
-  struct sb_info_t {
-    coll_t cid;
-    int64_t pool_id = INT64_MIN;
-    std::list<ghobject_t> oids;
-    BlueStore::SharedBlobRef sb;
-    bluestore_extent_ref_map_t ref_map;
-    bool compressed = false;
-    bool passed = false;
-    bool updated = false;
-  };
   typedef btree::btree_set<
     uint64_t, std::less<uint64_t>,
     mempool::bluestore_fsck::pool_allocator<uint64_t>> uint64_t_btree_t;
 
-  typedef mempool::bluestore_fsck::map<uint64_t, sb_info_t> sb_info_map_t;
   struct FSCK_ObjectCtx {
     int64_t& errors;
     int64_t& warnings;
@@ -3405,7 +3423,9 @@ public:
     uint64_t_btree_t* used_omap_head;
 
     ceph::mutex* sb_info_lock;
-    sb_info_map_t& sb_info;
+    sb_info_space_efficient_map_t& sb_info;
+    // approximate amount of references per <shared blob, chunk>
+    shared_blob_2hash_tracker_t& sb_ref_counts;
 
     store_statfs_t& expected_store_statfs;
     per_pool_statfs& expected_pool_statfs;
@@ -3420,8 +3440,10 @@ public:
                    uint64_t& _num_spanning_blobs,
                    mempool_dynamic_bitset* _ub,
                    uint64_t_btree_t* _used_omap_head,
+
                    ceph::mutex* _sb_info_lock,
-                   sb_info_map_t& _sb_info,
+                   sb_info_space_efficient_map_t& _sb_info,
+		   shared_blob_2hash_tracker_t& _sb_ref_counts,
                    store_statfs_t& _store_statfs,
                    per_pool_statfs& _pool_statfs,
                    BlueStoreRepairer* _repairer) :
@@ -3436,6 +3458,7 @@ public:
       used_omap_head(_used_omap_head),
       sb_info_lock(_sb_info_lock),
       sb_info(_sb_info),
+      sb_ref_counts(_sb_ref_counts),
       expected_store_statfs(_store_statfs),
       expected_pool_statfs(_pool_statfs),
       repairer(_repairer) {
@@ -3623,9 +3646,10 @@ public:
 public:
   void fix_per_pool_omap(KeyValueDB *db, int);
   bool remove_key(KeyValueDB *db, const std::string& prefix, const std::string& key);
-  bool fix_shared_blob(KeyValueDB *db,
-		         uint64_t sbid,
-		       const ceph::buffer::list* bl);
+  bool fix_shared_blob(KeyValueDB::Transaction txn,
+			uint64_t sbid,
+			bluestore_extent_ref_map_t* ref_map,
+			size_t repaired = 1);
   bool fix_statfs(KeyValueDB *db, const std::string& key,
     const store_statfs_t& new_statfs);
 
@@ -3650,10 +3674,15 @@ public:
       ++to_repair_cnt;
     }
   }
-  // In fact this is the only repairer's method which is thread-safe!!
-  void inc_repaired() {
-    ++to_repair_cnt;
+  //////////////////////
+  //In fact two methods below are the only ones in this class which are thread-safe!!
+  void inc_repaired(size_t n = 1) {
+    to_repair_cnt += n;
   }
+  void request_compaction() {
+    need_compact = true;
+  }
+  //////////////////////
 
   void init_space_usage_tracker(
     uint64_t total_space, uint64_t lres_tracking_unit_size)
@@ -3686,6 +3715,7 @@ public:
 
 private:
   std::atomic<unsigned> to_repair_cnt = { 0 };
+  std::atomic<bool> need_compact = { false };
   KeyValueDB::Transaction fix_per_pool_omap_txn;
   KeyValueDB::Transaction fix_fm_leaked_txn;
   KeyValueDB::Transaction fix_fm_false_free_txn;

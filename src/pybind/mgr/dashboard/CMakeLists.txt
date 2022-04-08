@@ -76,7 +76,7 @@ endif(WITH_SYSTEM_NPM)
 
 add_npm_command(
   OUTPUT "${CMAKE_SOURCE_DIR}/src/pybind/mgr/dashboard/frontend/node_modules"
-  COMMAND CYPRESS_CACHE_FOLDER=${CMAKE_SOURCE_DIR}/build/src/pybind/mgr/dashboard/cypress NG_CLI_ANALYTICS=false npm ci ${mgr-dashboard-userconfig}
+  COMMAND CYPRESS_CACHE_FOLDER=${CMAKE_SOURCE_DIR}/build/src/pybind/mgr/dashboard/cypress NG_CLI_ANALYTICS=false npm ci -f ${mgr-dashboard-userconfig}
   DEPENDS frontend/package.json
   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/src/pybind/mgr/dashboard/frontend
   COMMENT "dashboard frontend dependencies are being installed"
@@ -134,5 +134,8 @@ add_dependencies(tests mgr-dashboard-frontend-build)
 
 if(WITH_TESTS)
   include(AddCephTest)
-  add_tox_test(mgr-dashboard TOX_ENVS py3 lint check openapi-check)
+  add_tox_test(mgr-dashboard-py3 TOX_ENVS py3)
+  add_tox_test(mgr-dashboard-lint TOX_ENVS lint)
+  add_tox_test(mgr-dashboard-check TOX_ENVS check)
+  add_tox_test(mgr-dashboard-openapi TOX_ENVS openapi-check)
 endif()

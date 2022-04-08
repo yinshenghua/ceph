@@ -53,15 +53,16 @@ conf and keyring in your build dir, so that the ``bin/ceph ...`` CLI works
 There are a few advantages here:
 
 - The cluster is a "normal" cephadm cluster that looks and behaves
-  just like a user's cluster would.  In contract, vstart and teuthology
-  clusters tend to be special in subtle (and not-so-subtle) ways.
+  just like a user's cluster would.  In contrast, vstart and teuthology
+  clusters tend to be special in subtle (and not-so-subtle) ways (e.g.
+  having the ``lockdep`` turned on).
 
 To start a test cluster::
 
   sudo ../src/cstart.sh
 
-The last line of this will be a line you can cut+paste to update the
-container image.  For instance::
+The last line of the output will be a line you can cut+paste to update
+the container image.  For instance::
 
   sudo ../src/script/cpatch -t quay.io/ceph-ci/ceph:8f509f4e
 
@@ -123,6 +124,20 @@ another handler is executing.
 This means we should do very few synchronous calls to remote hosts.
 As a guideline, cephadm should do at most ``O(1)`` network calls in CLI handlers.
 Everything else should be done asynchronously in other threads, like ``serve()``.
+
+Note regarding different variables used in the code
+===================================================
+
+* a ``service_type`` is something like mon, mgr, alertmanager etc defined 
+  in ``ServiceSpec``
+* a ``service_id`` is the name of the service. Some services don't have 
+  names.
+* a ``service_name`` is ``<service_type>.<service_id>``
+* a ``daemon_type`` is the same as the service_type, except for ingress,
+  which has the haproxy and keepalived daemon types.
+* a ``daemon_id`` is typically ``<service_id>.<hostname>.<random-string>``. 
+  (Not the case for e.g. OSDs. OSDs are always called OSD.N)
+* a ``daemon_name`` is ``<daemon_type>.<daemon_id>``
 
 Kcli: a virtualization management tool to make easy orchestrators development
 =============================================================================

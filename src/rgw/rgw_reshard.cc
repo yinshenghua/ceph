@@ -347,15 +347,15 @@ static int create_new_bucket_instance(rgw::sal::RGWRadosStore *store,
   new_bucket_info.new_bucket_instance_id.clear();
   new_bucket_info.reshard_status = cls_rgw_reshard_status::NOT_RESHARDING;
 
-  int ret = store->svc()->bi->init_index(dpp, new_bucket_info);
+  int ret = store->getRados()->put_bucket_instance_info(new_bucket_info, true, real_time(), &attrs, dpp);
   if (ret < 0) {
-    cerr << "ERROR: failed to init new bucket indexes: " << cpp_strerror(-ret) << std::endl;
+    cerr << "ERROR: failed to store new bucket instance info: " << cpp_strerror(-ret) << std::endl;
     return ret;
   }
 
-  ret = store->getRados()->put_bucket_instance_info(new_bucket_info, true, real_time(), &attrs, dpp);
+  ret = store->svc()->bi->init_index(dpp, new_bucket_info);
   if (ret < 0) {
-    cerr << "ERROR: failed to store new bucket instance info: " << cpp_strerror(-ret) << std::endl;
+    cerr << "ERROR: failed to init new bucket indexes: " << cpp_strerror(-ret) << std::endl;
     return ret;
   }
 
@@ -475,6 +475,7 @@ RGWBucketReshardLock::RGWBucketReshardLock(rgw::sal::RGWRadosStore* _store,
 
 int RGWBucketReshardLock::lock() {
   internal_lock.set_must_renew(false);
+
   int ret;
   if (ephemeral) {
     ret = internal_lock.lock_exclusive_ephemeral(&store->getRados()->reshard_pool_ctx,
@@ -482,11 +483,19 @@ int RGWBucketReshardLock::lock() {
   } else {
     ret = internal_lock.lock_exclusive(&store->getRados()->reshard_pool_ctx, lock_oid);
   }
-  if (ret < 0) {
-    ldout(store->ctx(), 0) << "RGWReshardLock::" << __func__ <<
-      " failed to acquire lock on " << lock_oid << " ret=" << ret << dendl;
+
+  if (ret == -EBUSY) {
+    ldout(store->ctx(), 0) << "INFO: RGWReshardLock::" << __func__ <<
+      " found lock on " << lock_oid <<
+      " to be held by another RGW process; skipping for now" << dendl;
+    return ret;
+  } else if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: RGWReshardLock::" << __func__ <<
+      " failed to acquire lock on " << lock_oid << ": " <<
+      cpp_strerror(-ret) << dendl;
     return ret;
   }
+
   reset_time(Clock::now());
 
   return 0;
@@ -589,9 +598,10 @@ int RGWBucketReshard::do_reshard(int num_shards,
   for (int i = 0; i < num_source_shards; ++i) {
     bool is_truncated = true;
     marker.clear();
+    const std::string null_object_filter; // empty string since we're not filtering by object
     while (is_truncated) {
       entries.clear();
-      ret = store->getRados()->bi_list(dpp, bucket_info, i, string(), marker, max_entries, &entries, &is_truncated);
+      ret = store->getRados()->bi_list(dpp, bucket_info, i, null_object_filter, marker, max_entries, &entries, &is_truncated);
       if (ret < 0 && ret != -ENOENT) {
 	derr << "ERROR: bi_list(): " << cpp_strerror(-ret) << dendl;
 	return ret;

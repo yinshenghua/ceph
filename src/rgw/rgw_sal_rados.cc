@@ -30,6 +30,8 @@
 
 #include "rgw_zone.h"
 #include "rgw_rest_conn.h"
+#include "rgw_service.h"
+#include "rgw_lc.h"
 #include "services/svc_sys_obj.h"
 #include "services/svc_zone.h"
 #include "services/svc_tier_rados.h"
@@ -88,8 +90,6 @@ RGWObject *RGWRadosBucket::create_object(const rgw_obj_key &key)
 
 int RGWRadosBucket::remove_bucket(const DoutPrefixProvider *dpp,
 			       bool delete_children,
-			       std::string prefix,
-			       std::string delimiter,
 			       bool forward_to_master,
 			       req_info* req_info, optional_yield y)
 {
@@ -129,13 +129,14 @@ int RGWRadosBucket::remove_bucket(const DoutPrefixProvider *dpp,
     }
   } while(results.is_truncated);
 
-  /* If there's a prefix, then we are aborting multiparts as well */
-  if (!prefix.empty()) {
-    ret = abort_bucket_multiparts(dpp, store, store->ctx(), info, prefix, delimiter);
-    if (ret < 0) {
-      return ret;
-    }
+  ret = abort_bucket_multiparts(dpp, store, store->ctx(), info);
+  if (ret < 0) {
+    return ret;
   }
+
+  // remove lifecycle config, if any (XXX note could be made generic)
+  (void) store->getRados()->get_lc()->remove_bucket_config(
+    this->info, get_attrs());
 
   ret = store->ctl()->bucket->sync_user_stats(dpp, info.owner, info, y);
   if (ret < 0) {
@@ -197,6 +198,7 @@ int RGWRadosBucket::get_bucket_info(const DoutPrefixProvider *dpp, optional_yiel
   if (ret == 0) {
     bucket_version = ep_ot.read_version;
     ent.placement_rule = info.placement_rule;
+    ent.bucket = info.bucket; // we looked up bucket_id
   }
   return ret;
 }
@@ -374,6 +376,7 @@ int RGWRadosBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int 
   int ret = list_op.list_objects(dpp, max, &results.objs, &results.common_prefixes, &results.is_truncated, y);
   if (ret >= 0) {
     results.next_marker = list_op.get_next_marker();
+    params.marker = results.next_marker;
   }
 
   return ret;
@@ -813,6 +816,7 @@ RGWRadosObject::RadosWriteOp::RadosWriteOp(RGWRadosObject* _source, RGWObjectCtx
 int RGWRadosObject::RadosWriteOp::prepare(optional_yield y)
 {
   op_target.set_versioning_disabled(params.versioning_disabled);
+  op_target.set_meta_placement_rule(params.pmeta_placement_rule);
   parent_op.meta.mtime = params.mtime;
   parent_op.meta.rmattrs = params.rmattrs;
   parent_op.meta.data = params.data;
@@ -1292,7 +1296,7 @@ LCSerializer* RadosLifecycle::get_serializer(const std::string& lock_name, const
 
 } // namespace rgw::sal
 
-rgw::sal::RGWRadosStore *RGWStoreManager::init_storage_provider(const DoutPrefixProvider *dpp, CephContext *cct, bool use_gc_thread, bool use_lc_thread, bool quota_threads, bool run_sync_thread, bool run_reshard_thread, bool use_cache)
+rgw::sal::RGWRadosStore *RGWStoreManager::init_storage_provider(const DoutPrefixProvider *dpp, CephContext *cct, bool use_gc_thread, bool use_lc_thread, bool quota_threads, bool run_sync_thread, bool run_reshard_thread, bool use_cache, bool use_gc)
 {
   RGWRados *rados = new RGWRados;
   rgw::sal::RGWRadosStore *store = new rgw::sal::RGWRadosStore();
@@ -1301,6 +1305,7 @@ rgw::sal::RGWRadosStore *RGWStoreManager::init_storage_provider(const DoutPrefix
   rados->set_store(store);
 
   if ((*rados).set_use_cache(use_cache)
+              .set_use_gc(use_gc)
               .set_run_gc_thread(use_gc_thread)
               .set_run_lc_thread(use_lc_thread)
               .set_run_quota_threads(quota_threads)

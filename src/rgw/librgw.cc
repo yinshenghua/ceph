@@ -53,6 +53,12 @@
 #include "rgw_http_client.h"
 #include "rgw_http_client_curl.h"
 #include "rgw_perf_counters.h"
+#ifdef WITH_RADOSGW_AMQP_ENDPOINT
+#include "rgw_amqp.h"
+#endif
+#ifdef WITH_RADOSGW_KAFKA_ENDPOINT
+#include "rgw_kafka.h"
+#endif
 
 #include "services/svc_zone.h"
 
@@ -335,8 +341,7 @@ namespace rgw {
               << e.what() << dendl;
     }
     if (should_log) {
-      rgw_log_op(store->getRados(), nullptr /* !rest */, s,
-		 (op ? op->name() : "unknown"), olog);
+      rgw_log_op(nullptr /* !rest */, s, (op ? op->name() : "unknown"), olog);
     }
 
     int http_ret = s->err.http_ret;
@@ -583,10 +588,20 @@ namespace rgw {
 
     // XXX ex-RGWRESTMgr_lib, mgr->set_logging(true)
 
+    OpsLogManifold* olog_manifold = new OpsLogManifold();
     if (!g_conf()->rgw_ops_log_socket_path.empty()) {
-      olog = new OpsLogSocket(g_ceph_context, g_conf()->rgw_ops_log_data_backlog);
-      olog->init(g_conf()->rgw_ops_log_socket_path);
+      OpsLogSocket* olog_socket = new OpsLogSocket(g_ceph_context, g_conf()->rgw_ops_log_data_backlog);
+      olog_socket->init(g_conf()->rgw_ops_log_socket_path);
+      olog_manifold->add_sink(olog_socket);
     }
+    OpsLogFile* ops_log_file;
+    if (!g_conf()->rgw_ops_log_file_path.empty()) {
+      ops_log_file = new OpsLogFile(g_ceph_context, g_conf()->rgw_ops_log_file_path, g_conf()->rgw_ops_log_data_backlog);
+      ops_log_file->start();
+      olog_manifold->add_sink(ops_log_file);
+    }
+    olog_manifold->add_sink(new OpsLogRados(store->getRados()));
+    olog = olog_manifold;
 
     int port = 80;
     RGWProcessEnv env = { store, &rest, olog, port };
@@ -617,6 +632,17 @@ namespace rgw {
       /* ignore error */
     }
 
+#ifdef WITH_RADOSGW_AMQP_ENDPOINT
+    if (!rgw::amqp::init(cct.get())) {
+      derr << "ERROR: failed to initialize AMQP manager" << dendl;
+    }
+#endif
+#ifdef WITH_RADOSGW_KAFKA_ENDPOINT
+    if (!rgw::kafka::init(cct.get())) {
+      derr << "ERROR: failed to initialize Kafka manager" << dendl;
+    }
+#endif
+
     return 0;
   } /* RGWLib::init() */
 
@@ -636,7 +662,7 @@ namespace rgw {
     shutdown_async_signal_handler();
 
     rgw_log_usage_finalize();
-
+    
     delete olog;
 
     RGWStoreManager::close_storage(store);
@@ -645,6 +671,12 @@ namespace rgw {
     rgw_shutdown_resolver();
     rgw_http_client_cleanup();
     rgw::curl::cleanup_curl();
+#ifdef WITH_RADOSGW_AMQP_ENDPOINT
+    rgw::amqp::shutdown();
+#endif
+#ifdef WITH_RADOSGW_KAFKA_ENDPOINT
+    rgw::kafka::shutdown();
+#endif
 
     rgw_perf_stop(g_ceph_context);
 

@@ -1,3 +1,5 @@
+.. _rados-troubleshooting-mon:
+
 =================================
  Troubleshooting Monitors
 =================================
@@ -432,6 +434,8 @@ Recovery using healthy monitor(s)
 If there are any survivors, we can always :ref:`replace <adding-and-removing-monitors>` the corrupted one with a
 new one. After booting up, the new joiner will sync up with a healthy
 peer, and once it is fully sync'ed, it will be able to serve the clients.
+
+.. _mon-store-recovery-using-osds:
 
 Recovery using OSDs
 -------------------

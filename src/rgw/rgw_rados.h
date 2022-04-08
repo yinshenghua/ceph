@@ -9,9 +9,11 @@
 
 #include "include/rados/librados.hpp"
 #include "include/Context.h"
+#include "include/random.h"
 #include "common/RefCountedObj.h"
 #include "common/RWLock.h"
 #include "common/ceph_time.h"
+#include "common/Timer.h"
 #include "rgw_common.h"
 #include "cls/rgw/cls_rgw_types.h"
 #include "cls/version/cls_version_types.h"
@@ -32,7 +34,6 @@
 #include "services/svc_bi_rados.h"
 
 class RGWWatcher;
-class SafeTimer;
 class ACLOwner;
 class RGWGC;
 class RGWMetaNotifier;
@@ -422,12 +423,12 @@ class RGWRados
   int open_pool_ctx(const DoutPrefixProvider *dpp, const rgw_pool& pool, librados::IoCtx&  io_ctx,
 		    bool mostly_omap);
 
-  std::atomic<int64_t> max_req_id = { 0 };
+
   ceph::mutex lock = ceph::make_mutex("rados_timer_lock");
   SafeTimer *timer;
 
   rgw::sal::RGWRadosStore *store;
-  RGWGC *gc;
+  RGWGC *gc = nullptr;
   RGWLC *lc;
   RGWObjectExpirer *obj_expirer;
   bool use_gc_thread;
@@ -460,6 +461,7 @@ class RGWRados
   // This field represents the number of bucket index object shards
   uint32_t bucket_index_max_shards;
 
+  int get_obj_head_ref(const DoutPrefixProvider *dpp, const rgw_placement_rule& target_placement_rule, const rgw_obj& obj, rgw_rados_ref *ref);
   int get_obj_head_ref(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj, rgw_rados_ref *ref);
   int get_system_obj_ref(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, rgw_rados_ref *ref);
   uint64_t max_bucket_id;
@@ -506,6 +508,7 @@ protected:
   RGWIndexCompletionManager *index_completion_manager{nullptr};
 
   bool use_cache{false};
+  bool use_gc{true};
 
   int get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj, librados::IoCtx *ioctx);
 public:
@@ -524,6 +527,11 @@ public:
 
   RGWRados& set_use_cache(bool status) {
     use_cache = status;
+    return *this;
+  }
+
+  RGWRados& set_use_gc(bool status) {
+    use_gc = status;
     return *this;
   }
 
@@ -557,7 +565,7 @@ public:
   }
 
   uint64_t get_new_req_id() {
-    return ++max_req_id;
+    return ceph::util::generate_random_number<uint64_t>();
   }
 
   librados::IoCtx* get_lc_pool_ctx() {
@@ -710,6 +718,8 @@ public:
 
     bool bs_initialized;
 
+    const rgw_placement_rule *pmeta_placement_rule;
+
   protected:
     int get_state(const DoutPrefixProvider *dpp, RGWObjState **pstate, bool follow_olh, optional_yield y, bool assume_noent = false);
     void invalidate_state();
@@ -722,7 +732,8 @@ public:
     Object(RGWRados *_store, const RGWBucketInfo& _bucket_info, RGWObjectCtx& _ctx, const rgw_obj& _obj) : store(_store), bucket_info(_bucket_info),
                                                                                                ctx(_ctx), obj(_obj), bs(store),
                                                                                                state(NULL), versioning_disabled(false),
-                                                                                               bs_initialized(false) {}
+                                                                                               bs_initialized(false),
+                                                                                               pmeta_placement_rule(nullptr) {}
 
     RGWRados *get_store() { return store; }
     rgw_obj& get_obj() { return obj; }
@@ -749,6 +760,14 @@ public:
 
     bool versioning_enabled() {
       return (!versioning_disabled && bucket_info.versioning_enabled());
+    }
+
+    void set_meta_placement_rule(const rgw_placement_rule *p) {
+        pmeta_placement_rule = p;
+    }
+
+    const rgw_placement_rule& get_meta_placement_rule() {
+        return pmeta_placement_rule ? *pmeta_placement_rule : bucket_info.placement_rule;
     }
 
     struct Read {

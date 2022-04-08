@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 
+import logging
 import os
 from functools import total_ordering
-from ceph_volume import sys_info, process
+from ceph_volume import sys_info
 from ceph_volume.api import lvm
 from ceph_volume.util import disk, system
 from ceph_volume.util.lsmdisk import LSMDisk
 from ceph_volume.util.constants import ceph_disk_guids
+
+
+logger = logging.getLogger(__name__)
+
 
 report_template = """
 {dev:<25} {size:<12} {rot!s:<7} {available!s:<9} {model}"""
@@ -157,11 +162,11 @@ class Device(object):
         # if the path is not absolute, we have 'vg/lv', let's use LV name
         # to get the LV.
         if self.path[0] == '/':
-            lv = lvm.get_first_lv(filters={'lv_path': self.path})
+            lv = lvm.get_single_lv(filters={'lv_path': self.path})
         else:
             vgname, lvname = self.path.split('/')
-            lv = lvm.get_first_lv(filters={'lv_name': lvname,
-                                           'vg_name': vgname})
+            lv = lvm.get_single_lv(filters={'lv_name': lvname,
+                                            'vg_name': vgname})
         if lv:
             self.lv_api = lv
             self.lvs = [lv]
@@ -320,6 +325,12 @@ class Device(object):
         return self.sys_api['size']
 
     @property
+    def parent_device(self):
+        if 'PKNAME' in self.disk_api:
+            return '/dev/%s' % self.disk_api['PKNAME']
+        return None
+
+    @property
     def lvm_size(self):
         """
         If this device was made into a PV it would lose 1GB in total size
@@ -348,16 +359,22 @@ class Device(object):
 
     @property
     def has_bluestore_label(self):
-        out, err, ret = process.call([
-            'ceph-bluestore-tool', 'show-label',
-            '--dev', self.abspath], verbose_on_failure=False)
-        if ret:
-            return False
-        return True
+        return disk.has_bluestore_label(self.abspath)
 
     @property
     def is_mapper(self):
         return self.path.startswith(('/dev/mapper', '/dev/dm-'))
+
+    @property
+    def device_type(self):
+        if self.disk_api:
+            return self.disk_api['TYPE']
+        elif self.blkid_api:
+            return self.blkid_api['TYPE']
+
+    @property
+    def is_mpath(self):
+        return self.device_type == 'mpath'
 
     @property
     def is_lv(self):
@@ -379,10 +396,7 @@ class Device(object):
         elif self.blkid_api:
             api = self.blkid_api
         if api:
-            is_device = api['TYPE'] == 'device'
-            is_disk = api['TYPE'] == 'disk'
-            if is_device or is_disk:
-                return True
+            return self.device_type in ['disk', 'device', 'mpath']
         return False
 
     @property
@@ -460,6 +474,15 @@ class Device(object):
                 vg_free -= extent_size
             return [vg_free]
 
+    @property
+    def has_partitions(self):
+        '''
+        Boolean to determine if a given device has partitions.
+        '''
+        if self.sys_api.get('partitions'):
+            return True
+        return False
+
     def _check_generic_reject_reasons(self):
         reasons = [
             ('removable', 1, 'removable'),
@@ -476,10 +499,30 @@ class Device(object):
             rejected.append("Device type is not acceptable. It should be raw device or partition")
         if self.is_ceph_disk_member:
             rejected.append("Used by ceph-disk")
-        if self.has_bluestore_label:
-            rejected.append('Has BlueStore device label')
+
+        try:
+            if self.has_bluestore_label:
+                rejected.append('Has BlueStore device label')
+        except OSError as e:
+            # likely failed to open the device. assuming it is BlueStore is the safest option
+            # so that a possibly-already-existing OSD doesn't get overwritten
+            logger.error('failed to determine if device {} is BlueStore. device should not be used to avoid false negatives. err: {}'.format(self.abspath, e))
+            rejected.append('Failed to determine if device is BlueStore')
+
+        if self.is_partition:
+            try:
+                if disk.has_bluestore_label(self.parent_device):
+                    rejected.append('Parent has BlueStore device label')
+            except OSError as e:
+                # likely failed to open the device. assuming the parent is BlueStore is the safest
+                # option so that a possibly-already-existing OSD doesn't get overwritten
+                logger.error('failed to determine if partition {} (parent: {}) has a BlueStore parent. partition should not be used to avoid false negatives. err: {}'.format(self.abspath, self.parent_device, e))
+                rejected.append('Failed to determine if parent device is BlueStore')
+
         if self.has_gpt_headers:
             rejected.append('Has GPT headers')
+        if self.has_partitions:
+            rejected.append('Has partitions')
         return rejected
 
     def _check_lvm_reject_reasons(self):

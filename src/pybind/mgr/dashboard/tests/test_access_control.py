@@ -4,6 +4,7 @@ from __future__ import absolute_import
 
 import errno
 import json
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -15,7 +16,7 @@ from ..security import Permission, Scope
 from ..services.access_control import SYSTEM_ROLES, AccessControlDB, \
     PasswordPolicy, load_access_control_db, password_hash
 from ..settings import Settings
-from . import CLICommandTestMixin, CmdException  # pylint: disable=no-name-in-module
+from ..tests import CLICommandTestMixin, CmdException
 
 
 class AccessControlTest(unittest.TestCase, CLICommandTestMixin):
@@ -587,7 +588,7 @@ class AccessControlTest(unittest.TestCase, CLICommandTestMixin):
     def test_sanitize_password(self):
         self.test_create_user()
         password = 'myPass\\n\\r\\n'
-        with open('/tmp/test_sanitize_password.txt', 'w+') as pwd_file:
+        with tempfile.TemporaryFile(mode='w+') as pwd_file:
             # Add new line separators (like some text editors when a file is saved).
             pwd_file.write('{}{}'.format(password, '\n\r\n\n'))
             pwd_file.seek(0)
@@ -610,7 +611,7 @@ class AccessControlTest(unittest.TestCase, CLICommandTestMixin):
                           force_password=True)
 
         self.assertEqual(ctx.exception.retcode, -errno.EINVAL)
-        self.assertEqual(str(ctx.exception), ERROR_MSG_EMPTY_INPUT_FILE)
+        self.assertIn(ERROR_MSG_EMPTY_INPUT_FILE, str(ctx.exception))
 
     def test_set_user_password_hash(self):
         user_orig = self.test_create_user()

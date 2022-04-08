@@ -1123,7 +1123,7 @@ void Client::update_dentry_lease(Dentry *dn, LeaseStat *dlease, utime_t from, Me
 /*
  * update MDS location cache for a single inode
  */
-void Client::update_dir_dist(Inode *in, DirStat *dst)
+void Client::update_dir_dist(Inode *in, DirStat *dst, mds_rank_t from)
 {
   // auth
   ldout(cct, 20) << "got dirfrag map for " << in->ino << " frag " << dst->frag << " to mds " << dst->auth << dendl;
@@ -1137,12 +1137,14 @@ void Client::update_dir_dist(Inode *in, DirStat *dst)
     _fragmap_remove_non_leaves(in);
   }
 
-  // replicated
-  in->dir_replicated = !dst->dist.empty();
-  if (!dst->dist.empty())
-    in->frag_repmap[dst->frag].assign(dst->dist.begin(), dst->dist.end()) ;
-  else
-    in->frag_repmap.erase(dst->frag);
+  // replicated, only update from auth mds reply
+  if (from == dst->auth) {
+    in->dir_replicated = !dst->dist.empty();
+    if (!dst->dist.empty())
+      in->frag_repmap[dst->frag].assign(dst->dist.begin(), dst->dist.end()) ;
+    else
+      in->frag_repmap.erase(dst->frag);
+  }
 }
 
 void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
@@ -1432,7 +1434,8 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
   if (reply->head.is_dentry) {
     diri = add_update_inode(&dirst, request->sent_stamp, session,
 			    request->perms);
-    update_dir_dist(diri, &dst);  // dir stat info is attached to ..
+    mds_rank_t from_mds = mds_rank_t(reply->get_source().num());
+    update_dir_dist(diri, &dst, from_mds);  // dir stat info is attached to ..
 
     if (in) {
       Dir *dir = diri->open_dir();
@@ -4392,9 +4395,10 @@ void Client::remove_session_caps(MetaSession *s, int err)
   sync_cond.notify_all();
 }
 
-int Client::_do_remount(bool retry_on_error)
+std::pair<int, bool> Client::_do_remount(bool retry_on_error)
 {
   uint64_t max_retries = cct->_conf.get_val<uint64_t>("mds_max_retries_on_remount_failure");
+  bool abort_on_failure = false;
 
   errno = 0;
   int r = remount_cb(callback_handle);
@@ -4418,10 +4422,10 @@ int Client::_do_remount(bool retry_on_error)
       !(retry_on_error && (++retries_on_invalidate < max_retries));
     if (should_abort && !is_unmounting()) {
       lderr(cct) << "failed to remount for kernel dentry trimming; quitting!" << dendl;
-      ceph_abort();
+      abort_on_failure = true;
     }
   }
-  return r;
+  return std::make_pair(r, abort_on_failure);
 }
 
 class C_Client_Remount : public Context  {
@@ -5453,6 +5457,7 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   mds_rank_t mds = session->mds_num;
   int used = get_caps_used(in);
   int wanted = in->caps_wanted();
+  int flags = 0;
 
   const unsigned new_caps = m->get_caps();
   const bool was_stale = session->cap_gen > cap->gen;
@@ -5566,11 +5571,14 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
 	!_flush(in, new C_Client_FlushComplete(this, in))) {
       // waitin' for flush
     } else if (used & revoked & (CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO)) {
-      if (_release(in))
-	check = true;
+      if (_release(in)) {
+        check = true;
+        flags = CHECK_CAPS_NODELAY;
+      }
     } else {
       cap->wanted = 0; // don't let check_caps skip sending a response to MDS
       check = true;
+      flags = CHECK_CAPS_NODELAY;
     }
   } else if (cap->issued == new_caps) {
     ldout(cct, 10) << "  caps unchanged at " << ccap_string(cap->issued) << dendl;
@@ -5593,7 +5601,7 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   }
 
   if (check)
-    check_caps(in, 0);
+    check_caps(in, flags);
 
   // wake up waiters
   if (new_caps)
@@ -6313,9 +6321,29 @@ void Client::_close_sessions()
   }
 }
 
+void Client::flush_mdlog_sync(Inode *in)
+{
+  if (in->unsafe_ops.empty()) {
+    return;
+  }
+
+  std::set<mds_rank_t> anchor;
+  for (auto &&p : in->unsafe_ops) {
+    anchor.emplace(p->mds);
+  }
+  if (in->auth_cap) {
+    anchor.emplace(in->auth_cap->session->mds_num);
+  }
+
+  for (auto &rank : anchor) {
+    auto session = &mds_sessions.at(rank);
+    flush_mdlog(session);
+  }
+}
+
 void Client::flush_mdlog_sync()
 {
-  if (mds_requests.empty()) 
+  if (mds_requests.empty())
     return;
   for (auto &p : mds_sessions) {
     flush_mdlog(&p.second);
@@ -6710,6 +6738,16 @@ void Client::collect_and_send_global_metrics() {
     auto [opened_inodes, total_inodes] = get_opened_inodes_rates();
     metric = ClientMetricMessage(OpenedInodesPayload(opened_inodes, total_inodes));
   }
+  message.push_back(metric);
+
+  // read io sizes
+  metric = ClientMetricMessage(ReadIoSizesPayload(total_read_ops,
+                                                  total_read_size));
+  message.push_back(metric);
+
+  // write io sizes
+  metric = ClientMetricMessage(WriteIoSizesPayload(total_write_ops,
+                                                   total_write_size));
   message.push_back(metric);
 
   session->con->send_message2(make_message<MClientMetrics>(std::move(message)));
@@ -7436,6 +7474,54 @@ int Client::_getattr(Inode *in, int mask, const UserPerm& perms, bool force)
   
   int res = make_request(req, perms);
   ldout(cct, 10) << __func__ << " result=" << res << dendl;
+  return res;
+}
+
+int Client::_getvxattr(
+  Inode *in,
+  const UserPerm& perms,
+  const char *xattr_name,
+  ssize_t size,
+  void *value,
+  mds_rank_t rank)
+{
+  if (!xattr_name || strlen(xattr_name) <= 0 || strlen(xattr_name) > 255) {
+    return -CEPHFS_ENODATA;
+  }
+
+  MetaRequest *req = new MetaRequest(CEPH_MDS_OP_GETVXATTR);
+  filepath path;
+  in->make_nosnap_relative_path(path);
+  req->set_filepath(path);
+  req->set_inode(in);
+  req->set_string2(xattr_name);
+
+  bufferlist bl;
+  int res = make_request(req, perms, nullptr, nullptr, rank, &bl);
+  ldout(cct, 10) << __func__ << " result=" << res << dendl;
+
+  if (res < 0) {
+    return res;
+  }
+
+  std::string buf;
+  auto p = bl.cbegin();
+
+  DECODE_START(1, p);
+  decode(buf, p);
+  DECODE_FINISH(p);
+
+  ssize_t len = buf.length();
+
+  res = len; // refer to man getxattr(2) for output buffer size == 0
+
+  if (size > 0) {
+    if (len > size) {
+      res = -CEPHFS_ERANGE; // insufficient output buffer space
+    } else {
+      memcpy(value, buf.c_str(), len);
+    }
+  }
   return res;
 }
 
@@ -9944,6 +10030,7 @@ retry:
 
 success:
   ceph_assert(rc >= 0);
+  update_read_io_size(bl->length());
   if (movepos) {
     // adjust fd pos
     f->pos = start_pos + rc;
@@ -9991,6 +10078,9 @@ Client::C_Readahead::~C_Readahead() {
 void Client::C_Readahead::finish(int r) {
   lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
   client->put_cap_ref(f->inode.get(), CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
+  if (r > 0) {
+    client->update_read_io_size(r);
+  }
 }
 
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
@@ -10026,6 +10116,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl)
     r = onfinish.wait();
     client_lock.lock();
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+    update_read_io_size(bl->length());
   }
 
   if(f->readahead.get_min_readahead_size() > 0) {
@@ -10401,6 +10492,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 
   // if we get here, write was successful, update client metadata
 success:
+  update_write_io_size(size);
   // time
   lat = ceph_clock_now();
   lat -= start;
@@ -10565,7 +10657,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   } else ldout(cct, 10) << "no metadata needs to commit" << dendl;
 
   if (!syncdataonly && !in->unsafe_ops.empty()) {
-    flush_mdlog_sync();
+    flush_mdlog_sync(in);
 
     MetaRequest *req = in->unsafe_ops.back();
     ldout(cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
@@ -11269,20 +11361,19 @@ void Client::ll_register_callbacks(struct ceph_client_callback_args *args)
     umask_cb = args->umask_cb;
 }
 
-int Client::test_dentry_handling(bool can_invalidate)
+std::pair<int, bool> Client::test_dentry_handling(bool can_invalidate)
 {
-  int r = 0;
+  std::pair <int, bool> r(0, false);
 
   RWRef_t iref_reader(initialize_state, CLIENT_INITIALIZED);
   if (!iref_reader.is_state_satisfied())
-    return -CEPHFS_ENOTCONN;
+    return std::make_pair(-CEPHFS_ENOTCONN, false);
 
   can_invalidate_dentries = can_invalidate;
 
   if (can_invalidate_dentries) {
     ceph_assert(dentry_invalidate_cb);
     ldout(cct, 1) << "using dentry_invalidate_cb" << dendl;
-    r = 0;
   } else {
     ceph_assert(remount_cb);
     ldout(cct, 1) << "using remount_cb" << dendl;
@@ -12188,8 +12279,9 @@ int Client::_getxattr(Inode *in, const char *name, void *value, size_t size,
 		      const UserPerm& perms)
 {
   int r;
+  const VXattr *vxattr = nullptr;
 
-  const VXattr *vxattr = _match_vxattr(in, name);
+  vxattr = _match_vxattr(in, name);
   if (vxattr) {
     r = -CEPHFS_ENODATA;
 
@@ -12226,6 +12318,11 @@ int Client::_getxattr(Inode *in, const char *name, void *value, size_t size,
     goto out;
   }
 
+  if (!strncmp(name, "ceph.", 5)) {
+    r = _getvxattr(in, perms, name, size, value, MDS_RANK_NONE);
+    goto out;
+  }
+
   if (acl_type == NO_ACL && !strncmp(name, "system.", 7)) {
     r = -CEPHFS_EOPNOTSUPP;
     goto out;
@@ -12235,7 +12332,7 @@ int Client::_getxattr(Inode *in, const char *name, void *value, size_t size,
   if (r == 0) {
     string n(name);
     r = -CEPHFS_ENODATA;
-   if (in->xattrs.count(n)) {
+    if (in->xattrs.count(n)) {
       r = in->xattrs[n].length();
       if (r > 0 && size != 0) {
 	if (size >= (unsigned)r)
@@ -12809,6 +12906,8 @@ const Client::VXattr Client::_dir_vxattrs[] = {
     exists_cb: &Client::_vxattrcb_layout_exists,
     flags: 0,
   },
+  // FIXME
+  // Delete the following dir layout field definitions for release "S"
   XATTR_LAYOUT_FIELD(dir, layout, stripe_unit),
   XATTR_LAYOUT_FIELD(dir, layout, stripe_count),
   XATTR_LAYOUT_FIELD(dir, layout, object_size),
@@ -12832,6 +12931,8 @@ const Client::VXattr Client::_dir_vxattrs[] = {
   },
   XATTR_QUOTA_FIELD(quota, max_bytes),
   XATTR_QUOTA_FIELD(quota, max_files),
+  // FIXME
+  // Delete the following dir pin field definitions for release "S"
   {
     name: "ceph.dir.pin",
     getxattr_cb: &Client::_vxattrcb_dir_pin,

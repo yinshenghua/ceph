@@ -29,12 +29,12 @@
 %else
 %bcond_without tcmalloc
 %endif
+%bcond_with system_pmdk
 %if 0%{?fedora} || 0%{?rhel}
 %bcond_without selinux
 %ifarch x86_64 ppc64le
 %bcond_without rbd_rwl_cache
 %bcond_without rbd_ssd_cache
-%global _system_pmdk 1
 %else
 %bcond_with rbd_rwl_cache
 %bcond_with rbd_ssd_cache
@@ -49,6 +49,8 @@
 %bcond_without lttng
 %bcond_without libradosstriper
 %bcond_without ocf
+%global luarocks_package_name luarocks
+%bcond_without lua_packages
 %global _remote_tarball_prefix https://download.ceph.com/tarballs/
 %endif
 %if 0%{?suse_version}
@@ -58,12 +60,10 @@
 %bcond_with libradosstriper
 %ifarch x86_64 aarch64 ppc64le
 %bcond_without lttng
-%global _system_pmdk 1
 %bcond_without rbd_rwl_cache
 %bcond_without rbd_ssd_cache
 %else
 %bcond_with lttng
-%global _system_pmdk 0
 %bcond_with rbd_rwl_cache
 %bcond_with rbd_ssd_cache
 %endif
@@ -72,6 +72,21 @@
 #Compat macro for _fillupdir macro introduced in Nov 2017
 %if ! %{defined _fillupdir}
 %global _fillupdir /var/adm/fillup-templates
+%endif
+#luarocks
+%if 0%{?is_opensuse}
+# openSUSE
+%bcond_without lua_packages
+%if 0%{?sle_version}
+# openSUSE Leap
+%global luarocks_package_name lua53-luarocks
+%else
+# openSUSE Tumbleweed
+%global luarocks_package_name lua54-luarocks
+%endif
+%else
+# SLE
+%bcond_with lua_packages
 %endif
 %endif
 %bcond_with seastar
@@ -94,19 +109,6 @@
 %else
 %{!?_selinux_policy_version: %global _selinux_policy_version 0.0.0}
 %endif
-%endif
-
-%if 0%{?suse_version}
-%if !0%{?is_opensuse}
-# SLE does not support luarocks
-%bcond_with lua_packages
-%else
-%global luarocks_package_name lua53-luarocks
-%bcond_without lua_packages
-%endif
-%else
-%global luarocks_package_name luarocks
-%bcond_without lua_packages
 %endif
 
 %{!?_udevrulesdir: %global _udevrulesdir /lib/udev/rules.d}
@@ -168,7 +170,6 @@ BuildRequires:	gcc-toolset-9-gcc-c++ >= 9.2.1-2.3
 %else
 BuildRequires:	gcc-c++
 %endif
-BuildRequires:	gdbm
 %if 0%{with tcmalloc}
 # libprofiler did not build on ppc64le until 2.7.90
 %if 0%{?fedora} || 0%{?rhel} >= 8
@@ -232,7 +233,6 @@ BuildRequires:	python%{python3_pkgversion}-nose
 BuildRequires:	python%{python3_pkgversion}-pecan
 BuildRequires:	python%{python3_pkgversion}-requests
 BuildRequires:	python%{python3_pkgversion}-dateutil
-BuildRequires:	python%{python3_pkgversion}-virtualenv
 BuildRequires:	python%{python3_pkgversion}-coverage
 BuildRequires:	python%{python3_pkgversion}-pyOpenSSL
 BuildRequires:	socat
@@ -252,7 +252,7 @@ BuildRequires:  nlohmann_json-devel
 BuildRequires:  libevent-devel
 BuildRequires:  yaml-cpp-devel
 %endif
-%if 0%{?_system_pmdk}
+%if 0%{with system_pmdk}
 BuildRequires:  libpmem-devel
 BuildRequires:  libpmemobj-devel
 %endif
@@ -292,7 +292,6 @@ BuildRequires:	libbz2-devel
 BuildRequires:	mozilla-nss-devel
 BuildRequires:	keyutils-devel
 BuildRequires:  libopenssl-devel
-BuildRequires:  lsb-release
 BuildRequires:  openldap2-devel
 #BuildRequires:  krb5
 #BuildRequires:  krb5-devel
@@ -317,7 +316,6 @@ BuildRequires:  openldap-devel
 #BuildRequires:  krb5-devel
 BuildRequires:  openssl-devel
 BuildRequires:  CUnit-devel
-BuildRequires:  redhat-lsb-core
 BuildRequires:	python%{python3_pkgversion}-devel
 BuildRequires:	python%{python3_pkgversion}-setuptools
 BuildRequires:	python%{python3_pkgversion}-Cython
@@ -329,6 +327,7 @@ BuildRequires:	lz4-devel >= 1.7
 %if 0%{with make_check}
 %if 0%{?fedora} || 0%{?rhel}
 BuildRequires:	golang-github-prometheus
+BuildRequires:	jsonnet
 BuildRequires:	libtool-ltdl-devel
 BuildRequires:	xmlsec1
 BuildRequires:	xmlsec1-devel
@@ -346,6 +345,7 @@ BuildRequires:	python%{python3_pkgversion}-pyOpenSSL
 %endif
 %if 0%{?suse_version}
 BuildRequires:	golang-github-prometheus-prometheus
+BuildRequires:	jsonnet
 BuildRequires:	libxmlsec1-1
 BuildRequires:	libxmlsec1-nss1
 BuildRequires:	libxmlsec1-openssl1
@@ -436,6 +436,12 @@ Requires:      gperftools-libs >= 2.6.1
 %endif
 %if 0%{?weak_deps}
 Recommends:    chrony
+Recommends:    nvme-cli
+%if 0%{?suse_version}
+Requires:      smartmontools
+%else
+Recommends:    smartmontools
+%endif
 %endif
 %description base
 Base is the package that includes all the files shared amongst ceph servers
@@ -504,14 +510,6 @@ Group:		System/Filesystems
 %endif
 Provides:	ceph-test:/usr/bin/ceph-monstore-tool
 Requires:	ceph-base = %{_epoch_prefix}%{version}-%{release}
-%if 0%{?weak_deps}
-Recommends:	nvme-cli
-%if 0%{?suse_version}
-Requires:       smartmontools
-%else
-Recommends:	smartmontools
-%endif
-%endif
 %if 0%{with jaeger}
 Requires:	libjaeger = %{_epoch_prefix}%{version}-%{release}
 %endif
@@ -782,14 +780,6 @@ Requires:	lvm2
 Requires:	sudo
 Requires:	libstoragemgmt
 Requires:	python%{python3_pkgversion}-ceph-common = %{_epoch_prefix}%{version}-%{release}
-%if 0%{?weak_deps}
-Recommends:	nvme-cli
-%if 0%{?suse_version}
-Requires:       smartmontools
-%else
-Recommends:	smartmontools
-%endif
-%endif
 %description osd
 ceph-osd is the object storage daemon for the Ceph distributed file
 system.  It is responsible for storing objects on a local file system
@@ -1331,10 +1321,13 @@ ${CMAKE} .. \
 %if 0%{with rbd_ssd_cache}
     -DWITH_RBD_SSD_CACHE=ON \
 %endif
-%if 0%{?_system_pmdk}
+%if 0%{with system_pmdk}
     -DWITH_SYSTEM_PMDK:BOOL=ON \
 %endif
     -DBOOST_J=$CEPH_SMP_NCPUS \
+%if 0%{?rhel}
+    -DWITH_FMT_HEADER_ONLY:BOOL=ON \
+%endif
     -DWITH_GRAFANA=ON
 
 %if %{with cmake_verbose_logging}
@@ -1399,7 +1392,7 @@ ln -sf %{_sbindir}/mount.ceph %{buildroot}/sbin/mount.ceph
 install -m 0644 -D udev/50-rbd.rules %{buildroot}%{_udevrulesdir}/50-rbd.rules
 
 # sudoers.d
-install -m 0440 -D sudoers.d/ceph-osd-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-osd-smartctl
+install -m 0440 -D sudoers.d/ceph-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-smartctl
 
 %if 0%{?rhel} >= 8
 pathfix.py -pni "%{__python3} %{py3_shbang_opts}" %{buildroot}%{_bindir}/*
@@ -1500,6 +1493,7 @@ rm -rf %{buildroot}
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/bootstrap-mgr
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/bootstrap-rbd
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/bootstrap-rbd-mirror
+%{_sysconfdir}/sudoers.d/ceph-smartctl
 
 %post base
 /sbin/ldconfig
@@ -1544,7 +1538,7 @@ exit 0
 %{_mandir}/man8/cephadm.8*
 %attr(0700,cephadm,cephadm) %dir %{_sharedstatedir}/cephadm
 %attr(0700,cephadm,cephadm) %dir %{_sharedstatedir}/cephadm/.ssh
-%attr(0600,cephadm,cephadm) %{_sharedstatedir}/cephadm/.ssh/authorized_keys
+%config(noreplace) %attr(0600,cephadm,cephadm) %{_sharedstatedir}/cephadm/.ssh/authorized_keys
 
 %files common
 %dir %{_docdir}/ceph
@@ -1990,9 +1984,8 @@ fi
 %endif
 
 %postun immutable-object-cache
-test -n "$FIRST_ARG" || FIRST_ARG=$1
 %systemd_postun ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
-if [ $FIRST_ARG -ge 1 ] ; then
+if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
   SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
@@ -2082,7 +2075,6 @@ fi
 %{_unitdir}/ceph-volume@.service
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/osd
 %config(noreplace) %{_sysctldir}/90-ceph-osd.conf
-%{_sysconfdir}/sudoers.d/ceph-osd-smartctl
 
 %post osd
 %if 0%{?suse_version}
@@ -2383,13 +2375,21 @@ if diff ${FILE_CONTEXT} ${FILE_CONTEXT}.pre > /dev/null 2>&1; then
    exit 0
 fi
 
+# Stop ceph.target while relabeling if CEPH_AUTO_RESTART_ON_UPGRADE=yes
+SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
+if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
+    source $SYSCONF_CEPH
+fi
+
 # Check whether the daemons are running
 /usr/bin/systemctl status ceph.target > /dev/null 2>&1
 STATUS=$?
 
 # Stop the daemons if they were running
 if test $STATUS -eq 0; then
-    /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+    if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+        /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+    fi
 fi
 
 # Relabel the files fix for first package install
@@ -2401,7 +2401,9 @@ rm -f ${FILE_CONTEXT}.pre
 
 # Start the daemons iff they were running before
 if test $STATUS -eq 0; then
-    /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+    if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+        /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+    fi
 fi
 exit 0
 
@@ -2421,13 +2423,21 @@ if [ $1 -eq 0 ]; then
         exit 0
     fi
 
+    # Stop ceph.target while relabeling if CEPH_AUTO_RESTART_ON_UPGRADE=yes
+    SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
+    if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
+        source $SYSCONF_CEPH
+    fi
+
     # Check whether the daemons are running
     /usr/bin/systemctl status ceph.target > /dev/null 2>&1
     STATUS=$?
 
     # Stop the daemons if they were running
     if test $STATUS -eq 0; then
-        /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+        if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+            /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+        fi
     fi
 
     /usr/sbin/fixfiles -C ${FILE_CONTEXT}.pre restore 2> /dev/null
@@ -2437,7 +2447,9 @@ if [ $1 -eq 0 ]; then
 
     # Start the daemons if they were running before
     if test $STATUS -eq 0; then
-	/usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+        if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+	    /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+        fi
     fi
 fi
 exit 0

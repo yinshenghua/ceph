@@ -14,8 +14,7 @@
  * 
  */
 
-#ifndef CEPH_RGW_COMMON_H
-#define CEPH_RGW_COMMON_H
+#pragma once
 
 #include <array>
 #include <string_view>
@@ -1121,17 +1120,20 @@ struct RGWStorageStats
   RGWObjCategory category;
   uint64_t size;
   uint64_t size_rounded;
-  uint64_t size_utilized{0}; //< size after compression, encryption
   uint64_t num_objects;
+  uint64_t size_utilized{0}; //< size after compression, encryption
+  bool dump_utilized;        // whether dump should include utilized values
 
-  RGWStorageStats()
+  RGWStorageStats(bool _dump_utilized=true)
     : category(RGWObjCategory::None),
       size(0),
       size_rounded(0),
-      num_objects(0) {}
+      num_objects(0),
+      dump_utilized(_dump_utilized)
+  {}
 
   void dump(Formatter *f) const;
-};
+}; // RGWStorageStats
 
 class RGWEnv;
 
@@ -1620,6 +1622,8 @@ struct req_state : DoutPrefixProvider {
   //token claims from STS token for ops log (can be used for Keystone token also)
   std::vector<string> token_claims;
 
+  vector<rgw::IAM::Policy> session_policies;
+
   req_state(CephContext* _cct, RGWEnv* e, uint64_t id);
   ~req_state();
 
@@ -2085,7 +2089,7 @@ bool verify_object_permission_no_policy(const DoutPrefixProvider* dpp,
 
 /** Check if the req_state's user has the necessary permissions
  * to do the requested action */
-rgw::IAM::Effect eval_user_policies(const vector<rgw::IAM::Policy>& user_policies,
+rgw::IAM::Effect eval_identity_or_session_policies(const vector<rgw::IAM::Policy>& user_policies,
                           const rgw::IAM::Environment& env,
                           boost::optional<const rgw::auth::Identity&> id,
                           const uint64_t op,
@@ -2114,7 +2118,8 @@ bool verify_bucket_permission(
   RGWAccessControlPolicy * const user_acl,
   RGWAccessControlPolicy * const bucket_acl,
   const boost::optional<rgw::IAM::Policy>& bucket_policy,
-  const vector<rgw::IAM::Policy>& user_policies,
+  const vector<rgw::IAM::Policy>& identity_policies,
+  const vector<rgw::IAM::Policy>& session_policies,
   const uint64_t op);
 bool verify_bucket_permission(const DoutPrefixProvider* dpp, struct req_state * const s, const uint64_t op);
 bool verify_bucket_permission_no_policy(
@@ -2136,7 +2141,8 @@ extern bool verify_object_permission(
   RGWAccessControlPolicy * const bucket_acl,
   RGWAccessControlPolicy * const object_acl,
   const boost::optional<rgw::IAM::Policy>& bucket_policy,
-  const vector<rgw::IAM::Policy>& user_policies,
+  const vector<rgw::IAM::Policy>& identity_policies,
+  const vector<rgw::IAM::Policy>& session_policies,
   const uint64_t op);
 extern bool verify_object_permission(const DoutPrefixProvider* dpp, struct req_state *s, uint64_t op);
 extern bool verify_object_permission_no_policy(
@@ -2324,5 +2330,3 @@ int decode_bl(bufferlist& bl, T& t)
   }
   return 0;
 }
-
-#endif

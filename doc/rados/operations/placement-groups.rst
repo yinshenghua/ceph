@@ -31,6 +31,20 @@ applied to any pools that are created in the future with::
 
   ceph config set global osd_pool_default_pg_autoscale_mode <mode>
 
+You can disable or enable the autoscaler for all pools with
+the ``noautoscale`` flag. By default this flag is set to  be ``off``,
+but you can turn it ``on`` by using the command::
+
+  ceph osd pool set noautoscale
+
+You can turn it ``off`` using the command::
+
+  ceph osd pool unset noautoscale
+
+To ``get`` the value of the flag use the command::
+
+  ceph osd pool get noautoscale
+
 Viewing PG scaling recommendations
 ----------------------------------
 
@@ -41,10 +55,10 @@ the PG count with this command::
 
 Output will be something like::
 
-   POOL    SIZE  TARGET SIZE  RATE  RAW CAPACITY   RATIO  TARGET RATIO  EFFECTIVE RATIO PG_NUM  NEW PG_NUM  AUTOSCALE
-   a     12900M                3.0        82431M  0.4695                                     8         128  warn
-   c         0                 3.0        82431M  0.0000        0.2000           0.9884      1          64  warn
-   b         0        953.6M   3.0        82431M  0.0347                                     8              warn
+   POOL    SIZE  TARGET SIZE  RATE  RAW CAPACITY   RATIO  TARGET RATIO  EFFECTIVE RATIO BIAS PG_NUM  NEW PG_NUM  AUTOSCALE BULK
+   a     12900M                3.0        82431M  0.4695                                          8         128  warn      True
+   c         0                 3.0        82431M  0.0000        0.2000           0.9884  1.0      1          64  warn      True
+   b         0        953.6M   3.0        82431M  0.0347                                          8              warn      False
 
 **SIZE** is the amount of data stored in the pool. **TARGET SIZE**, if
 present, is the amount of data the administrator has specified that
@@ -77,6 +91,10 @@ ratio takes precedence.
 The system uses the larger of the actual ratio and the effective ratio
 for its calculation.
 
+**BIAS** is used as a multiplier to manually adjust a pool's PG based
+on prior information about how much PGs a specific pool is expected
+to have.
+
 **PG_NUM** is the current number of PGs for the pool (or the current
 number of PGs that the pool is working towards, if a ``pg_num``
 change is in progress).  **NEW PG_NUM**, if present, is what the
@@ -84,8 +102,15 @@ system believes the pool's ``pg_num`` should be changed to.  It is
 always a power of 2, and will only be present if the "ideal" value
 varies from the current value by more than a factor of 3.
 
-The final column, **AUTOSCALE**, is the pool ``pg_autoscale_mode``,
+**AUTOSCALE**, is the pool ``pg_autoscale_mode``
 and will be either ``on``, ``off``, or ``warn``.
+
+The final column, **BULK** determines if the pool is ``bulk``
+and will be either ``True`` or ``False``. A ``bulk`` pool
+means that the pool is expected to be large and should start out
+with large amount of PGs for performance purposes. On the other hand,
+pools without the ``bulk`` flag are expected to be smaller e.g.,
+.mgr or meta pools.
 
 
 Automated scaling
@@ -113,6 +138,27 @@ example, a pool that maps to OSDs of class `ssd` and a pool that maps
 to OSDs of class `hdd` will each have optimal PG counts that depend on
 the number of those respective device types.
 
+The autoscaler uses the `bulk` flag to determine which pool
+should start out with a full complement of PGs and only
+scales down when the usage ratio across the pool is not even.
+However, if the pool doesn't have the `bulk` flag, the pool will
+start out with minimal PGs and only when there is more usage in the pool.
+
+The autoscaler identifies any overlapping roots and prevents the pools
+with such roots from scaling because overlapping roots can cause problems
+with the scaling process.
+
+To create pool with `bulk` flag::
+
+  ceph osd pool create <pool-name> --bulk
+
+To set/unset `bulk` flag of existing pool::
+
+  ceph osd pool set <pool-name> bulk <true/false/1/0>
+
+To get `bulk` flag of existing pool::
+
+  ceph osd pool get <pool-name> bulk
 
 .. _specifying_pool_target_size:
 
@@ -167,13 +213,14 @@ parallelism client will see when doing IO, even when a pool is mostly
 empty.  Setting the lower bound prevents Ceph from reducing (or
 recommending you reduce) the PG number below the configured number.
 
-You can set the minimum number of PGs for a pool with::
+You can set the minimum or maximum number of PGs for a pool with::
 
   ceph osd pool set <pool-name> pg_num_min <num>
+  ceph osd pool set <pool-name> pg_num_max <num>
 
-You can also specify the minimum PG count at pool creation time with
-the optional ``--pg-num-min <num>`` argument to the ``ceph osd pool
-create`` command.
+You can also specify the minimum or maximum PG count at pool creation
+time with the optional ``--pg-num-min <num>`` or ``--pg-num-max
+<num>`` arguments to the ``ceph osd pool create`` command.
 
 .. _preselection:
 

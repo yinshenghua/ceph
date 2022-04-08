@@ -40,7 +40,7 @@ function run() {
 
     CHECK_MAKEOPTS=${CHECK_MAKEOPTS:-$DEFAULT_MAKEOPTS}
     if in_jenkins; then
-        if ! ctest $CHECK_MAKEOPTS --no-compress-output --output-on-failure -T Test; then
+        if ! ctest $CHECK_MAKEOPTS --no-compress-output --output-on-failure --test-output-size-failed 1024000 -T Test; then
             # do not return failure, as the jenkins publisher will take care of this
             rm -fr ${TMPDIR:-/tmp}/ceph-asok.*
         fi
@@ -67,14 +67,17 @@ function main() {
     fi
     FOR_MAKE_CHECK=1 prepare
     # Init defaults after deps are installed.
-    local cmake_opts=" -DWITH_PYTHON3=3 -DWITH_GTEST_PARALLEL=ON -DWITH_FIO=ON -DWITH_CEPHFS_SHELL=ON -DWITH_SPDK=ON -DENABLE_GIT_VERSION=OFF"
+    local cmake_opts=" -DWITH_PYTHON3=3 -DWITH_GTEST_PARALLEL=ON -DWITH_FIO=ON -DWITH_CEPHFS_SHELL=ON -DWITH_GRAFANA=ON -DWITH_SPDK=ON -DENABLE_GIT_VERSION=OFF"
     if [ $WITH_SEASTAR ]; then
         cmake_opts+=" -DWITH_SEASTAR=ON"
     fi
     if [ $WITH_ZBD ]; then
         cmake_opts+=" -DWITH_ZBD=ON"
     fi
+    in_jenkins && echo "CI_DEBUG: Our cmake_opts are: $cmake_opts
+                        CI_DEBUG: Running ./configure"
     configure $cmake_opts $@
+    in_jenkins && echo "CI_DEBUG: Running 'build tests'"
     build tests
     echo "make check: successful build on $(git rev-parse HEAD)"
     run

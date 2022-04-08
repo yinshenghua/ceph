@@ -14,6 +14,7 @@ from .operations.volume import create_volume, \
 from .operations.group import open_group, create_group, remove_group, open_group_unique
 from .operations.subvolume import open_subvol, create_subvol, remove_subvol, \
     create_clone
+from .operations.trash import Trash
 
 from .vol_spec import VolSpec
 from .exception import VolumeException, ClusterError, ClusterTimeout, EvictionError
@@ -73,7 +74,7 @@ class VolumeClient(CephfsClient["Module"]):
         # stop purge threads
         self.purge_queue.shutdown()
         # last, delete all libcephfs handles from connection pool
-        self.connection_pool.del_all_handles()
+        self.connection_pool.del_all_connections()
 
     def cluster_log(self, msg, lvl=None):
         """
@@ -122,7 +123,7 @@ class VolumeClient(CephfsClient["Module"]):
         if not metadata_pool:
             return -errno.ENOENT, "", "volume {0} doesn't exist".format(volname)
         self.purge_queue.cancel_jobs(volname)
-        self.connection_pool.del_fs_handle(volname, wait=True)
+        self.connection_pool.del_connections(volname, wait=True)
         return delete_volume(self.mgr, volname, metadata_pool, data_pools)
 
     def list_fs_volumes(self):
@@ -160,6 +161,7 @@ class VolumeClient(CephfsClient["Module"]):
         pool       = kwargs['pool_layout']
         uid        = kwargs['uid']
         gid        = kwargs['gid']
+        mode       = kwargs['mode']
         isolate_nspace = kwargs['namespace_isolated']
 
         try:
@@ -171,6 +173,7 @@ class VolumeClient(CephfsClient["Module"]):
                             attrs = {
                                 'uid': uid if uid else subvolume.uid,
                                 'gid': gid if gid else subvolume.gid,
+                                'mode': octal_str_to_decimal_int(mode),
                                 'data_pool': pool,
                                 'pool_namespace': subvolume.namespace if isolate_nspace else None,
                                 'quota': size
@@ -204,7 +207,7 @@ class VolumeClient(CephfsClient["Module"]):
                     # the purge threads on dump.
                     self.purge_queue.queue_job(volname)
         except VolumeException as ve:
-            if ve.errno == -errno.EAGAIN:
+            if ve.errno == -errno.EAGAIN and not force:
                 ve = VolumeException(ve.errno, ve.error_str + " (use --force to override)")
                 ret = self.volume_exception_to_retval(ve)
             elif not (ve.errno == -errno.ENOENT and force):
@@ -626,7 +629,7 @@ class VolumeClient(CephfsClient["Module"]):
         try:
             with open_volume(self, volname) as fs_handle:
                 volume_exists = True
-                groups = listdir(fs_handle, self.volspec.base_dir)
+                groups = listdir(fs_handle, self.volspec.base_dir, filter_entries=[Trash.GROUP_NAME.encode('utf-8')])
                 ret = 0, name_to_json(groups), ""
         except VolumeException as ve:
             if not ve.errno == -errno.ENOENT or not volume_exists:

@@ -220,9 +220,9 @@ class AMQPReceiver(object):
         self.events.append(json.loads(body))
 
     # TODO create a base class for the AMQP and HTTP cases
-    def verify_s3_events(self, keys, exact_match=False, deletions=False):
+    def verify_s3_events(self, keys, exact_match=False, deletions=False, expected_sizes={}):
         """verify stored s3 records agains a list of keys"""
-        verify_s3_records_by_elements(self.events, keys, exact_match=exact_match, deletions=deletions)
+        verify_s3_records_by_elements(self.events, keys, exact_match=exact_match, deletions=deletions, expected_sizes=expected_sizes)
         self.events = []
 
     def verify_events(self, keys, exact_match=False, deletions=False):
@@ -335,11 +335,11 @@ def verify_s3_records_by_elements(records, keys, exact_match=False, deletions=Fa
                 for record in record_list['Records']:
                     if record['s3']['bucket']['name'] == key.bucket.name and \
                         record['s3']['object']['key'] == key.name:
-                        if deletions and 'ObjectRemoved' in record['eventName']:
+                        if deletions and record['eventName'].startswith('ObjectRemoved'):
                             key_found = True
                             object_size = record['s3']['object']['size']
                             break
-                        elif not deletions and 'ObjectCreated' in record['eventName']:
+                        elif not deletions and record['eventName'].startswith('ObjectCreated'):
                             key_found = True
                             object_size = record['s3']['object']['size']
                             break
@@ -347,11 +347,11 @@ def verify_s3_records_by_elements(records, keys, exact_match=False, deletions=Fa
             for record in records['Records']:
                 if record['s3']['bucket']['name'] == key.bucket.name and \
                     record['s3']['object']['key'] == key.name:
-                    if deletions and 'ObjectRemoved' in record['eventName']:
+                    if deletions and record['eventName'].startswith('ObjectRemoved'):
                         key_found = True
                         object_size = record['s3']['object']['size']
                         break
-                    elif not deletions and 'ObjectCreated' in record['eventName']:
+                    elif not deletions and record['eventName'].startswith('ObjectCreated'):
                         key_found = True
                         object_size = record['s3']['object']['size']
                         break
@@ -3530,20 +3530,27 @@ def ps_s3_creation_triggers_on_master(external_endpoint_address=None, ca_locatio
     response, status = s3_notification_conf.set_config()
     assert_equal(status/100, 2)
 
+    objects_size = {}
     # create objects in the bucket using PUT
-    key = bucket.new_key('put')
-    key.set_contents_from_string('bar')
+    content = str(os.urandom(randint(1, 1024)))
+    key_name = 'put'
+    key = bucket.new_key(key_name)
+    objects_size[key_name] = len(content)
+    key.set_contents_from_string(content)
     # create objects in the bucket using COPY
-    bucket.copy_key('copy', bucket.name, key.name)
+    key_name = 'copy'
+    bucket.copy_key(key_name, bucket.name, key.name)
+    objects_size[key_name] = len(content)
 
     # create objects in the bucket using multi-part upload
     fp = tempfile.NamedTemporaryFile(mode='w+b')
-    object_size = 10*1024*1024
-    content = bytearray(os.urandom(object_size))
+    content = bytearray(os.urandom(10*1024*1024))
+    key_name = 'multipart'
+    objects_size[key_name] = len(content)
     fp.write(content)
     fp.flush()
     fp.seek(0)
-    uploader = bucket.initiate_multipart_upload('multipart')
+    uploader = bucket.initiate_multipart_upload(key_name)
     uploader.upload_part_from_file(fp, 1)
     uploader.complete_upload()
     fp.close()
@@ -3553,7 +3560,7 @@ def ps_s3_creation_triggers_on_master(external_endpoint_address=None, ca_locatio
 
     # check amqp receiver
     keys = list(bucket.list())
-    receiver.verify_s3_events(keys, exact_match=True)
+    receiver.verify_s3_events(keys, exact_match=True, expected_sizes=objects_size)
 
     # cleanup
     stop_amqp_receiver(receiver, task)
@@ -4207,19 +4214,22 @@ def test_ps_s3_versioned_deletion_on_master():
 
     # create objects in the bucket
     key = bucket.new_key('foo')
-    key.set_contents_from_string('bar')
-    v1 = key.version_id
-    key.set_contents_from_string('kaboom')
-    v2 = key.version_id
+    content = str(os.urandom(512))
+    size1 = len(content)
+    key.set_contents_from_string(content)
+    ver1 = key.version_id
+    content = str(os.urandom(511))
+    size2 = len(content)
+    key.set_contents_from_string(content)
+    ver2 = key.version_id
     # create delete marker (non versioned deletion)
     delete_marker_key = bucket.delete_key(key.name)
     
     time.sleep(1)
     
     # versioned deletion
-    bucket.delete_key(key.name, version_id=v2)
-    bucket.delete_key(key.name, version_id=v1)
-    delete_marker_key.delete()
+    bucket.delete_key(key.name, version_id=ver2)
+    bucket.delete_key(key.name, version_id=ver1)
 
     print('wait for 5sec for the messages...')
     time.sleep(5)
@@ -4230,21 +4240,25 @@ def test_ps_s3_versioned_deletion_on_master():
     delete_marker_create_events = 0
     for event_list in events:
         for event in event_list['Records']:
+            size = event['s3']['object']['size']
             if event['eventName'] == 's3:ObjectRemoved:Delete':
                 delete_events += 1
+                assert size in [size1, size2]
                 assert event['s3']['configurationId'] in [notification_name+'_1', notification_name+'_3']
             if event['eventName'] == 's3:ObjectRemoved:DeleteMarkerCreated':
                 delete_marker_create_events += 1
+                assert size == size2
                 assert event['s3']['configurationId'] in [notification_name+'_1', notification_name+'_2']
    
-    # 3 key versions were deleted (v1, v2 and the deletion marker)
+    # 2 key versions were deleted
     # notified over the same topic via 2 notifications (1,3)
-    assert_equal(delete_events, 3*2)
+    assert_equal(delete_events, 2*2)
     # 1 deletion marker was created
     # notified over the same topic over 2 notifications (1,2)
     assert_equal(delete_marker_create_events, 1*2)
 
     # cleanup
+    delete_marker_key.delete()
     stop_amqp_receiver(receiver, task)
     s3_notification_conf.del_config()
     topic_conf.del_config()

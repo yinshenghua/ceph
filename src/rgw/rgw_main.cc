@@ -195,7 +195,10 @@ int radosgw_Main(int argc, const char **argv)
   map<string,string> defaults = {
     { "debug_rgw", "1/5" },
     { "keyring", "$rgw_data/keyring" },
-    { "objecter_inflight_ops", "24576" }
+    { "objecter_inflight_ops", "24576" },
+    // require a secure mon connection by default
+    { "ms_mon_client_mode", "secure" },
+    { "auth_client_required", "cephx" }
   };
 
   vector<const char*> args;
@@ -501,12 +504,19 @@ int radosgw_Main(int argc, const char **argv)
 
   rgw::dmclock::SchedulerCtx sched_ctx{cct.get()};
 
-  OpsLogSocket *olog = NULL;
-
+  OpsLogManifold *olog = new OpsLogManifold();
   if (!g_conf()->rgw_ops_log_socket_path.empty()) {
-    olog = new OpsLogSocket(g_ceph_context, g_conf()->rgw_ops_log_data_backlog);
-    olog->init(g_conf()->rgw_ops_log_socket_path);
+    OpsLogSocket* olog_socket = new OpsLogSocket(g_ceph_context, g_conf()->rgw_ops_log_data_backlog);
+    olog_socket->init(g_conf()->rgw_ops_log_socket_path);
+    olog->add_sink(olog_socket);
   }
+  OpsLogFile* ops_log_file;
+  if (!g_conf()->rgw_ops_log_file_path.empty()) {
+    ops_log_file = new OpsLogFile(g_ceph_context, g_conf()->rgw_ops_log_file_path, g_conf()->rgw_ops_log_data_backlog);
+    ops_log_file->start();
+    olog->add_sink(ops_log_file);
+  }
+  olog->add_sink(new OpsLogRados(store->getRados()));
 
   r = signal_fd_init();
   if (r < 0) {
@@ -557,6 +567,8 @@ int radosgw_Main(int argc, const char **argv)
     RGWFrontend *fe = NULL;
 
     if (framework == "civetweb" || framework == "mongoose") {
+      lderr(cct.get()) << "IMPORTANT: the civetweb frontend is now deprecated "
+          "and will be removed in a future release" << dendl;
       framework = "civetweb";
       std::string uri_prefix;
       config->get_val("prefix", "", &uri_prefix);
@@ -676,7 +688,6 @@ int radosgw_Main(int argc, const char **argv)
   shutdown_async_signal_handler();
 
   rgw_log_usage_finalize();
-
   delete olog;
 
   RGWStoreManager::close_storage(store);

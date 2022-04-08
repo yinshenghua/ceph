@@ -1891,8 +1891,8 @@ public:
   }
   osd_id_t pop_osd() {
     ceph_assert(!is_empty());
-    auto ret = osds.back();
-    osds.pop_back();
+    auto ret = osds.front();
+    osds.pop_front();
     return ret.second;
   }
 
@@ -1901,7 +1901,7 @@ public:
 
   osd_ord_t get_ord() const {
     return osds.empty() ? std::make_tuple(false, eversion_t())
-      : osds.back().first;
+      : osds.front().first;
   }
 
   bool is_empty() const { return osds.empty(); }
@@ -2782,6 +2782,11 @@ void PeeringState::activate(
     info.purged_snaps.swap(purged);
 
     // start up replicas
+    if (prior_readable_down_osds.empty()) {
+      dout(10) << __func__ << " no prior_readable_down_osds to wait on, clearing ub"
+	       << dendl;
+      clear_prior_readable_until_ub();
+    }
     info.history.refresh_prior_readable_until_ub(pl->get_mnow(),
 						 prior_readable_until_ub);
 
@@ -2801,6 +2806,9 @@ void PeeringState::activate(
       pg_missing_t& pm = peer_missing[peer];
 
       bool needs_past_intervals = pi.dne();
+
+      // Save num_bytes for backfill reservation request, can't be negative
+      peer_bytes[peer] = std::max<int64_t>(0, pi.stats.stats.sum.num_bytes);
 
       if (pi.last_update == info.last_update) {
         // empty log
@@ -2852,8 +2860,6 @@ void PeeringState::activate(
 	pi.last_interval_started = info.last_interval_started;
 	pi.history = info.history;
 	pi.hit_set = info.hit_set;
-        // Save num_bytes for reservation request, can't be negative
-        peer_bytes[peer] = std::max<int64_t>(0, pi.stats.stats.sum.num_bytes);
         pi.stats.stats.clear();
         pi.stats.stats.sum.num_bytes = peer_bytes[peer];
 
@@ -3867,6 +3873,8 @@ std::optional<pg_stat_t> PeeringState::prepare_stats_for_publish(
   const object_stat_collection_t &unstable_stats)
 {
   if (info.stats.stats.sum.num_scrub_errors) {
+    psdout(10) << __func__ << " inconsistent due to " <<
+      info.stats.stats.sum.num_scrub_errors << " scrub errors" << dendl;
     state_set(PG_STATE_INCONSISTENT);
   } else {
     state_clear(PG_STATE_INCONSISTENT);
@@ -6767,10 +6775,10 @@ PeeringState::GetInfo::GetInfo(my_context ctx)
 
   prior_set = ps->build_prior();
   ps->prior_readable_down_osds = prior_set.down;
+
   if (ps->prior_readable_down_osds.empty()) {
-    psdout(10) << " no prior_set down osds, clearing prior_readable_until_ub"
+    psdout(10) << " no prior_set down osds, will clear prior_readable_until_ub before activating"
 	       << dendl;
-    ps->clear_prior_readable_until_ub();
   }
 
   ps->reset_min_peer_features();

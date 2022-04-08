@@ -107,11 +107,11 @@ class LastEpochClean {
     std::vector<epoch_t> epoch_by_pg;
     ps_t next_missing = 0;
     epoch_t floor = std::numeric_limits<epoch_t>::max();
-    void report(ps_t pg, epoch_t last_epoch_clean);
+    void report(unsigned pg_num, ps_t pg, epoch_t last_epoch_clean);
   };
   std::map<uint64_t, Lec> report_by_pool;
 public:
-  void report(const pg_t& pg, epoch_t last_epoch_clean);
+  void report(unsigned pg_num, const pg_t& pg, epoch_t last_epoch_clean);
   void remove_pool(uint64_t pool);
   epoch_t get_lower_bound(const OSDMap& latest) const;
 
@@ -520,6 +520,7 @@ private:
 		       const std::string &crush_rule_name,
                        unsigned pg_num, unsigned pgp_num,
 		       unsigned pg_num_min,
+		       unsigned pg_num_max,
                        uint64_t repl_size,
 		       const uint64_t target_size_bytes,
 		       const float target_size_ratio,
@@ -528,6 +529,7 @@ private:
                        const uint64_t expected_num_objects,
                        FastReadType fast_read,
 		       const std::string& pg_autoscale_mode,
+		       bool bulk,
 		       std::ostream *ss);
   int prepare_new_pool(MonOpRequestRef op);
 
@@ -858,6 +860,13 @@ public:
    * Sets the osdmap and pg_pool_t values back to healthy stretch mode status.
    */
   void trigger_healthy_stretch_mode();
+  /**
+   * Obtain the crush rule being used for stretch pools.
+   * Note that right now this is heuristic and simply selects the
+   * most-used rule on replicated stretch pools.
+   * @return the crush rule ID, or a negative errno
+   */
+  int get_replicated_stretch_crush_rule();
 private:
   utime_t stretch_recovery_triggered; // what time we committed a switch to recovery mode
 };

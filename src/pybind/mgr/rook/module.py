@@ -321,8 +321,6 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
                 spec[svc] = orchestrator.ServiceDescription(
                     spec=NFSServiceSpec(
                         service_id=nfs_name,
-                        pool=nfs['spec']['rados']['pool'],
-                        namespace=nfs['spec']['rados'].get('namespace', None),
                         placement=PlacementSpec(count=active),
                     ),
                     size=active,
@@ -372,14 +370,13 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
             sd.hostname = p['hostname']
             sd.daemon_type = p['labels']['app'].replace('rook-ceph-', '')
             status = {
-                'Pending': orchestrator.DaemonDescriptionStatus.error,
+                'Pending': orchestrator.DaemonDescriptionStatus.starting,
                 'Running': orchestrator.DaemonDescriptionStatus.running,
                 'Succeeded': orchestrator.DaemonDescriptionStatus.stopped,
                 'Failed': orchestrator.DaemonDescriptionStatus.error,
-                'Unknown': orchestrator.DaemonDescriptionStatus.error,
+                'Unknown': orchestrator.DaemonDescriptionStatus.unknown,
             }[p['phase']]
             sd.status = status
-            sd.status_desc = p['phase']
 
             if 'ceph_daemon_id' in p['labels']:
                 sd.daemon_id = p['labels']['ceph_daemon_id']
@@ -403,7 +400,7 @@ class RookOrchestrator(MgrModule, orchestrator.Orchestrator):
         return result
 
     @handle_orch_error
-    def remove_service(self, service_name: str) -> str:
+    def remove_service(self, service_name: str, force: bool = False) -> str:
         service_type, service_name = service_name.split('.', 1)
         if service_type == 'mds':
             return self.rook_cluster.rm_service('cephfilesystems', service_name)

@@ -459,6 +459,16 @@ class TestFailover(CephFSTestCase):
         self.assertEqual(mds_0['gid'], self.fs.get_rank(rank=0)['gid'])
         self.fs.rank_freeze(False, rank=0)
 
+    def test_connect_bootstrapping(self):
+        self.config_set("mds", "mds_sleep_rank_change", 10000000.0)
+        self.config_set("mds", "mds_connect_bootstrapping", True)
+        self.fs.set_max_mds(2)
+        self.fs.wait_for_daemons()
+        self.fs.rank_fail(rank=0)
+        # rank 0 will get stuck in up:resolve, see https://tracker.ceph.com/issues/53194
+        self.fs.wait_for_daemons()
+
+
 class TestStandbyReplay(CephFSTestCase):
     CLIENTS_REQUIRED = 0
     MDSS_REQUIRED = 4
@@ -517,6 +527,22 @@ class TestStandbyReplay(CephFSTestCase):
         self.fs.set_allow_standby_replay(True)
         time.sleep(30)
         self._confirm_single_replay()
+
+    def test_standby_replay_damaged(self):
+        """
+        That a standby-replay daemon can cause the rank to go damaged correctly.
+        """
+
+        self._confirm_no_replay()
+        self.config_set("mds", "mds_standby_replay_damaged", True)
+        self.fs.set_allow_standby_replay(True)
+        self.wait_until_true(
+            lambda: len(self.fs.get_damaged()) > 0,
+            timeout=30
+        )
+        status = self.fs.status()
+        self.assertListEqual([], list(self.fs.get_ranks(status=status)))
+        self.assertListEqual([0], self.fs.get_damaged(status=status))
 
     def test_standby_replay_disable(self):
         """

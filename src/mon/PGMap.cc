@@ -954,7 +954,11 @@ void PGMapDigest::dump_object_stat_sum(
     if (verbose) {
       f->dump_int("quota_objects", pool->quota_max_objects);
       f->dump_int("quota_bytes", pool->quota_max_bytes);
-      f->dump_int("dirty", sum.num_objects_dirty);
+      if (pool->is_tier()) {
+        f->dump_int("dirty", sum.num_objects_dirty);
+      } else {
+        f->dump_int("dirty", 0);
+      }
       f->dump_int("rd", sum.num_rd);
       f->dump_int("rd_bytes", sum.num_rd_kb * 1024ull);
       f->dump_int("wr", sum.num_wr);
@@ -984,16 +988,17 @@ void PGMapDigest::dump_object_stat_sum(
         tbl << "N/A";
       else
         tbl << stringify(si_u_t(pool->quota_max_objects));
-
       if (pool->quota_max_bytes == 0)
         tbl << "N/A";
       else
         tbl << stringify(byte_u_t(pool->quota_max_bytes));
-
-      tbl << stringify(si_u_t(sum.num_objects_dirty))
-	  << stringify(byte_u_t(statfs.data_compressed_allocated))
-	  << stringify(byte_u_t(statfs.data_compressed_original))
-	  ;
+      if (pool->is_tier()) {
+        tbl << stringify(si_u_t(sum.num_objects_dirty));
+      } else {
+        tbl << "N/A";
+      }
+      tbl << stringify(byte_u_t(statfs.data_compressed_allocated));
+      tbl << stringify(byte_u_t(statfs.data_compressed_original));
     }
   }
 }
@@ -1587,6 +1592,21 @@ void PGMap::dump_pg_stats(ceph::Formatter *f, bool brief) const
       i->second.dump_brief(f);
     else
       i->second.dump(f);
+    f->close_section();
+  }
+  f->close_section();
+}
+
+void PGMap::dump_pg_progress(ceph::Formatter *f) const
+{
+  f->open_object_section("pgs");
+  for (auto& i : pg_stat) {
+    std::string n = stringify(i.first);
+    f->open_object_section(n.c_str());
+    f->dump_int("num_bytes_recovered", i.second.stats.sum.num_bytes_recovered);
+    f->dump_int("num_bytes", i.second.stats.sum.num_bytes);
+    f->dump_unsigned("reported_epoch", i.second.reported_epoch);
+    f->dump_string("state", pg_state_string(i.second.state));
     f->close_section();
   }
   f->close_section();
@@ -2991,11 +3011,13 @@ void PGMap::get_health_checks(
 	if (mon_pg_warn_max_object_skew > 0 &&
 	    ratio > mon_pg_warn_max_object_skew) {
 	  ostringstream ss;
-	  ss << "pool " << name << " objects per pg ("
-	     << objects_per_pg << ") is more than " << ratio
-	     << " times cluster average ("
-	     << average_objects_per_pg << ")";
-	  many_detail.push_back(ss.str());
+	  if (pi->pg_autoscale_mode != pg_pool_t::pg_autoscale_mode_t::ON) {
+	      ss << "pool " << name << " objects per pg ("
+		 << objects_per_pg << ") is more than " << ratio
+		 << " times cluster average ("
+		 << average_objects_per_pg << ")";
+	      many_detail.push_back(ss.str());
+	  }
 	}
       }
     }

@@ -188,6 +188,11 @@ public:
   void dump(ceph::Formatter *f) const;
   void print(std::ostream& out) const;
 
+  bool is_upgradeable() const {
+    return (mds_map.allows_standby_replay() && mds_map.get_num_in_mds() == 0)
+       || (!mds_map.allows_standby_replay() && mds_map.get_num_in_mds() <= 1);
+  }
+
   /**
    * Return true if a daemon is already assigned as
    * STANDBY_REPLAY for the gid `who`
@@ -219,19 +224,23 @@ public:
   friend class PaxosFSMap;
   using mds_info_t = MDSMap::mds_info_t;
 
-  FSMap() : compat(MDSMap::get_compat_set_default()) {}
+  static const version_t STRUCT_VERSION = 7;
+  static const version_t STRUCT_VERSION_TRIM_TO = 7;
+
+  FSMap() : default_compat(MDSMap::get_compat_set_default()) {}
 
   FSMap(const FSMap &rhs)
     :
       epoch(rhs.epoch),
       next_filesystem_id(rhs.next_filesystem_id),
       legacy_client_fscid(rhs.legacy_client_fscid),
-      compat(rhs.compat),
+      default_compat(rhs.default_compat),
       enable_multiple(rhs.enable_multiple),
       ever_enabled_multiple(rhs.ever_enabled_multiple),
       mds_roles(rhs.mds_roles),
       standby_daemons(rhs.standby_daemons),
-      standby_epochs(rhs.standby_epochs)
+      standby_epochs(rhs.standby_epochs),
+      struct_version(rhs.struct_version)
   {
     filesystems.clear();
     for (const auto &i : rhs.filesystems) {
@@ -242,7 +251,7 @@ public:
 
   FSMap &operator=(const FSMap &rhs);
 
-  const CompatSet &get_compat() const {return compat;}
+  const CompatSet &get_default_compat() const {return default_compat;}
 
   void filter(const std::vector<string>& allowed)
   {
@@ -300,7 +309,7 @@ public:
    */
   std::map<mds_gid_t, mds_info_t> get_mds_info() const;
 
-  const mds_info_t* get_available_standby(fs_cluster_id_t fscid) const;
+  const mds_info_t* get_available_standby(const Filesystem& fs) const;
 
   /**
    * Resolve daemon name to GID
@@ -400,7 +409,8 @@ public:
    */
   Filesystem::ref create_filesystem(
       std::string_view name, int64_t metadata_pool,
-      int64_t data_pool, uint64_t features);
+      int64_t data_pool, uint64_t features,
+      fs_cluster_id_t fscid, bool recover);
 
   /**
    * Remove the filesystem (it must exist).  Caller should already
@@ -482,13 +492,6 @@ public:
     return filesystems.at(mds_roles.at(who))->get_standby_replay(who);
   }
 
-  /**
-   * A daemon has told us it's compat, and it's too new
-   * for the one we had previously.  Impose the new one
-   * on all filesystems.
-   */
-  void update_compat(const CompatSet &c);
-
   Filesystem::const_ref get_legacy_filesystem()
   {
     if (legacy_client_fscid == FS_CLUSTER_ID_NONE) {
@@ -512,12 +515,23 @@ public:
   epoch_t get_epoch() const { return epoch; }
   void inc_epoch() { epoch++; }
 
+  version_t get_struct_version() const { return struct_version; }
+  bool is_struct_old() const {
+    return struct_version < STRUCT_VERSION_TRIM_TO;
+  }
+
   size_t filesystem_count() const {return filesystems.size();}
   bool filesystem_exists(fs_cluster_id_t fscid) const {return filesystems.count(fscid) > 0;}
   Filesystem::const_ref get_filesystem(fs_cluster_id_t fscid) const {return std::const_pointer_cast<const Filesystem>(filesystems.at(fscid));}
   Filesystem::ref get_filesystem(fs_cluster_id_t fscid) {return filesystems.at(fscid);}
+  Filesystem::ref get_filesystem(mds_gid_t gid) {
+    return filesystems.at(mds_roles.at(gid));
+  }
   Filesystem::const_ref get_filesystem(void) const {return std::const_pointer_cast<const Filesystem>(filesystems.begin()->second);}
   Filesystem::const_ref get_filesystem(std::string_view name) const;
+  Filesystem::const_ref get_filesystem(mds_gid_t gid) const {
+    return filesystems.at(mds_roles.at(gid));
+  }
 
   std::vector<Filesystem::const_ref> get_filesystems(void) const;
 
@@ -555,7 +569,7 @@ public:
    * Assert that the FSMap, Filesystem, MDSMap, mds_info_t relations are
    * all self-consistent.
    */
-  void sanity() const;
+  void sanity(bool pending=false) const;
 
   void encode(ceph::buffer::list& bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator& p);
@@ -577,7 +591,7 @@ protected:
   epoch_t epoch = 0;
   uint64_t next_filesystem_id = FS_CLUSTER_ID_ANONYMOUS + 1;
   fs_cluster_id_t legacy_client_fscid = FS_CLUSTER_ID_NONE;
-  CompatSet compat;
+  CompatSet default_compat;
   bool enable_multiple = true;
   bool ever_enabled_multiple = true; // < the cluster had multiple FS enabled once
 
@@ -590,6 +604,9 @@ protected:
   // For MDS daemons not yet assigned to a Filesystem
   std::map<mds_gid_t, mds_info_t> standby_daemons;
   std::map<mds_gid_t, epoch_t> standby_epochs;
+
+private:
+  epoch_t struct_version = 0;
 };
 WRITE_CLASS_ENCODER_FEATURES(FSMap)
 

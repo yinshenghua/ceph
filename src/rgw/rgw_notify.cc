@@ -144,7 +144,10 @@ class Manager : public DoutPrefixProvider {
       pending_tokens(0),
       timer(io_context) {}  
  
-    void async_wait(spawn::yield_context yield) { 
+    void async_wait(yield_context yield) {
+      if (pending_tokens == 0) {
+        return;
+      }
       timer.expires_from_now(infinite_duration);
       boost::system::error_code ec; 
       timer.async_wait(yield[ec]);
@@ -158,7 +161,7 @@ class Manager : public DoutPrefixProvider {
 
   // processing of a specific entry
   // return whether processing was successfull (true) or not (false)
-  bool process_entry(const cls_queue_entry& entry, spawn::yield_context yield) {
+  bool process_entry(const cls_queue_entry& entry, yield_context yield) {
     event_entry_t event_entry;
     auto iter = entry.data.cbegin();
     try {
@@ -193,7 +196,7 @@ class Manager : public DoutPrefixProvider {
   }
 
   // clean stale reservation from queue
-  void cleanup_queue(const std::string& queue_name, spawn::yield_context yield) {
+  void cleanup_queue(const std::string& queue_name, yield_context yield) {
     while (true) {
       ldpp_dout(this, 20) << "INFO: trying to perform stale reservation cleanup for queue: " << queue_name << dendl;
       const auto now = ceph::coarse_real_time::clock::now();
@@ -229,13 +232,13 @@ class Manager : public DoutPrefixProvider {
   }
 
   // processing of a specific queue
-  void process_queue(const std::string& queue_name, spawn::yield_context yield) {
+  void process_queue(const std::string& queue_name, yield_context yield) {
     constexpr auto max_elements = 1024;
     auto is_idle = false;
     const std::string start_marker;
 
     // start a the cleanup coroutine for the queue
-    spawn::spawn(io_context, [this, queue_name](spawn::yield_context yield) {
+    spawn::spawn(io_context, [this, queue_name](yield_context yield) {
             cleanup_queue(queue_name, yield);
             }, make_stack_allocator());
     
@@ -308,7 +311,7 @@ class Manager : public DoutPrefixProvider {
           break;
         }
         // TODO pass entry pointer instead of by-value
-        spawn::spawn(yield, [this, &queue_name, entry_idx, total_entries, &end_marker, &remove_entries, &has_error, &waiter, entry](spawn::yield_context yield) {
+        spawn::spawn(yield, [this, &queue_name, entry_idx, total_entries, &end_marker, &remove_entries, &has_error, &waiter, entry](yield_context yield) {
             const auto token = waiter.make_token();
             if (process_entry(entry, yield)) {
               ldpp_dout(this, 20) << "INFO: processing of entry: " << 
@@ -360,7 +363,6 @@ class Manager : public DoutPrefixProvider {
           << queue_name << dendl;
         }
       }
-
     }
   }
 
@@ -369,7 +371,7 @@ class Manager : public DoutPrefixProvider {
 
   // process all queues
   // find which of the queues is owned by this daemon and process it
-  void process_queues(spawn::yield_context yield) {
+  void process_queues(yield_context yield) {
     auto has_error = false;
     owned_queues_t owned_queues;
 
@@ -381,6 +383,8 @@ class Manager : public DoutPrefixProvider {
     const auto max_jitter = 500; // ms
     std::uniform_int_distribution<> duration_jitter(min_jitter, max_jitter);
 
+    std::vector<std::string> queue_gc;
+    std::mutex queue_gc_lock;
     while (true) {
       Timer timer(io_context);
       const auto duration = (has_error ? 
@@ -399,8 +403,6 @@ class Manager : public DoutPrefixProvider {
         continue;
       }
 
-      std::vector<std::string> queue_gc;
-      std::mutex queue_gc_lock;
       for (const auto& queue_name : queues) {
         // try to lock the queue to check if it is owned by this rgw
         // or if ownershif needs to be taken
@@ -436,7 +438,7 @@ class Manager : public DoutPrefixProvider {
         if (owned_queues.insert(queue_name).second) {
           ldpp_dout(this, 10) << "INFO: queue: " << queue_name << " now owned (locked) by this daemon" << dendl;
           // start processing this queue
-          spawn::spawn(io_context, [this, &queue_gc, &queue_gc_lock, queue_name](spawn::yield_context yield) {
+          spawn::spawn(io_context, [this, &queue_gc, &queue_gc_lock, queue_name](yield_context yield) {
             process_queue(queue_name, yield);
             // if queue processing ended, it measn that the queue was removed or not owned anymore
             // mark it for deletion
@@ -486,16 +488,23 @@ public:
     stale_reservations_period_s(_stale_reservations_period_s),
     reservations_cleanup_period_s(_reservations_cleanup_period_s)
     {
-      spawn::spawn(io_context, [this](spawn::yield_context yield) {
+      spawn::spawn(io_context, [this] (yield_context yield) {
             process_queues(yield);
           }, make_stack_allocator());
 
       // start the worker threads to do the actual queue processing
       const std::string WORKER_THREAD_NAME = "notif-worker";
       for (auto worker_id = 0U; worker_id < worker_count; ++worker_id) {
-        workers.emplace_back([this]() { io_context.run(); });
-        const auto rc = ceph_pthread_setname(workers.back().native_handle(), 
-            (WORKER_THREAD_NAME+std::to_string(worker_id)).c_str());
+        workers.emplace_back([this]() {
+          try {
+            io_context.run(); 
+          } catch (const std::exception& err) {
+            ldpp_dout(this, 10) << "Notification worker failed with error: " << err.what() << dendl;
+            throw(err);
+          }
+        });
+        const auto rc = ceph_pthread_setname(workers.back().native_handle(),
+          (WORKER_THREAD_NAME+std::to_string(worker_id)).c_str());
         ceph_assert(rc == 0);
       }
       ldpp_dout(this, 10) << "Started notification manager with: " << worker_count << " workers" << dendl;
@@ -667,7 +676,7 @@ void populate_event_from_request(const reservation_t& res,
         rgw_pubsub_s3_event& event) {
   const auto s = res.s;
   event.eventTime = mtime;
-  event.eventName = to_string(event_type);
+  event.eventName = to_event_string(event_type);
   event.userIdentity = s->user->get_id().id;    // user that triggered the change
   event.x_amz_request_id = s->req_id;          // request ID of the original change
   event.x_amz_id_2 = s->host_id;               // RGW on which the change was made
@@ -675,7 +684,7 @@ void populate_event_from_request(const reservation_t& res,
   event.bucket_name = s->bucket_name;
   event.bucket_ownerIdentity = s->bucket_owner.get_id().id;
   event.bucket_arn = to_string(rgw::ARN(s->bucket->get_key()));
-  event.object_key = obj->get_name();
+  event.object_key = res.object_name ? *res.object_name : obj->get_name();
   event.object_size = size;
   event.object_etag = etag;
   event.object_versionId = obj->get_instance();
@@ -709,7 +718,8 @@ bool notification_match(reservation_t& res, const rgw_pubsub_topic_filter& filte
     return false;
   }
   const auto obj = res.object;
-  if (!match(filter.s3_filter.key_filter, obj->get_name())) {
+  if (!match(filter.s3_filter.key_filter, 
+        res.object_name ? *res.object_name : obj->get_name())) {
     return false;
   }
 

@@ -219,13 +219,18 @@ void RGWOp_Bucket_Remove::execute(optional_yield y)
   RESTArgs::get_string(s, "bucket", bucket_name, &bucket_name);
   RESTArgs::get_bool(s, "purge-objects", false, &delete_children);
 
-  op_ret = store->get_bucket(s, nullptr, string(), bucket_name, &bucket, y);
+  /* FIXME We're abusing the owner of the bucket to pass the user, so that it can be forwarded to
+   * the master.  This user is actually the OP caller, not the bucket owner. */
+  op_ret = store->get_bucket(s, s->user.get(), string(), bucket_name, &bucket, y);
   if (op_ret < 0) {
     ldpp_dout(this, 0) << "get_bucket returned ret=" << op_ret << dendl;
+    if (op_ret == -ENOENT) {
+      op_ret = -ERR_NO_SUCH_BUCKET;
+    }
     return;
   }
 
-  op_ret = bucket->remove_bucket(s, delete_children, string(), string(), true, &s->info, s->yield);
+  op_ret = bucket->remove_bucket(s, delete_children, true, &s->info, s->yield);
 }
 
 class RGWOp_Set_Bucket_Quota : public RGWRESTOp {
@@ -403,4 +408,3 @@ RGWOp *RGWHandler_Bucket::op_delete()
 
   return new RGWOp_Bucket_Remove;
 }
-

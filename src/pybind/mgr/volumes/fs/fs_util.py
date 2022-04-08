@@ -58,16 +58,20 @@ def volume_exists(mgr, fs_name):
             return True
     return False
 
-def listdir(fs, dirpath):
+def listdir(fs, dirpath, filter_entries=None):
     """
     Get the directory names (only dirs) for a given path
     """
     dirs = []
+    if filter_entries is None:
+        filter_entries = [b".", b".."]
+    else:
+        filter_entries.extend([b".", b".."])
     try:
         with fs.opendir(dirpath) as dir_handle:
             d = fs.readdir(dir_handle)
             while d:
-                if (d.d_name not in (b".", b"..")) and d.is_dir():
+                if (d.d_name not in filter_entries) and d.is_dir():
                     dirs.append(d.d_name)
                 d = fs.readdir(dir_handle)
     except cephfs.Error as e:
@@ -161,3 +165,15 @@ def get_ancestor_xattr(fs, path, attr):
             raise VolumeException(-e.args[0], e.args[1])
         else:
             return get_ancestor_xattr(fs, os.path.split(path)[0], attr)
+
+def create_base_dir(fs, path, mode):
+    """
+    Create volspec base/group directory if it doesn't exist
+    """
+    try:
+        fs.stat(path)
+    except cephfs.Error as e:
+        if e.args[0] == errno.ENOENT:
+            fs.mkdirs(path, mode)
+        else:
+            raise VolumeException(-e.args[0], e.args[1])
