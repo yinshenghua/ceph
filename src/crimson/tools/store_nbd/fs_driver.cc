@@ -179,10 +179,11 @@ seastar::future<bufferlist> FSDriver::read(
 
 seastar::future<> FSDriver::mkfs()
 {
-  init();
-  assert(fs);
-  return fs->start(
+  return init(    
   ).then([this] {
+    assert(fs);
+    return fs->start();
+  }).then([this] {
     uuid_d uuid;
     uuid.generate_random();
     return fs->mkfs(uuid).handle_error(
@@ -196,8 +197,9 @@ seastar::future<> FSDriver::mkfs()
   }).then([this] {
     return fs->stop();
   }).then([this] {
-    init();
-    return fs->start();
+    return init().then([this] {
+      return fs->start();
+    });
   }).then([this] {
     return fs->mount(
     ).handle_error(
@@ -239,8 +241,9 @@ seastar::future<> FSDriver::mount()
   return (
     config.mkfs ? mkfs() : seastar::now()
   ).then([this] {
-    init();
-    return fs->start();
+    return init().then([this] {
+      return fs->start();
+    });
   }).then([this] {
     return fs->mount(
     ).handle_error(
@@ -299,11 +302,15 @@ seastar::future<> FSDriver::close()
   });
 }
 
-void FSDriver::init()
+seastar::future<> FSDriver::init()
 {
   fs.reset();
-  fs = FuturizedStore::create(
+  return FuturizedStore::create(
     config.get_fs_type(),
     *config.path,
-    crimson::common::local_conf().get_config_values());
+    crimson::common::local_conf().get_config_values()
+  ).then([this] (auto store_ptr) {
+      fs = std::move(store_ptr);
+      return seastar::now();
+  });
 }

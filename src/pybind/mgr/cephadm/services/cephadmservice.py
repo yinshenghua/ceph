@@ -2,6 +2,7 @@ import errno
 import json
 import logging
 import re
+import socket
 from abc import ABCMeta, abstractmethod
 from typing import TYPE_CHECKING, List, Callable, TypeVar, \
     Optional, Dict, Any, Tuple, NewType, cast
@@ -37,7 +38,8 @@ class CephadmDaemonDeploySpec:
                  ip: Optional[str] = None,
                  ports: Optional[List[int]] = None,
                  rank: Optional[int] = None,
-                 rank_generation: Optional[int] = None):
+                 rank_generation: Optional[int] = None,
+                 extra_container_args: Optional[List[str]] = None):
         """
         A data struction to encapsulate `cephadm deploy ...
         """
@@ -72,6 +74,8 @@ class CephadmDaemonDeploySpec:
         self.rank: Optional[int] = rank
         self.rank_generation: Optional[int] = rank_generation
 
+        self.extra_container_args = extra_container_args
+
     def name(self) -> str:
         return '%s.%s' % (self.daemon_type, self.daemon_id)
 
@@ -96,6 +100,7 @@ class CephadmDaemonDeploySpec:
             ports=dd.ports,
             rank=dd.rank,
             rank_generation=dd.rank_generation,
+            extra_container_args=dd.extra_container_args,
         )
 
     def to_daemon_description(self, status: DaemonDescriptionStatus, status_desc: str) -> DaemonDescription:
@@ -110,6 +115,7 @@ class CephadmDaemonDeploySpec:
             ports=self.ports,
             rank=self.rank,
             rank_generation=self.rank_generation,
+            extra_container_args=self.extra_container_args,
         )
 
 
@@ -171,6 +177,10 @@ class CephadmService(metaclass=ABCMeta):
             rank: Optional[int] = None,
             rank_generation: Optional[int] = None,
     ) -> CephadmDaemonDeploySpec:
+        try:
+            eca = spec.extra_container_args
+        except AttributeError:
+            eca = None
         return CephadmDaemonDeploySpec(
             host=host,
             daemon_id=daemon_id,
@@ -181,6 +191,7 @@ class CephadmService(metaclass=ABCMeta):
             ip=ip,
             rank=rank,
             rank_generation=rank_generation,
+            extra_container_args=eca,
         )
 
     def prepare_create(self, daemon_spec: CephadmDaemonDeploySpec) -> CephadmDaemonDeploySpec:
@@ -229,9 +240,14 @@ class CephadmService(metaclass=ABCMeta):
                 self.mgr.log.warning(f"Unable to update caps for {entity}")
         return keyring
 
-    def _inventory_get_addr(self, hostname: str) -> str:
-        """Get a host's address with its hostname."""
-        return self.mgr.inventory.get_addr(hostname)
+    def _inventory_get_fqdn(self, hostname: str) -> str:
+        """Get a host's FQDN with its hostname.
+
+           If the FQDN can't be resolved, the address from the inventory will
+           be returned instead.
+        """
+        addr = self.mgr.inventory.get_addr(hostname)
+        return socket.getfqdn(addr)
 
     def _set_service_url_on_dashboard(self,
                                       service_name: str,
@@ -986,6 +1002,18 @@ class CrashService(CephService):
 class CephfsMirrorService(CephService):
     TYPE = 'cephfs-mirror'
 
+    def config(self, spec: ServiceSpec) -> None:
+        # make sure mirroring module is enabled
+        mgr_map = self.mgr.get('mgr_map')
+        mod_name = 'mirroring'
+        if mod_name not in mgr_map.get('services', {}):
+            self.mgr.check_mon_command({
+                'prefix': 'mgr module enable',
+                'module': mod_name
+            })
+            # we shouldn't get here (mon will tell the mgr to respawn), but no
+            # harm done if we do.
+
     def prepare_create(self, daemon_spec: CephadmDaemonDeploySpec) -> CephadmDaemonDeploySpec:
         assert self.TYPE == daemon_spec.daemon_type
 
@@ -1015,26 +1043,28 @@ class CephadmAgent(CephService):
 
         keyring = self.get_keyring_with_caps(self.get_auth_entity(daemon_id, host=host), [])
         daemon_spec.keyring = keyring
-        self.mgr.cache.agent_keys[host] = keyring
+        self.mgr.agent_cache.agent_keys[host] = keyring
 
         daemon_spec.final_config, daemon_spec.deps = self.generate_config(daemon_spec)
 
         return daemon_spec
 
     def generate_config(self, daemon_spec: CephadmDaemonDeploySpec) -> Tuple[Dict[str, Any], List[str]]:
-        cfg = {'target_ip': self.mgr.get_mgr_ip(),
-               'target_port': self.mgr.endpoint_port,
-               'refresh_period': self.mgr.agent_refresh_rate,
-               'listener_port': self.mgr.agent_starting_port,
-               'host': daemon_spec.host,
-               'device_enhanced_scan': str(self.mgr.get_module_option('device_enhanced_scan'))}
-
         try:
             assert self.mgr.cherrypy_thread
             assert self.mgr.cherrypy_thread.ssl_certs.get_root_cert()
+            assert self.mgr.cherrypy_thread.server_port
         except Exception:
             raise OrchestratorError(
                 'Cannot deploy agent daemons until cephadm endpoint has finished generating certs')
+
+        cfg = {'target_ip': self.mgr.get_mgr_ip(),
+               'target_port': self.mgr.cherrypy_thread.server_port,
+               'refresh_period': self.mgr.agent_refresh_rate,
+               'listener_port': self.mgr.agent_starting_port,
+               'host': daemon_spec.host,
+               'device_enhanced_scan': str(self.mgr.device_enhanced_scan)}
+
         listener_cert, listener_key = self.mgr.cherrypy_thread.ssl_certs.generate_cert(
             self.mgr.inventory.get_addr(daemon_spec.host))
         config = {
@@ -1045,6 +1075,6 @@ class CephadmAgent(CephService):
             'listener.key': listener_key,
         }
 
-        return config, sorted([str(self.mgr.get_mgr_ip()), str(self.mgr.endpoint_port),
+        return config, sorted([str(self.mgr.get_mgr_ip()), str(self.mgr.cherrypy_thread.server_port),
                                self.mgr.cherrypy_thread.ssl_certs.get_root_cert(),
                                str(self.mgr.get_module_option('device_enhanced_scan'))])

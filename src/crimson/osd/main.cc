@@ -28,6 +28,7 @@
 
 #include "osd.h"
 
+using namespace std::literals;
 namespace bpo = boost::program_options;
 using config_t = crimson::common::ConfigProxy;
 using std::string;
@@ -37,8 +38,8 @@ seastar::logger& logger() {
 }
 
 void usage(const char* prog) {
-  std::cout << "usage: " << prog << " -i <ID>\n"
-            << "  --help-seastar    show Seastar help messages\n";
+  std::cout << "usage: " << prog << "\n"
+            << "  -i <ID>\n";
   generic_server_usage();
 }
 
@@ -59,6 +60,7 @@ auto partition_args(seastar::app_template& app, char** argv_begin, char** argv_e
   // options. and ceph wins
   auto consume_conf_arg = [&](char** argv) {
     if (std::strcmp(*argv, "-c") == 0) {
+      std::cout << "warn: apply '-c FILE' as ceph option" << std::endl;
       ceph_args.push_back(*argv++);
       if (argv != argv_end) {
         ceph_args.push_back(*argv++);
@@ -71,11 +73,7 @@ auto partition_args(seastar::app_template& app, char** argv_begin, char** argv_e
     for (; unknown != unknown_args.end() &&
            argv != argv_end &&
            *unknown == *argv; ++argv, ++unknown) {
-      if (std::strcmp(*argv, "--help-seastar") == 0) {
-        app_args.push_back("--help");
-      } else {
-        ceph_args.push_back(*argv);
-      }
+      ceph_args.push_back(*argv);
     }
     return argv;
   };
@@ -103,10 +101,11 @@ seastar::future<> make_keyring()
     if (exists &&
         keyring.load(nullptr, path) == 0 &&
         keyring.get_auth(name, auth)) {
-      seastar::fprint(std::cerr, "already have key in keyring: %s\n", path);
+      fmt::print(std::cerr, "already have key in keyring: {}\n", path);
       return seastar::now();
     } else {
-      auth.key.create(std::make_unique<CephContext>().get(), CEPH_CRYPTO_AES);
+      CephContext temp_cct{};
+      auth.key.create(&temp_cct, CEPH_CRYPTO_AES);
       keyring.add(name, auth);
       bufferlist bl;
       keyring.encode_plaintext(bl);
@@ -115,7 +114,7 @@ seastar::future<> make_keyring()
       return crimson::write_file(std::move(bl), path, permissions);
     }
   }).handle_exception_type([path](const std::filesystem::filesystem_error& e) {
-    seastar::fprint(std::cerr, "FATAL: writing new keyring to %s: %s\n", path, e.what());
+    fmt::print(std::cerr, "FATAL: writing new keyring to {}: {}\n", path, e.what());
     throw e;
   });
 }
@@ -167,7 +166,7 @@ seastar::future<> fetch_config()
       msgr->shutdown().get();
     });
     monc.start().handle_exception([] (auto ep) {
-      seastar::fprint(std::cerr, "FATAL: unable to connect to cluster: {}\n", ep);
+      fmt::print(std::cerr, "FATAL: unable to connect to cluster: {}\n", ep);
       return seastar::make_exception_future<>(ep);
     }).get();
     auto stop_monc = seastar::defer([&] {
@@ -192,6 +191,7 @@ static void override_seastar_opts(std::vector<const char*>& args)
     // with the deployment tools, like cephadm and rook, which don't set, for
     // instance, aio-max-nr for us. but we should fix this, once crimson is able
     // to run on a multi-core system, i.e., once m-to-n problem is resolved.
+    std::cout << "warn: added seastar option --smp 1" << std::endl;
     args.emplace_back("--smp");
     args.emplace_back("1");
   }
@@ -218,10 +218,9 @@ int main(int argc, char* argv[])
      "Prometheus metrics prefix");
 
   auto [ceph_args, app_args] = partition_args(app, argv, argv + argc);
-  if (ceph_argparse_need_usage(ceph_args) &&
-      std::find(app_args.begin(), app_args.end(), "--help") == app_args.end()) {
+  if (ceph_argparse_need_usage(ceph_args) ||
+      ceph_argparse_need_usage(app_args)) {
     usage(argv[0]);
-    return EXIT_SUCCESS;
   }
   override_seastar_opts(app_args);
   std::string cluster_name{"ceph"};
@@ -314,7 +313,7 @@ int main(int argc, char* argv[])
           auto store = crimson::os::FuturizedStore::create(
             local_conf().get_val<std::string>("osd_objectstore"),
             local_conf().get_val<std::string>("osd_data"),
-            local_conf().get_config_values());
+            local_conf().get_config_values()).get();
 
           osd.start_single(whoami, nonce,
                            std::ref(*store),
@@ -330,10 +329,15 @@ int main(int argc, char* argv[])
             fetch_config().get();
           }
           if (config.count("mkfs")) {
+            auto osd_uuid = local_conf().get_val<uuid_d>("osd_uuid");
+            if (osd_uuid.is_zero()) {
+              // use a random osd uuid if not specified
+              osd_uuid.generate_random();
+            }
             osd.invoke_on(
               0,
               &crimson::osd::OSD::mkfs,
-              local_conf().get_val<uuid_d>("osd_uuid"),
+              osd_uuid,
               local_conf().get_val<uuid_d>("fsid")).get();
           }
           if (config.count("mkkey") || config.count("mkfs")) {
@@ -354,7 +358,7 @@ int main(int argc, char* argv[])
       });
     });
   } catch (...) {
-    seastar::fprint(std::cerr, "FATAL: Exception during startup, aborting: %s\n", std::current_exception());
+    fmt::print(std::cerr, "FATAL: Exception during startup, aborting: {}\n", std::current_exception());
     return EXIT_FAILURE;
   }
 }

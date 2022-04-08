@@ -1854,8 +1854,8 @@ public:
   }
   osd_id_t pop_osd() {
     ceph_assert(!is_empty());
-    auto ret = osds.back();
-    osds.pop_back();
+    auto ret = osds.front();
+    osds.pop_front();
     return ret.second;
   }
 
@@ -1864,7 +1864,7 @@ public:
 
   osd_ord_t get_ord() const {
     return osds.empty() ? std::make_tuple(false, eversion_t())
-      : osds.back().first;
+      : osds.front().first;
   }
 
   bool is_empty() const { return osds.empty(); }
@@ -2721,6 +2721,11 @@ void PeeringState::activate(
     info.purged_snaps.swap(purged);
 
     // start up replicas
+    if (prior_readable_down_osds.empty()) {
+      dout(10) << __func__ << " no prior_readable_down_osds to wait on, clearing ub"
+	       << dendl;
+      clear_prior_readable_until_ub();
+    }
     info.history.refresh_prior_readable_until_ub(pl->get_mnow(),
 						 prior_readable_until_ub);
 
@@ -3233,6 +3238,8 @@ void PeeringState::split_into(
   child->info.stats.parent_split_bits = split_bits;
   info.stats.stats_invalid = true;
   child->info.stats.stats_invalid = true;
+  child->info.stats.objects_trimmed = 0;
+  child->info.stats.snaptrim_duration = 0.0;
   child->info.last_epoch_started = info.last_epoch_started;
   child->info.last_interval_started = info.last_interval_started;
 
@@ -3810,7 +3817,7 @@ std::optional<pg_stat_t> PeeringState::prepare_stats_for_publish(
   if (info.stats.state != state) {
     info.stats.last_change = now;
     // Optimistic estimation, if we just find out an inactive PG,
-    // assumt it is active till now.
+    // assume it is active till now.
     if (!(state & PG_STATE_ACTIVE) &&
 	(info.stats.state & PG_STATE_ACTIVE))
       info.stats.last_active = now;
@@ -3982,6 +3989,12 @@ void PeeringState::update_stats(
     dirty_info = true;
     write_if_dirty(*t);
   }
+}
+
+void PeeringState::update_stats_wo_resched(
+  std::function<void(pg_history_t &, pg_stat_t &)> f)
+{
+  f(info.history, info.stats);
 }
 
 bool PeeringState::append_log_entries_update_missing(
@@ -6691,10 +6704,10 @@ PeeringState::GetInfo::GetInfo(my_context ctx)
 
   prior_set = ps->build_prior();
   ps->prior_readable_down_osds = prior_set.down;
+
   if (ps->prior_readable_down_osds.empty()) {
-    psdout(10) << " no prior_set down osds, clearing prior_readable_until_ub"
+    psdout(10) << " no prior_set down osds, will clear prior_readable_until_ub before activating"
 	       << dendl;
-    ps->clear_prior_readable_until_ub();
   }
 
   ps->reset_min_peer_features();

@@ -3,6 +3,8 @@
 
 #include "tm_driver.h"
 
+#include "crimson/os/seastore/segment_manager/block.h"
+
 using namespace crimson;
 using namespace crimson::os;
 using namespace crimson::os::seastore;
@@ -24,8 +26,10 @@ seastar::future<> TMDriver::write(
   return seastar::do_with(ptr, [this, offset](auto& ptr) {
     return repeat_eagain([this, offset, &ptr] {
       return tm->with_transaction_intr(
-          Transaction::src_t::MUTATE,
-          [this, offset, &ptr](auto& t) {
+        Transaction::src_t::MUTATE,
+        "write",
+        [this, offset, &ptr](auto& t)
+      {
         return tm->dec_ref(t, offset
         ).si_then([](auto){}).handle_error_interruptible(
           crimson::ct_error::enoent::handle([](auto) { return seastar::now(); }),
@@ -34,6 +38,7 @@ seastar::future<> TMDriver::write(
           logger().debug("dec_ref complete");
           return tm->alloc_extent<TestBlock>(t, offset, ptr.length());
         }).si_then([this, offset, &t, &ptr](auto ext) {
+          boost::ignore_unused(offset);  // avoid clang warning;
           assert(ext->get_laddr() == (size_t)offset);
           assert(ext->get_bptr().length() == ptr.length());
           ext->get_bptr().swap(ptr);
@@ -97,8 +102,10 @@ seastar::future<bufferlist> TMDriver::read(
   auto &blret = *blptrret;
   return repeat_eagain([=, &blret] {
     return tm->with_transaction_intr(
-        Transaction::src_t::READ,
-        [=, &blret](auto& t) {
+      Transaction::src_t::READ,
+      "read",
+      [=, &blret](auto& t)
+    {
       return read_extents(t, offset, size
       ).si_then([=, &blret](auto ext_list) {
         size_t cur = offset;
@@ -127,40 +134,8 @@ seastar::future<bufferlist> TMDriver::read(
 
 void TMDriver::init()
 {
-  auto scanner = std::make_unique<ExtentReader>();
-  scanner->add_segment_manager(segment_manager.get());
-  auto& scanner_ref = *scanner.get();
-  auto segment_cleaner = std::make_unique<SegmentCleaner>(
-    SegmentCleaner::config_t::get_default(),
-    std::move(scanner),
-    false /* detailed */);
-  std::vector<SegmentManager*> sms;
-  segment_cleaner->mount(segment_manager->get_device_id(), sms);
-  auto journal = std::make_unique<Journal>(*segment_manager, scanner_ref);
-  auto cache = std::make_unique<Cache>(scanner_ref);
-  auto lba_manager = lba_manager::create_lba_manager(*segment_manager, *cache);
-
-  auto epm = std::make_unique<ExtentPlacementManager>(*cache, *lba_manager);
-
-  epm->add_allocator(
-    device_type_t::SEGMENTED,
-    std::make_unique<SegmentedAllocator>(
-      *segment_cleaner,
-      *segment_manager,
-      *lba_manager,
-      *journal,
-      *cache));
-
-  journal->set_segment_provider(&*segment_cleaner);
-
-  tm = std::make_unique<TransactionManager>(
-    *segment_manager,
-    std::move(segment_cleaner),
-    std::move(journal),
-    std::move(cache),
-    std::move(lba_manager),
-    std::move(epm),
-    scanner_ref);
+  tm = make_transaction_manager(*segment_manager, false /* detailed */);
+  tm->add_segment_manager(segment_manager.get());
 }
 
 void TMDriver::clear()

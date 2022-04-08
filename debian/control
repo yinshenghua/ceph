@@ -18,13 +18,15 @@ Build-Depends: automake,
                dh-python,
                flex  <pkg.ceph.jaeger>,
                git,
+               golang,
                gperf,
                g++ (>= 7),
                hostname <pkg.ceph.check>,
                javahelper,
                jq <pkg.ceph.check>,
-               jsonnet <pkg.ceph.check>,
                junit4,
+               libarrow-dev <pkg.ceph.arrow>,
+               libparquet-dev <pkg.ceph.arrow>,
                libaio-dev,
                libbabeltrace-ctf-dev,
                libbabeltrace-dev,
@@ -48,7 +50,6 @@ Build-Depends: automake,
                librdmacm-dev,
                libkeyutils-dev,
                libldap2-dev,
-               libleveldb-dev,
                liblttng-ust-dev,
                liblua5.3-dev,
                liblz4-dev (>= 0.0~r131),
@@ -66,9 +67,11 @@ Build-Depends: automake,
                libnl-genl-3-dev,
                libxml2-dev,
                librabbitmq-dev,
+               libre2-dev,
+               libutf8proc-dev (>= 2.2.0),
                librdkafka-dev,
                luarocks,
-               libthrift-dev (>= 0.13.0) <pkg.ceph.jaeger>,
+               libthrift-dev (>= 0.13.0),
                libyaml-cpp-dev (>= 0.6) <pkg.ceph.crimson> <pkg.ceph.jaeger>,
                libzstd-dev <pkg.ceph.check>,
                libxmlsec1 <pkg.ceph.check>,
@@ -82,6 +85,7 @@ Build-Depends: automake,
                prometheus <pkg.ceph.check>,
                python3-all-dev,
                python3-cherrypy3,
+               python3-natsort,
                python3-jwt <pkg.ceph.check>,
                python3-nose <pkg.ceph.check>,
                python3-pecan <pkg.ceph.check>,
@@ -100,6 +104,7 @@ Build-Depends: automake,
                python3-yaml,
                ragel <pkg.ceph.crimson>,
                socat <pkg.ceph.check>,
+               systemd,
                systemtap-sdt-dev <pkg.ceph.crimson>,
                uuid-dev <pkg.ceph.check>,
                uuid-runtime,
@@ -224,6 +229,7 @@ Depends: ceph-base (= ${binary:Version}),
          ceph-mgr-modules-core (= ${binary:Version}),
          python3-bcrypt,
          python3-cherrypy3,
+         python3-natsort,
          python3-distutils,
          python3-jwt,
          python3-openssl,
@@ -344,7 +350,7 @@ Depends: ceph-mgr (= ${binary:Version}),
          ${python:Depends},
          openssh-client,
          python3-jinja2,
-         python3-cherrypy
+         python3-cherrypy3
 Description: cephadm orchestrator module for ceph-mgr
  Ceph is a massively scalable, open-source, distributed
  storage system that runs on commodity hardware and delivers object,
@@ -370,7 +376,6 @@ Description: debugging symbols for ceph-mgr
 Package: ceph-mon
 Architecture: linux-any
 Depends: ceph-base (= ${binary:Version}),
-         libjaeger <pkg.ceph.jaeger>,
          ${misc:Depends},
          ${shlibs:Depends},
 Replaces: ceph (<< 10), ceph-test (<< 12.2.2-14)
@@ -628,7 +633,6 @@ Description: debugging symbols for rbd-nbd
 Package: ceph-common
 Architecture: linux-any
 Depends: librbd1 (= ${binary:Version}),
-         libjaeger (= ${binary:Version}) <pkg.ceph.jaeger>,
          python3-cephfs (= ${binary:Version}),
          python3-ceph-argparse (= ${binary:Version}),
          python3-ceph-common (= ${binary:Version}),
@@ -1002,14 +1006,6 @@ Description: debugging symbols for radosgw
  service as well as the OpenStack Object Storage ("Swift") API.
  .
  This package contains debugging symbols for radosgw.
-
-Package: libjaeger
-Architecture: linux-any
-Section: libs
-Depends: ${misc:Depends},
-         ${shlibs:Depends},
-Build-Profiles: <pkg.ceph.jaeger>
-Description: This package provides libraries needed for distributed tracing for Ceph.
 
 Package: ceph-test
 Architecture: linux-any

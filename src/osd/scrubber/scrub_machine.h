@@ -20,8 +20,6 @@
 #include "scrub_machine_lstnr.h"
 #include "osd/scrubber_common.h"
 
-using namespace std::string_literals;
-
 class PG;  // holding a pointer to that one - just for testing
 class PgScrubber;
 namespace Scrub {
@@ -90,7 +88,7 @@ MEV(IntLocalMapDone)
 MEV(DigestUpdate)  ///< external. called upon success of a MODIFY op. See
 		   ///< scrub_snapshot_metadata()
 
-MEV(MapsCompared)  ///< (Crimson) maps_compare_n_cleanup() transactions are done
+MEV(MapsCompared)  ///< maps_compare_n_cleanup() transactions are done
 
 MEV(StartReplica)  ///< initiating replica scrub.
 
@@ -124,11 +122,11 @@ class ScrubMachine : public sc::state_machine<ScrubMachine, NotActive> {
   explicit ScrubMachine(PG* pg, ScrubMachineListener* pg_scrub);
   ~ScrubMachine();
 
-  PG* m_pg;  // only used for dout messages
   spg_t m_pg_id;
   ScrubMachineListener* m_scrbr;
+  std::ostream& gen_prefix(std::ostream& out) const;
 
-  void my_states() const;
+  std::string current_states_desc() const;
   void assert_not_active() const;
   [[nodiscard]] bool is_reserving() const;
   [[nodiscard]] bool is_accepting_updates() const;
@@ -299,11 +297,11 @@ struct WaitReplicas : sc::state<WaitReplicas, ActiveScrubbing> {
   using reactions =
     mpl::list<sc::custom_reaction<GotReplicas>,	 // all replicas are accounted for
 	      sc::transition<MapsCompared, WaitDigestUpdate>,
-	      sc::deferral<DigestUpdate>  // might arrive before we've reached WDU
+	      sc::custom_reaction<DigestUpdate>
 	      >;
 
   sc::result react(const GotReplicas&);
-
+  sc::result react(const DigestUpdate&);
   bool all_maps_already_called{false};	// see comment in react code
 };
 

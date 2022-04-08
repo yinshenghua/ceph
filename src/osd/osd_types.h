@@ -564,6 +564,8 @@ struct spg_t {
 
   static const uint8_t calc_name_buf_size = pg_t::calc_name_buf_size + 4; // 36 + len('s') + len("255");
   char *calc_name(char *buf, const char *suffix_backwords) const;
+  // and a (limited) version that uses an internal buffer:
+  std::string calc_name_sring() const;
  
   bool parse(const char *s);
   bool parse(const std::string& s) {
@@ -1074,6 +1076,9 @@ inline std::ostream& operator<<(std::ostream& out, const pool_snap_info_t& si) {
  * pool options.
  */
 
+// The order of items in the list is important, therefore,
+// you should always add to the end of the list when adding new options.
+
 class pool_opts_t {
 public:
   enum key_t {
@@ -1100,6 +1105,7 @@ public:
     DEDUP_TIER,
     DEDUP_CHUNK_ALGORITHM,
     DEDUP_CDC_CHUNK_SIZE,
+    PG_NUM_MAX, // max pg_num
   };
 
   enum type_t {
@@ -1256,6 +1262,7 @@ struct pg_pool_t {
     FLAG_POOL_SNAPS = 1<<14,        // pool has pool snaps
     FLAG_CREATING = 1<<15,          // initial pool PGs are being created
     FLAG_EIO = 1<<16,               // return EIO for all client ops
+    FLAG_BULK = 1<<17, //pool is large
   };
 
   static const char *get_flag_name(uint64_t f) {
@@ -1277,6 +1284,7 @@ struct pg_pool_t {
     case FLAG_POOL_SNAPS: return "pool_snaps";
     case FLAG_CREATING: return "creating";
     case FLAG_EIO: return "eio";
+    case FLAG_BULK: return "bulk";
     default: return "???";
     }
   }
@@ -1329,6 +1337,8 @@ struct pg_pool_t {
       return FLAG_CREATING;
     if (name == "eio")
       return FLAG_EIO;
+    if (name == "bulk")
+      return FLAG_BULK;
     return 0;
   }
 
@@ -2179,6 +2189,28 @@ inline bool operator==(const object_stat_collection_t& l,
   return l.sum == r.sum;
 }
 
+enum class scrub_level_t : bool { shallow = false, deep = true };
+enum class scrub_type_t : bool { not_repair = false, do_repair = true };
+
+/// is there a scrub in our future?
+enum class pg_scrub_sched_status_t : uint16_t {
+  unknown,         ///< status not reported yet
+  not_queued,	   ///< not in the OSD's scrub queue. Probably not active.
+  active,          ///< scrubbing
+  scheduled,	   ///< scheduled for a scrub at an already determined time
+  queued	   ///< queued to be scrubbed
+};
+
+struct pg_scrubbing_status_t {
+  utime_t m_scheduled_at{};
+  int32_t m_duration_seconds{0}; // relevant when scrubbing
+  pg_scrub_sched_status_t m_sched_status{pg_scrub_sched_status_t::unknown};
+  bool m_is_active{false};
+  scrub_level_t m_is_deep{scrub_level_t::shallow};
+  bool m_is_periodic{true};
+};
+
+bool operator==(const pg_scrubbing_status_t& l, const pg_scrubbing_status_t& r);
 
 /** pg_stat
  * aggregate stats for a single PG.
@@ -2213,11 +2245,14 @@ struct pg_stat_t {
   utime_t last_scrub_stamp;
   utime_t last_deep_scrub_stamp;
   utime_t last_clean_scrub_stamp;
+  int32_t last_scrub_duration{0};
 
   object_stat_collection_t stats;
 
   int64_t log_size;
   int64_t ondisk_log_size;    // >= active_log_size
+  int64_t objects_scrubbed;
+  double scrub_duration;
 
   std::vector<int32_t> up, acting;
   std::vector<pg_shard_t> avail_no_missing;
@@ -2236,8 +2271,12 @@ struct pg_stat_t {
   int32_t acting_primary;
 
   // snaptrimq.size() is 64bit, but let's be serious - anything over 50k is
-  // absurd already, so cap it to 2^32 and save 4 bytes at  the same time
+  // absurd already, so cap it to 2^32 and save 4 bytes at the same time
   uint32_t snaptrimq_len;
+  int64_t objects_trimmed;
+  double snaptrim_duration;
+
+  pg_scrubbing_status_t scrub_sched_status;
 
   bool stats_invalid:1;
   /// true if num_objects_dirty is not accurate (because it was not
@@ -2249,8 +2288,6 @@ struct pg_stat_t {
   bool pin_stats_invalid:1;
   bool manifest_stats_invalid:1;
 
-  double scrub_duration;
-
   pg_stat_t()
     : reported_seq(0),
       reported_epoch(0),
@@ -2258,18 +2295,21 @@ struct pg_stat_t {
       created(0), last_epoch_clean(0),
       parent_split_bits(0),
       log_size(0), ondisk_log_size(0),
+      objects_scrubbed(0),
+      scrub_duration(0),
       mapping_epoch(0),
       up_primary(-1),
       acting_primary(-1),
       snaptrimq_len(0),
+      objects_trimmed(0),
+      snaptrim_duration(0.0),
       stats_invalid(false),
       dirty_stats_invalid(false),
       omap_stats_invalid(false),
       hitset_stats_invalid(false),
       hitset_bytes_stats_invalid(false),
       pin_stats_invalid(false),
-      manifest_stats_invalid(false),
-      scrub_duration(0)
+      manifest_stats_invalid(false)
   { }
 
   epoch_t get_effective_last_epoch_clean() const {
@@ -2329,6 +2369,7 @@ struct pg_stat_t {
   bool is_acting_osd(int32_t osd, bool primary) const;
   void dump(ceph::Formatter *f) const;
   void dump_brief(ceph::Formatter *f) const;
+  std::string dump_scrub_schedule() const;
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   static void generate_test_instances(std::list<pg_stat_t*>& o);
@@ -6082,9 +6123,6 @@ struct PushOp {
 WRITE_CLASS_ENCODER_FEATURES(PushOp)
 std::ostream& operator<<(std::ostream& out, const PushOp &op);
 
-enum class scrub_level_t : bool { shallow = false, deep = true };
-enum class scrub_type_t : bool { not_repair = false, do_repair = true };
-
 /*
  * summarize pg contents for purposes of a scrub
  */
@@ -6573,13 +6611,6 @@ void create_pg_collection(
 
 void init_pg_ondisk(
   ceph::os::Transaction& t, spg_t pgid, const pg_pool_t *pool);
-
-// omap specific stats
-struct omap_stat_t {
- int large_omap_objects;
- int64_t omap_bytes;
- int64_t omap_keys;
-};
 
 // filter for pg listings
 class PGLSFilter {

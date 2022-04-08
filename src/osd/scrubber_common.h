@@ -178,6 +178,23 @@ struct ScrubPgIF {
    */
   [[nodiscard]] virtual bool is_scrub_active() const = 0;
 
+  /**
+   * 'true' until after the FSM processes the 'scrub-finished' event,
+   * and scrubbing is completely cleaned-up.
+   *
+   * In other words - holds longer than is_scrub_active(), thus preventing
+   * a rescrubbing of the same PG while the previous scrub has not fully
+   * terminated.
+   */
+  [[nodiscard]] virtual bool is_queued_or_active() const = 0;
+
+  /**
+   * Manipulate the 'scrubbing request has been queued, or - we are
+   * actually scrubbing' Scrubber's flag
+   */
+  virtual void set_queued_or_active() = 0;
+  virtual void clear_queued_or_active() = 0;
+
   /// are we waiting for resource reservation grants form our replicas?
   [[nodiscard]] virtual bool is_reserving() const = 0;
 
@@ -192,7 +209,10 @@ struct ScrubPgIF {
 
   virtual void handle_query_state(ceph::Formatter* f) = 0;
 
-  virtual void dump(ceph::Formatter* f) const = 0;
+  virtual pg_scrubbing_status_t get_schedule() const = 0;
+
+  virtual void dump_scrubber(ceph::Formatter* f,
+			     const requested_scrub_t& request_flags) const = 0;
 
   /**
    * Return true if soid is currently being scrubbed and pending IOs should block.

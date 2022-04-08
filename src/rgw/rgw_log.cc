@@ -344,8 +344,12 @@ int OpsLogManifold::log(struct req_state* s, struct rgw_log_entry& entry)
 }
 
 OpsLogFile::OpsLogFile(CephContext* cct, std::string& path, uint64_t max_data_size) :
-  cct(cct), file(path, std::ofstream::app), data_size(0), max_data_size(max_data_size)
+  cct(cct), data_size(0), max_data_size(max_data_size), path(path), need_reopen(false)
 {
+}
+
+void OpsLogFile::reopen() {
+  need_reopen = true;
 }
 
 void OpsLogFile::flush()
@@ -360,6 +364,11 @@ void OpsLogFile::flush()
   for (auto bl : flush_buffer) {
     int try_num = 0;
     while (true) {
+      if (!file.is_open() || need_reopen) {
+        need_reopen = false;
+        file.close();
+        file.open(path, std::ofstream::app);
+      }
       bl.write_stream(file);
       if (!file) {
         ldpp_dout(this, 0) << "ERROR: failed to log RGW ops log file entry" << dendl;
@@ -472,7 +481,7 @@ int OpsLogSocket::log_json(struct req_state* s, bufferlist& bl)
   return 0;
 }
 
-OpsLogRados::OpsLogRados(rgw::sal::Store* store): store(store)
+OpsLogRados::OpsLogRados(rgw::sal::Store* const& store): store(store)
 {
 }
 
@@ -628,3 +637,52 @@ int rgw_log_op(RGWREST* const rest, struct req_state *s, const string& op_name, 
   }
   return 0;
 }
+
+void rgw_log_entry::generate_test_instances(list<rgw_log_entry*>& o)
+{
+  rgw_log_entry *e = new rgw_log_entry;
+  e->object_owner = "object_owner";
+  e->bucket_owner = "bucket_owner";
+  e->bucket = "bucket";
+  e->remote_addr = "1.2.3.4";
+  e->user = "user";
+  e->obj = rgw_obj_key("obj");
+  e->uri = "http://uri/bucket/obj";
+  e->http_status = "200";
+  e->error_code = "error_code";
+  e->bytes_sent = 1024;
+  e->bytes_received = 512;
+  e->obj_size = 2048;
+  e->user_agent = "user_agent";
+  e->referrer = "referrer";
+  e->bucket_id = "10";
+  e->trans_id = "trans_id";
+  e->identity_type = TYPE_RGW;
+  o.push_back(e);
+  o.push_back(new rgw_log_entry);
+}
+
+void rgw_log_entry::dump(Formatter *f) const
+{
+  f->dump_string("object_owner", object_owner.to_str());
+  f->dump_string("bucket_owner", bucket_owner.to_str());
+  f->dump_string("bucket", bucket);
+  f->dump_stream("time") << time;
+  f->dump_string("remote_addr", remote_addr);
+  f->dump_string("user", user);
+  f->dump_stream("obj") << obj;
+  f->dump_string("op", op);
+  f->dump_string("uri", uri);
+  f->dump_string("http_status", http_status);
+  f->dump_string("error_code", error_code);
+  f->dump_unsigned("bytes_sent", bytes_sent);
+  f->dump_unsigned("bytes_received", bytes_received);
+  f->dump_unsigned("obj_size", obj_size);
+  f->dump_stream("total_time") << total_time;
+  f->dump_string("user_agent", user_agent);
+  f->dump_string("referrer", referrer);
+  f->dump_string("bucket_id", bucket_id);
+  f->dump_string("trans_id", trans_id);
+  f->dump_unsigned("identity_type", identity_type);
+}
+

@@ -70,44 +70,8 @@ protected:
   }
 };
 
-auto get_transaction_manager(
-  SegmentManager &segment_manager) {
-  auto scanner = std::make_unique<ExtentReader>();
-  scanner->add_segment_manager(&segment_manager);
-  auto& scanner_ref = *scanner.get();
-  auto segment_cleaner = std::make_unique<SegmentCleaner>(
-    SegmentCleaner::config_t::get_default(),
-    std::move(scanner),
-    true);
-  auto journal = std::make_unique<Journal>(segment_manager, scanner_ref);
-  auto cache = std::make_unique<Cache>(scanner_ref);
-  auto lba_manager = lba_manager::create_lba_manager(segment_manager, *cache);
-
-  auto epm = std::make_unique<ExtentPlacementManager>(*cache, *lba_manager);
-
-  epm->add_allocator(
-    device_type_t::SEGMENTED,
-    std::make_unique<SegmentedAllocator>(
-      *segment_cleaner,
-      segment_manager,
-      *lba_manager,
-      *journal,
-      *cache));
-
-  journal->set_segment_provider(&*segment_cleaner);
-
-  return std::make_unique<TransactionManager>(
-    segment_manager,
-    std::move(segment_cleaner),
-    std::move(journal),
-    std::move(cache),
-    std::move(lba_manager),
-    std::move(epm),
-    scanner_ref);
-}
-
 auto get_seastore(SeaStore::MDStoreRef mdstore, SegmentManagerRef sm) {
-  auto tm = get_transaction_manager(*sm);
+  auto tm = make_transaction_manager(*sm, true);
   auto cm = std::make_unique<collection_manager::FlatCollectionManager>(*tm);
   return std::make_unique<SeaStore>(
     "",
@@ -128,7 +92,8 @@ protected:
   TMTestState() : EphemeralTestState() {}
 
   virtual void _init() override {
-    tm = get_transaction_manager(*segment_manager);
+    tm = make_transaction_manager(*segment_manager, true);
+    tm->add_segment_manager(segment_manager.get());
     segment_cleaner = tm->get_segment_cleaner();
     lba_manager = tm->get_lba_manager();
   }
@@ -167,15 +132,18 @@ protected:
   }
 
   auto create_mutate_transaction() {
-    return tm->create_transaction(Transaction::src_t::MUTATE);
+    return tm->create_transaction(
+        Transaction::src_t::MUTATE, "test_mutate");
   }
 
   auto create_read_transaction() {
-    return tm->create_transaction(Transaction::src_t::READ);
+    return tm->create_transaction(
+        Transaction::src_t::READ, "test_read");
   }
 
   auto create_weak_transaction() {
-    return tm->create_weak_transaction(Transaction::src_t::READ);
+    return tm->create_weak_transaction(
+        Transaction::src_t::READ, "test_read_weak");
   }
 
   auto submit_transaction_fut2(Transaction& t) {
@@ -248,8 +216,8 @@ public:
   }
 
   size_t get_size() const final { return sm.get_size(); }
-  segment_off_t get_block_size() const final { return sm.get_block_size(); }
-  segment_off_t get_segment_size() const final {
+  seastore_off_t get_block_size() const final { return sm.get_block_size(); }
+  seastore_off_t get_segment_size() const final {
     return sm.get_segment_size();
   }
   const seastore_meta_t &get_meta() const final {

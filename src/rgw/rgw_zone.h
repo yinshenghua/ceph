@@ -679,10 +679,154 @@ struct RGWDefaultZoneGroupInfo {
 };
 WRITE_CLASS_ENCODER(RGWDefaultZoneGroupInfo)
 
+struct RGWTierACLMapping {
+  ACLGranteeTypeEnum type{ACL_TYPE_CANON_USER};
+  std::string source_id;
+  std::string dest_id;
+
+  RGWTierACLMapping() = default;
+
+  RGWTierACLMapping(ACLGranteeTypeEnum t,
+             const std::string& s,
+             const std::string& d) : type(t),
+  source_id(s),
+  dest_id(d) {}
+
+  void init(const JSONFormattable& config) {
+    const std::string& t = config["type"];
+
+    if (t == "email") {
+      type = ACL_TYPE_EMAIL_USER;
+    } else if (t == "uri") {
+      type = ACL_TYPE_GROUP;
+    } else {
+      type = ACL_TYPE_CANON_USER;
+    }
+
+    source_id = config["source_id"];
+    dest_id = config["dest_id"];
+  }
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode((uint32_t)type, bl);
+    encode(source_id, bl);
+    encode(dest_id, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    uint32_t it;
+    decode(it, bl);
+    type = (ACLGranteeTypeEnum)it;
+    decode(source_id, bl);
+    decode(dest_id, bl);
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) const;
+  void decode_json(JSONObj *obj);
+};
+WRITE_CLASS_ENCODER(RGWTierACLMapping)
+
+struct RGWZoneGroupPlacementTierS3 {
+#define DEFAULT_MULTIPART_SYNC_PART_SIZE (32 * 1024 * 1024)
+  std::string endpoint;
+  RGWAccessKey key;
+  std::string region;
+  HostStyle host_style{PathStyle};
+  std::string target_storage_class;
+
+  /* Should below be bucket/zone specific?? */
+  std::string target_path;
+  std::map<std::string, RGWTierACLMapping> acl_mappings;
+
+  uint64_t multipart_sync_threshold{DEFAULT_MULTIPART_SYNC_PART_SIZE};
+  uint64_t multipart_min_part_size{DEFAULT_MULTIPART_SYNC_PART_SIZE};
+
+  int update_params(const JSONFormattable& config);
+  int clear_params(const JSONFormattable& config);
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(endpoint, bl);
+    encode(key, bl);
+    encode(region, bl);
+    encode((uint32_t)host_style, bl);
+    encode(target_storage_class, bl);
+    encode(target_path, bl);
+    encode(acl_mappings, bl);
+    encode(multipart_sync_threshold, bl);
+    encode(multipart_min_part_size, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(endpoint, bl);
+    decode(key, bl);
+    decode(region, bl);
+
+    uint32_t it;
+    decode(it, bl);
+    host_style = (HostStyle)it;
+
+    decode(target_storage_class, bl);
+    decode(target_path, bl);
+    decode(acl_mappings, bl);
+    decode(multipart_sync_threshold, bl);
+    decode(multipart_min_part_size, bl);
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) const;
+  void decode_json(JSONObj *obj);
+};
+WRITE_CLASS_ENCODER(RGWZoneGroupPlacementTierS3)
+
+struct RGWZoneGroupPlacementTier {
+  std::string tier_type;
+  std::string storage_class;
+  bool retain_head_object = false;
+
+  struct _tier {
+    RGWZoneGroupPlacementTierS3 s3;
+  } t;
+
+  int update_params(const JSONFormattable& config);
+  int clear_params(const JSONFormattable& config);
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(tier_type, bl);
+    encode(storage_class, bl);
+    encode(retain_head_object, bl);
+    if (tier_type == "cloud-s3") {
+      encode(t.s3, bl);
+    }
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(tier_type, bl);
+    decode(storage_class, bl);
+    decode(retain_head_object, bl);
+    if (tier_type == "cloud-s3") {
+      decode(t.s3, bl);
+    }
+    DECODE_FINISH(bl);
+  }
+
+  void dump(Formatter *f) const;
+  void decode_json(JSONObj *obj);
+};
+WRITE_CLASS_ENCODER(RGWZoneGroupPlacementTier)
+
 struct RGWZoneGroupPlacementTarget {
   std::string name;
   std::set<std::string> tags;
   std::set<std::string> storage_classes;
+  std::map<std::string, RGWZoneGroupPlacementTier> tier_targets;
 
   bool user_permitted(const std::list<std::string>& user_tags) const {
     if (tags.empty()) {
@@ -697,15 +841,16 @@ struct RGWZoneGroupPlacementTarget {
   }
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(2, 1, bl);
+    ENCODE_START(3, 1, bl);
     encode(name, bl);
     encode(tags, bl);
     encode(storage_classes, bl);
+    encode(tier_targets, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(2, bl);
+    DECODE_START(3, bl);
     decode(name, bl);
     decode(tags, bl);
     if (struct_v >= 2) {
@@ -713,6 +858,9 @@ struct RGWZoneGroupPlacementTarget {
     }
     if (storage_classes.empty()) {
       storage_classes.insert(RGW_STORAGE_CLASS_STANDARD);
+    }
+    if (struct_v >= 3) {
+      decode(tier_targets, bl);
     }
     DECODE_FINISH(bl);
   }
@@ -880,18 +1028,30 @@ struct RGWPeriodConfig
 {
   RGWQuotaInfo bucket_quota;
   RGWQuotaInfo user_quota;
+  RGWRateLimitInfo user_ratelimit;
+  RGWRateLimitInfo bucket_ratelimit;
+  // rate limit unauthenticated user
+  RGWRateLimitInfo anon_ratelimit;
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     encode(bucket_quota, bl);
     encode(user_quota, bl);
+    encode(bucket_ratelimit, bl);
+    encode(user_ratelimit, bl);
+    encode(anon_ratelimit, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     decode(bucket_quota, bl);
     decode(user_quota, bl);
+    if (struct_v >= 2) {
+      decode(bucket_ratelimit, bl);
+      decode(user_ratelimit, bl);
+      decode(anon_ratelimit, bl);
+    }
     DECODE_FINISH(bl);
   }
 
@@ -1111,6 +1271,7 @@ public:
   const rgw_zone_id& get_master_zone() const { return master_zone; }
   const std::string& get_master_zonegroup() const { return master_zonegroup; }
   const std::string& get_realm() const { return realm_id; }
+  const std::string& get_realm_name() const { return realm_name; }
   const RGWPeriodMap& get_map() const { return period_map; }
   RGWPeriodConfig& get_config() { return period_config; }
   const RGWPeriodConfig& get_config() const { return period_config; }

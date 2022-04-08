@@ -142,7 +142,7 @@ def get_chunks(file_size):
 
 
 def to_bytes(param):
-    # don't convert as follows as it can lead unusable results like coverting
+    # don't convert as follows as it can lead unusable results like converting
     # [1, 2, 3, 4] to '[1, 2, 3, 4]' -
     # str(param).encode('utf-8')
     if isinstance(param, bytes):
@@ -386,7 +386,7 @@ def dirwalk(path):
 class CephFSShell(Cmd):
 
     def __init__(self):
-        super().__init__(use_ipython=False)
+        super().__init__()
         self.working_dir = cephfs.getcwd().decode('utf-8')
         self.set_prompt()
         self.interactive = False
@@ -1126,7 +1126,7 @@ class CephFSShell(Cmd):
         # Arguments to the with_argpaser decorator function are sticky.
         # The items in args.path do not get overwritten in subsequent calls.
         # The arguments remain in args.paths after the function exits and we
-        # neeed to clean it up to ensure the next call works as expected.
+        # need to clean it up to ensure the next call works as expected.
         args.paths.clear()
 
     def do_lpwd(self, arglist):
@@ -1498,14 +1498,14 @@ class CephFSShell(Cmd):
 #
 #####################################################
 
-def setup_cephfs():
+def setup_cephfs(args):
     """
     Mounting a cephfs
     """
     global cephfs
     try:
         cephfs = libcephfs.LibCephFS(conffile='')
-        cephfs.mount()
+        cephfs.mount(filesystem_name=args.fs)
     except libcephfs.ObjectNotFound as e:
         print('couldn\'t find ceph configuration not found')
         sys.exit(e.get_error_code())
@@ -1580,12 +1580,15 @@ def get_shell_conffile_path(arg_conf=''):
 
 def manage_args():
     main_parser = argparse.ArgumentParser(description='')
-    main_parser.add_argument('-c', '--config', action='store',
-                             help='Path to Ceph configuration file.',
-                             type=str)
     main_parser.add_argument('-b', '--batch', action='store',
                              help='Path to CephFS shell script/batch file'
                                   'containing CephFS shell commands',
+                             type=str)
+    main_parser.add_argument('-c', '--config', action='store',
+                             help='Path to Ceph configuration file.',
+                             type=str)
+    main_parser.add_argument('-f', '--fs', action='store',
+                             help='Name of filesystem to mount.',
                              type=str)
     main_parser.add_argument('-t', '--test', action='store',
                              help='Test against transcript(s) in FILE',
@@ -1620,7 +1623,7 @@ def manage_sys_argv(args):
     sys.argv.append(exe)
     sys.argv.extend([i.strip() for i in ' '.join(args.commands).split(',')])
 
-    setup_cephfs()
+    setup_cephfs(args)
 
 
 def execute_cmd_args(args):
@@ -1657,7 +1660,7 @@ def execute_cmds_and_quit(args):
         if ',' in cmdarg:
             args_to_onecmd += ' ' + cmdarg[0:-1]
             onecmd_retval = shell.onecmd(args_to_onecmd)
-            # if the curent command failed, let's abort the execution of
+            # if the current command failed, let's abort the execution of
             # series of commands passed.
             if onecmd_retval is not stop_exec_val:
                 return onecmd_retval

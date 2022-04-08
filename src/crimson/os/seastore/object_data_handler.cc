@@ -10,21 +10,13 @@
 
 namespace {
   seastar::logger& logger() {
-    return crimson::get_logger(ceph_subsys_seastore);
+    return crimson::get_logger(ceph_subsys_seastore_odata);
   }
 }
 
-namespace crimson::os::seastore {
+SET_SUBSYS(seastore_odata);
 
-/**
- * MAX_OBJECT_SIZE
- *
- * For now, we allocate a fixed region of laddr space of size MAX_OBJECT_SIZE
- * for any object.  In the future, once we have the ability to remap logical
- * mappings (necessary for clone), we'll add the ability to grow and shrink
- * these regions and remove this assumption.
- */
-static constexpr extent_len_t MAX_OBJECT_SIZE = 16<<20;
+namespace crimson::os::seastore {
 #define assert_aligned(x) ceph_assert(((x)%ctx.tm.get_block_size()) == 0)
 
 using context_t = ObjectDataHandler::context_t;
@@ -77,10 +69,10 @@ ObjectDataHandler::write_ret do_removals(
       LOG_PREFIX(object_data_handler.cc::do_removals);
       DEBUGT("decreasing ref: {}",
 	     ctx.t,
-	     pin->get_laddr());
+	     pin->get_key());
       return ctx.tm.dec_ref(
 	ctx.t,
-	pin->get_laddr()
+	pin->get_key()
       ).si_then(
 	[](auto){},
 	ObjectDataHandler::write_iertr::pass_further{},
@@ -137,14 +129,14 @@ ObjectDataHandler::write_ret do_insertions(
 	  region.len
 	).si_then([FNAME, ctx, &region](auto pin) {
 	  ceph_assert(pin->get_length() == region.len);
-	  if (pin->get_laddr() != region.addr) {
+	  if (pin->get_key() != region.addr) {
 	    ERRORT(
 	      "inconsistent laddr: pin: {} region {}",
 	      ctx.t,
-	      pin->get_laddr(),
+	      pin->get_key(),
 	      region.addr);
 	  }
-	  ceph_assert(pin->get_laddr() == region.addr);
+	  ceph_assert(pin->get_key() == region.addr);
 	  return ObjectDataHandler::write_iertr::now();
 	});
       }
@@ -164,7 +156,7 @@ using split_ret_bare = std::pair<
 using split_ret = get_iertr::future<split_ret_bare>;
 split_ret split_pin_left(context_t ctx, LBAPinRef &pin, laddr_t offset)
 {
-  const auto pin_offset = pin->get_laddr();
+  const auto pin_offset = pin->get_key();
   assert_aligned(pin_offset);
   ceph_assert(offset >= pin_offset);
   if (offset == pin_offset) {
@@ -189,7 +181,7 @@ split_ret split_pin_left(context_t ctx, LBAPinRef &pin, laddr_t offset)
     );
   } else {
     // Data, return up to offset to prepend
-    auto to_prepend = offset - pin->get_laddr();
+    auto to_prepend = offset - pin->get_key();
     return read_pin(ctx, pin->duplicate()
     ).si_then([to_prepend](auto extent) {
       return get_iertr::make_ready_future<split_ret_bare>(
@@ -202,8 +194,8 @@ split_ret split_pin_left(context_t ctx, LBAPinRef &pin, laddr_t offset)
 /// Reverse of split_pin_left
 split_ret split_pin_right(context_t ctx, LBAPinRef &pin, laddr_t end)
 {
-  const auto pin_begin = pin->get_laddr();
-  const auto pin_end = pin->get_laddr() + pin->get_length();
+  const auto pin_begin = pin->get_key();
+  const auto pin_end = pin->get_key() + pin->get_length();
   assert_aligned(pin_end);
   ceph_assert(pin_end >= end);
   if (end == pin_end) {
@@ -261,9 +253,9 @@ ObjectDataHandler::write_ret ObjectDataHandler::prepare_data_reservation(
   extent_len_t size)
 {
   LOG_PREFIX(ObjectDataHandler::prepare_data_reservation);
-  ceph_assert(size <= MAX_OBJECT_SIZE);
+  ceph_assert(size <= max_object_size);
   if (!object_data.is_null()) {
-    ceph_assert(object_data.get_reserved_data_len() == MAX_OBJECT_SIZE);
+    ceph_assert(object_data.get_reserved_data_len() == max_object_size);
     DEBUGT("reservation present: {}~{}",
            ctx.t,
            object_data.get_reserved_data_base(),
@@ -272,16 +264,16 @@ ObjectDataHandler::write_ret ObjectDataHandler::prepare_data_reservation(
   } else {
     DEBUGT("reserving: {}~{}",
            ctx.t,
-           ctx.onode.get_hint(),
-           MAX_OBJECT_SIZE);
+           ctx.onode.get_data_hint(),
+           max_object_size);
     return ctx.tm.reserve_region(
       ctx.t,
-      ctx.onode.get_hint(),
-      MAX_OBJECT_SIZE
-    ).si_then([&object_data](auto pin) {
-      ceph_assert(pin->get_length() == MAX_OBJECT_SIZE);
+      ctx.onode.get_data_hint(),
+      max_object_size
+    ).si_then([max_object_size=max_object_size, &object_data](auto pin) {
+      ceph_assert(pin->get_length() == max_object_size);
       object_data.update_reserved(
-	pin->get_laddr(),
+	pin->get_key(),
 	pin->get_length());
       return write_iertr::now();
     });
@@ -292,7 +284,6 @@ ObjectDataHandler::clear_ret ObjectDataHandler::trim_data_reservation(
   context_t ctx, object_data_t &object_data, extent_len_t size)
 {
   ceph_assert(!object_data.is_null());
-  assert_aligned(size);
   ceph_assert(size <= object_data.get_reserved_data_len());
   return seastar::do_with(
     lba_pin_list_t(),
@@ -311,21 +302,26 @@ ObjectDataHandler::clear_ret ObjectDataHandler::trim_data_reservation(
 	_pins.swap(pins);
 	ceph_assert(pins.size());
 	auto &pin = *pins.front();
-	ceph_assert(pin.get_laddr() >= object_data.get_reserved_data_base());
+	ceph_assert(pin.get_key() >= object_data.get_reserved_data_base());
 	ceph_assert(
-	  pin.get_laddr() <= object_data.get_reserved_data_base() + size);
-	auto pin_offset = pin.get_laddr() -
+	  pin.get_key() <= object_data.get_reserved_data_base() + size);
+	auto pin_offset = pin.get_key() -
 	  object_data.get_reserved_data_base();
-	if (pin.get_paddr().is_zero()) {
+	if ((pin.get_key() == (object_data.get_reserved_data_base() + size)) ||
+	  (pin.get_paddr().is_zero())) {
+	  /* First pin is exactly at the boundary or is a zero pin.  Either way,
+	   * remove all pins and add a single zero pin to the end. */
 	  to_write.emplace_back(
-	    pin.get_laddr(),
+	    pin.get_key(),
 	    object_data.get_reserved_data_len() - pin_offset);
 	  return clear_iertr::now();
 	} else {
+	  /* First pin overlaps the boundary and has data, read in extent
+	   * and rewrite portion prior to size */
 	  return read_pin(
 	    ctx,
 	    pin.duplicate()
-	  ).si_then([size, pin_offset, &pin, &object_data, &to_write](
+	  ).si_then([ctx, size, pin_offset, &pin, &object_data, &to_write](
 		     auto extent) {
 	    bufferlist bl;
 	    bl.append(
@@ -334,12 +330,15 @@ ObjectDataHandler::clear_ret ObjectDataHandler::trim_data_reservation(
 		0,
 		size - pin_offset
 	      ));
+	    bl.append_zero(p2roundup(size, ctx.tm.get_block_size()) - size);
 	    to_write.emplace_back(
-	      pin.get_laddr(),
+	      pin.get_key(),
 	      bl);
 	    to_write.emplace_back(
-	      object_data.get_reserved_data_base() + size,
-	      object_data.get_reserved_data_len() - size);
+	      object_data.get_reserved_data_base() +
+                p2roundup(size, ctx.tm.get_block_size()),
+	      object_data.get_reserved_data_len() -
+                p2roundup(size, ctx.tm.get_block_size()));
 	    return clear_iertr::now();
 	  });
 	}
@@ -388,9 +387,9 @@ ObjectDataHandler::write_ret ObjectDataHandler::overwrite(
 	     offset,
 	     bl.length());
       ceph_assert(pins.size() >= 1);
-      auto pin_begin = pins.front()->get_laddr();
+      auto pin_begin = pins.front()->get_key();
       ceph_assert(pin_begin <= offset);
-      auto pin_end = pins.back()->get_laddr() + pins.back()->get_length();
+      auto pin_end = pins.back()->get_key() + pins.back()->get_length();
       ceph_assert(pin_end >= (offset + bl.length()));
 
       return split_pin_left(
@@ -501,7 +500,7 @@ ObjectDataHandler::read_ret ObjectDataHandler::read(
 	  ).si_then([ctx, loffset, len, &ret](auto _pins) {
 	    // offset~len falls within reserved region and len > 0
 	    ceph_assert(_pins.size() >= 1);
-	    ceph_assert((*_pins.begin())->get_laddr() <= loffset);
+	    ceph_assert((*_pins.begin())->get_key() <= loffset);
 	    return seastar::do_with(
 	      std::move(_pins),
 	      loffset,
@@ -512,9 +511,9 @@ ObjectDataHandler::read_ret ObjectDataHandler::read(
 		  -> read_iertr::future<> {
 		    ceph_assert(current <= (loffset + len));
 		    ceph_assert(
-		      (loffset + len) > pin->get_laddr());
+		      (loffset + len) > pin->get_key());
 		    laddr_t end = std::min(
-		      pin->get_laddr() + pin->get_length(),
+		      pin->get_key() + pin->get_length(),
 		      loffset + len);
 		    if (pin->get_paddr().is_zero()) {
 		      ceph_assert(end > current); // See LBAManager::get_mappings
@@ -552,6 +551,60 @@ ObjectDataHandler::read_ret ObjectDataHandler::read(
     });
 }
 
+ObjectDataHandler::fiemap_ret ObjectDataHandler::fiemap(
+  context_t ctx,
+  objaddr_t obj_offset,
+  extent_len_t len)
+{
+  return seastar::do_with(
+    std::map<uint64_t, uint64_t>(),
+    [ctx, obj_offset, len](auto &ret) {
+    return with_object_data(
+      ctx,
+      [ctx, obj_offset, len, &ret](const auto &object_data) {
+      LOG_PREFIX(ObjectDataHandler::fiemap);
+      DEBUGT(
+	"{}~{}, reservation {}~{}",
+        ctx.t,
+        obj_offset,
+        len,
+        object_data.get_reserved_data_base(),
+        object_data.get_reserved_data_len());
+      /* Assumption: callers ensure that onode size is <= reserved
+       * size and that len is adjusted here prior to call */
+      ceph_assert(!object_data.is_null());
+      ceph_assert((obj_offset + len) <= object_data.get_reserved_data_len());
+      ceph_assert(len > 0);
+      laddr_t loffset =
+        object_data.get_reserved_data_base() + obj_offset;
+      return ctx.tm.get_pins(
+        ctx.t,
+        loffset,
+        len
+      ).si_then([loffset, len, &object_data, &ret](auto &&pins) {
+	ceph_assert(pins.size() >= 1);
+        ceph_assert((*pins.begin())->get_key() <= loffset);
+	for (auto &&i: pins) {
+	  if (!(i->get_paddr().is_zero())) {
+	    auto ret_left = std::max(i->get_key(), loffset);
+	    auto ret_right = std::min(
+	      i->get_key() + i->get_length(),
+	      loffset + len);
+	    assert(ret_right > ret_left);
+	    ret.emplace(
+	      std::make_pair(
+		ret_left - object_data.get_reserved_data_base(),
+		ret_right - ret_left
+	      ));
+	  }
+	}
+      });
+    }).si_then([&ret] {
+      return std::move(ret);
+    });
+  });
+}
+
 ObjectDataHandler::truncate_ret ObjectDataHandler::truncate(
   context_t ctx,
   objaddr_t offset)
@@ -571,7 +624,7 @@ ObjectDataHandler::truncate_ret ObjectDataHandler::truncate(
 	return prepare_data_reservation(
 	  ctx,
 	  object_data,
-	  offset);
+	  p2roundup(offset, ctx.tm.get_block_size()));
       } else {
 	return truncate_iertr::now();
       }

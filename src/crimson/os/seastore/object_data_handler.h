@@ -50,6 +50,8 @@ class ObjectDataHandler {
 public:
   using base_iertr = TransactionManager::base_iertr;
 
+  ObjectDataHandler(uint32_t mos) : max_object_size(mos) {}
+
   struct context_t {
     TransactionManager &tm;
     Transaction &t;
@@ -68,6 +70,14 @@ public:
   using read_iertr = base_iertr;
   using read_ret = read_iertr::future<bufferlist>;
   read_ret read(
+    context_t ctx,
+    objaddr_t offset,
+    extent_len_t len);
+
+  /// sparse read data, get range interval in [offset, offset + len)
+  using fiemap_iertr = base_iertr;
+  using fiemap_ret = fiemap_iertr::future<std::map<uint64_t, uint64_t>>;
+  fiemap_ret fiemap(
     context_t ctx,
     objaddr_t offset,
     extent_len_t len);
@@ -104,6 +114,16 @@ private:
     context_t ctx,
     object_data_t &object_data,
     extent_len_t size);
+private:
+  /**
+   * max_object_size
+   *
+   * For now, we allocate a fixed region of laddr space of size max_object_size
+   * for any object.  In the future, once we have the ability to remap logical
+   * mappings (necessary for clone), we'll add the ability to grow and shrink
+   * these regions and remove this assumption.
+   */
+  const uint32_t max_object_size = 0;
 };
 
 }

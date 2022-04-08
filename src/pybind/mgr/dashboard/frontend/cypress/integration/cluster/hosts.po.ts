@@ -41,7 +41,7 @@ export class HostsPageHelper extends PageHelper {
       });
   }
 
-  add(hostname: string, exist?: boolean, maintenance?: boolean) {
+  add(hostname: string, exist?: boolean, maintenance?: boolean, labels: string[] = []) {
     cy.get(`${this.pages.add.id}`).within(() => {
       cy.get('#hostname').type(hostname);
       if (maintenance) {
@@ -50,14 +50,25 @@ export class HostsPageHelper extends PageHelper {
       if (exist) {
         cy.get('#hostname').should('have.class', 'ng-invalid');
       }
-      cy.get('cd-submit-button').click();
     });
+
+    if (labels.length) {
+      this.selectPredefinedLabels(labels);
+    }
+
+    cy.get('cd-submit-button').click();
     // back to host list
     cy.get(`${this.pages.index.id}`);
   }
 
+  selectPredefinedLabels(labels: string[]) {
+    cy.get('a[data-testid=select-menu-edit]').click();
+    for (const label of labels) {
+      cy.get('.popover-body div.select-menu-item-content').contains(label).click();
+    }
+  }
+
   checkExist(hostname: string, exist: boolean) {
-    this.clearTableSearchInput();
     this.getTableCell(this.columnIndex.hostname, hostname).should(($elements) => {
       const hosts = $elements.map((_, el) => el.textContent).get();
       if (exist) {
@@ -68,7 +79,7 @@ export class HostsPageHelper extends PageHelper {
     });
   }
 
-  delete(hostname: string) {
+  remove(hostname: string) {
     super.delete(hostname, this.columnIndex.hostname, 'hosts');
   }
 
@@ -115,11 +126,14 @@ export class HostsPageHelper extends PageHelper {
 
   @PageHelper.restrictTo(pages.index.url)
   maintenance(hostname: string, exit = false, force = false) {
+    this.clearTableSearchInput();
     if (force) {
       this.getTableCell(this.columnIndex.hostname, hostname).click();
       this.clickActionButton('enter-maintenance');
 
-      cy.contains('cd-modal button', 'Continue').click();
+      cy.get('cd-modal').within(() => {
+        cy.contains('button', 'Continue').click();
+      });
 
       this.getTableCell(this.columnIndex.hostname, hostname)
         .parent()
@@ -160,5 +174,18 @@ export class HostsPageHelper extends PageHelper {
           expect(status).to.include('maintenance');
         });
     }
+  }
+
+  @PageHelper.restrictTo(pages.index.url)
+  drain(hostname: string) {
+    this.getTableCell(this.columnIndex.hostname, hostname).click();
+    this.clickActionButton('start-drain');
+    this.checkLabelExists(hostname, ['_no_schedule'], true);
+
+    this.clickTab('cd-host-details', hostname, 'Daemons');
+    cy.get('cd-host-details').within(() => {
+      cy.wait(20000);
+      this.expectTableCount('total', 0);
+    });
   }
 }

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+#include <list>
 #include <boost/container/flat_map.hpp>
 #include "common/ceph_time.h"
 #include "common/Formatter.h"
@@ -13,11 +15,12 @@
 
 #include "rgw/rgw_basic_types.h"
 
-#define CEPH_RGW_REMOVE 'r'
-#define CEPH_RGW_UPDATE 'u'
-#define CEPH_RGW_TAG_TIMEOUT 120
+#define CEPH_RGW_REMOVE 'r' // value 114
+#define CEPH_RGW_UPDATE 'u' // value 117
 #define CEPH_RGW_DIR_SUGGEST_LOG_OP  0x80
 #define CEPH_RGW_DIR_SUGGEST_OP_MASK 0x7f
+
+constexpr uint64_t CEPH_RGW_DEFAULT_TAG_TIMEOUT = 120; // in seconds
 
 class JSONObj;
 
@@ -96,6 +99,13 @@ enum RGWModifyOp {
   CLS_RGW_OP_RESYNC          = 8,
 };
 
+std::string_view to_string(RGWModifyOp op);
+RGWModifyOp parse_modify_op(std::string_view name);
+
+inline std::ostream& operator<<(std::ostream& out, RGWModifyOp op) {
+  return out << to_string(op);
+}
+
 enum RGWBILogFlags {
   RGW_BILOG_FLAG_VERSIONED_OP = 0x1,
 };
@@ -172,8 +182,15 @@ enum class RGWObjCategory : uint8_t {
                   // uploads; not currently used in the codebase
 
   MultiMeta = 3,  // b-i entries for multipart upload metadata objs
+
+  CloudTiered = 4, // b-i entries which are tiered to external cloud
 };
 
+std::string_view to_string(RGWObjCategory c);
+
+inline std::ostream& operator<<(std::ostream& out, RGWObjCategory c) {
+  return out << to_string(c);
+}
 
 struct rgw_bucket_dir_entry_meta {
   RGWObjCategory category;
@@ -362,6 +379,11 @@ struct cls_rgw_obj_key {
            (instance.compare(k.instance) == 0);
   }
 
+  bool operator!=(const cls_rgw_obj_key& k) const {
+    return (name.compare(k.name) != 0) ||
+           (instance.compare(k.instance) != 0);
+  }
+
   bool operator<(const cls_rgw_obj_key& k) const {
     int r = name.compare(k.name);
     if (r == 0) {
@@ -372,11 +394,6 @@ struct cls_rgw_obj_key {
 
   bool operator<=(const cls_rgw_obj_key& k) const {
     return !(k < *this);
-  }
-
-  std::ostream& operator<<(std::ostream& out) const {
-    out << to_string();
-    return out;
   }
 
   void encode(ceph::buffer::list &bl) const {
@@ -405,6 +422,13 @@ struct cls_rgw_obj_key {
 };
 WRITE_CLASS_ENCODER(cls_rgw_obj_key)
 
+inline std::ostream& operator<<(std::ostream& out, const cls_rgw_obj_key& o) {
+  out << o.name;
+  if (!o.instance.empty()) {
+    out << '[' << o.instance << ']';
+  }
+  return out;
+}
 
 struct rgw_bucket_dir_entry {
   /* a versioned object instance */
@@ -736,6 +760,18 @@ struct rgw_bucket_category_stats {
 };
 WRITE_CLASS_ENCODER(rgw_bucket_category_stats)
 
+inline bool operator==(const rgw_bucket_category_stats& lhs,
+                       const rgw_bucket_category_stats& rhs) {
+  return lhs.total_size == rhs.total_size
+      && lhs.total_size_rounded == rhs.total_size_rounded
+      && lhs.num_entries == rhs.num_entries
+      && lhs.actual_size == rhs.actual_size;
+}
+inline bool operator!=(const rgw_bucket_category_stats& lhs,
+                       const rgw_bucket_category_stats& rhs) {
+  return !(lhs == rhs);
+}
+
 enum class cls_rgw_reshard_status : uint8_t {
   NOT_RESHARDING  = 0,
   IN_PROGRESS     = 1,
@@ -805,8 +841,10 @@ struct cls_rgw_bucket_instance_entry {
 };
 WRITE_CLASS_ENCODER(cls_rgw_bucket_instance_entry)
 
+using rgw_bucket_dir_stats = std::map<RGWObjCategory, rgw_bucket_category_stats>;
+
 struct rgw_bucket_dir_header {
-  std::map<RGWObjCategory, rgw_bucket_category_stats> stats;
+  rgw_bucket_dir_stats stats;
   uint64_t tag_timeout;
   uint64_t ver;
   uint64_t master_ver;
@@ -1202,23 +1240,31 @@ struct cls_rgw_lc_obj_head
 {
   time_t start_date = 0;
   std::string marker;
+  time_t shard_rollover_date = 0;
 
   cls_rgw_lc_obj_head() {}
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 2, bl);
     uint64_t t = start_date;
     encode(t, bl);
     encode(marker, bl);
+    encode(shard_rollover_date, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     uint64_t t;
     decode(t, bl);
     start_date = static_cast<time_t>(t);
     decode(marker, bl);
+    if (struct_v < 2) {
+      shard_rollover_date = 0;
+    } else {
+      decode(t, bl);
+      shard_rollover_date = static_cast<time_t>(t);
+    }
     DECODE_FINISH(bl);
   }
 
@@ -1255,6 +1301,8 @@ struct cls_rgw_lc_entry {
     decode(status, bl);
     DECODE_FINISH(bl);
   }
+  void dump(Formatter *f) const;
+  void generate_test_instances(std::list<cls_rgw_lc_entry*>& ls);
 };
 WRITE_CLASS_ENCODER(cls_rgw_lc_entry);
 

@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 /**
@@ -80,7 +80,7 @@ public:
 	return r;
     }
     void* Realloc(void* p, size_t old, size_t nw) {
-	void *r;
+	void *r = nullptr;
 	if (nw) r = malloc(nw);
 	if (nw > old) nw = old;
 	if (r && old) memcpy(r, p, nw);
@@ -732,14 +732,6 @@ public:
 	return r;
   }
 };
-
-
-static map<string,string> get_str_map(const string &str) {
-  map<string,string> m;
-  get_str_map(str, &m, ";, \t");
-  return m;
-}
-
 
 static int get_actual_key_from_conf(const DoutPrefixProvider* dpp,
                                     CephContext *cct,

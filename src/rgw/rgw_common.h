@@ -18,6 +18,8 @@
 
 #include <array>
 #include <string_view>
+#include <atomic>
+#include <unordered_map>
 
 #include "common/ceph_crypto.h"
 #include "common/random_string.h"
@@ -38,7 +40,7 @@
 #include "cls/rgw/cls_rgw_types.h"
 #include "include/rados/librados.hpp"
 #include "rgw_public_access.h"
-#include "rgw_tracer.h"
+#include "common/tracer.h"
 
 namespace ceph {
   class Formatter;
@@ -66,6 +68,7 @@ using ceph::crypto::MD5;
 #define RGW_SYS_PARAM_PREFIX "rgwx-"
 
 #define RGW_ATTR_ACL		RGW_ATTR_PREFIX "acl"
+#define RGW_ATTR_RATELIMIT		RGW_ATTR_PREFIX "ratelimit"
 #define RGW_ATTR_LC            RGW_ATTR_PREFIX "lc"
 #define RGW_ATTR_CORS		RGW_ATTR_PREFIX "cors"
 #define RGW_ATTR_ETAG    	RGW_ATTR_PREFIX "etag"
@@ -148,6 +151,7 @@ using ceph::crypto::MD5;
 #define RGW_ATTR_BUCKET_ENCRYPTION_POLICY RGW_ATTR_BUCKET_ENCRYPTION_PREFIX "policy"
 #define RGW_ATTR_BUCKET_ENCRYPTION_KEY_ID RGW_ATTR_BUCKET_ENCRYPTION_PREFIX "key-id"
 
+#define RGW_ATTR_TRACE RGW_ATTR_PREFIX "trace"
 
 #define RGW_FORMAT_PLAIN        0
 #define RGW_FORMAT_XML          1
@@ -259,6 +263,7 @@ using ceph::crypto::MD5;
 #define ERR_POSITION_NOT_EQUAL_TO_LENGTH                 2219
 #define ERR_OBJECT_NOT_APPENDABLE                        2220
 #define ERR_INVALID_BUCKET_STATE                         2221
+#define ERR_INVALID_OBJECT_STATE			 2222
 
 #define ERR_BUSY_RESHARDING      2300
 #define ERR_NO_SUCH_ENTITY       2301
@@ -301,6 +306,7 @@ struct rgw_err {
   std::string err_code;
   std::string message;
 };
+
 
 /* Helper class used for RGWHTTPArgs parsing */
 class NameVal
@@ -346,10 +352,10 @@ class RGWHTTPArgs {
   const std::string& get(const std::string& name, bool *exists = NULL) const;
   boost::optional<const std::string&>
   get_optional(const std::string& name) const;
-  int get_bool(const std::string& name, bool *val, bool *exists);
-  int get_bool(const char *name, bool *val, bool *exists);
-  void get_bool(const char *name, bool *val, bool def_val);
-  int get_int(const char *name, int *val, int def_val);
+  int get_bool(const std::string& name, bool *val, bool *exists) const;
+  int get_bool(const char *name, bool *val, bool *exists) const;
+  void get_bool(const char *name, bool *val, bool def_val) const;
+  int get_int(const char *name, int *val, int def_val) const;
 
   /** Get the value for specific system argument parameter */
   std::string sys_get(const std::string& name, bool *exists = nullptr) const;
@@ -689,6 +695,43 @@ void decode_json_obj(rgw_placement_rule& v, JSONObj *obj);
 inline std::ostream& operator<<(std::ostream& out, const rgw_placement_rule& rule) {
   return out << rule.to_str();
 }
+
+class RateLimiter;
+struct RGWRateLimitInfo {
+  int64_t max_write_ops;
+  int64_t max_read_ops;
+  int64_t max_write_bytes;
+  int64_t max_read_bytes;
+  bool enabled = false;
+  RGWRateLimitInfo()
+    : max_write_ops(0), max_read_ops(0), max_write_bytes(0), max_read_bytes(0)  {}
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(max_write_ops, bl);
+    encode(max_read_ops, bl);
+    encode(max_write_bytes, bl);
+    encode(max_read_bytes, bl);
+    encode(enabled, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(max_write_ops,bl);
+    decode(max_read_ops, bl);
+    decode(max_write_bytes,bl);
+    decode(max_read_bytes, bl);
+    decode(enabled, bl);
+    DECODE_FINISH(bl);
+  }
+
+  void dump(Formatter *f) const;
+
+  void decode_json(JSONObj *obj);
+
+};
+WRITE_CLASS_ENCODER(RGWRateLimitInfo)
+
 struct RGWUserInfo
 {
   rgw_user user_id;
@@ -1491,14 +1534,6 @@ inline std::ostream& operator<<(std::ostream& out, const rgw_obj_key &o) {
   return out << o.to_str();
 }
 
-inline std::ostream& operator<<(std::ostream& out, const rgw_obj_index_key &o) {
-  if (o.instance.empty()) {
-    return out << o.name;
-  } else {
-    return out << o.name << "[" << o.instance << "]";
-  }
-}
-
 struct req_init_state {
   /* Keeps [[tenant]:]bucket until we parse the token. */
   std::string url_bucket;
@@ -1516,6 +1551,11 @@ struct req_state : DoutPrefixProvider {
   rgw::io::BasicClient *cio{nullptr};
   http_op op{OP_UNKNOWN};
   RGWOpType op_type{};
+  std::shared_ptr<RateLimiter> ratelimit_data;
+  RGWRateLimitInfo user_ratelimit;
+  RGWRateLimitInfo bucket_ratelimit;
+  std::string ratelimit_bucket_marker;
+  std::string ratelimit_user_name;
   bool content_started{false};
   int format{0};
   ceph::Formatter *formatter{nullptr};
@@ -1632,7 +1672,6 @@ struct req_state : DoutPrefixProvider {
 
   Clock::duration time_elapsed() const { return Clock::now() - time; }
 
-  RGWObjectCtx *obj_ctx{nullptr};
   std::string dialect;
   std::string req_id;
   std::string trans_id;
@@ -1771,6 +1810,10 @@ struct rgw_obj {
   rgw_obj(const rgw_bucket& b, const rgw_obj_key& k) : bucket(b), key(k) {}
   rgw_obj(const rgw_bucket& b, const rgw_obj_index_key& k) : bucket(b), key(k) {}
 
+  void init(const rgw_bucket& b, const rgw_obj_key& k) {
+    bucket = b;
+    key = k;
+  }
   void init(const rgw_bucket& b, const std::string& name) {
     bucket = b;
     key.set(name);
@@ -1897,6 +1940,24 @@ inline std::ostream& operator<<(std::ostream& out, const rgw_obj &o) {
   return out << o.bucket.name << ":" << o.get_oid();
 }
 
+struct multipart_upload_info
+{
+  rgw_placement_rule dest_placement;
+
+  void encode(bufferlist& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(dest_placement, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(bufferlist::const_iterator& bl) {
+    DECODE_START(1, bl);
+    decode(dest_placement, bl);
+    DECODE_FINISH(bl);
+  }
+};
+WRITE_CLASS_ENCODER(multipart_upload_info)
+
 static inline void buf_to_hex(const unsigned char* const buf,
                               const size_t len,
                               char* const str)
@@ -1972,22 +2033,6 @@ static inline void append_rand_alpha(CephContext *cct, const std::string& src, s
   dest.append(buf);
 }
 
-static inline const char *rgw_obj_category_name(RGWObjCategory category)
-{
-  switch (category) {
-  case RGWObjCategory::None:
-    return "rgw.none";
-  case RGWObjCategory::Main:
-    return "rgw.main";
-  case RGWObjCategory::Shadow:
-    return "rgw.shadow";
-  case RGWObjCategory::MultiMeta:
-    return "rgw.multimeta";
-  }
-
-  return "unknown";
-}
-
 static inline uint64_t rgw_rounded_kb(uint64_t bytes)
 {
   return (bytes + 1023) / 1024;
@@ -2021,6 +2066,13 @@ parse_key_value(const std::string_view& in_str,
 extern boost::optional<std::pair<std::string_view,std::string_view>>
 parse_key_value(const std::string_view& in_str);
 
+struct rgw_name_to_flag {
+  const char *type_name;
+  uint32_t flag;
+};
+
+extern int rgw_parse_list_of_flags(struct rgw_name_to_flag *mapping,
+                                   const std::string& str, uint32_t *perm);
 
 /** time parsing */
 extern int parse_time(const char *time_str, real_time *time);
@@ -2122,7 +2174,6 @@ bool verify_object_permission_no_policy(const DoutPrefixProvider* dpp,
  * to do the requested action */
 rgw::IAM::Effect eval_identity_or_session_policies(const std::vector<rgw::IAM::Policy>& user_policies,
                           const rgw::IAM::Environment& env,
-                          boost::optional<const rgw::auth::Identity&> id,
                           const uint64_t op,
                           const rgw::ARN& arn);
 bool verify_user_permission(const DoutPrefixProvider* dpp,

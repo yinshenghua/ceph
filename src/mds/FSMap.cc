@@ -933,6 +933,11 @@ void FSMap::promote(
   }
   auto& info = mds_map.mds_info.at(standby_gid);
 
+  if (!filesystem.mds_map.compat.writeable(info.compat)) {
+    ceph_assert(filesystem.is_upgradeable());
+    filesystem.mds_map.compat.merge(info.compat);
+  }
+
   if (mds_map.stopped.erase(assigned_rank)) {
     // The cluster is being expanded with a stopped rank
     info.state = MDSMap::STATE_STARTING;
@@ -956,11 +961,6 @@ void FSMap::promote(
   if (!is_standby_replay) {
     standby_daemons.erase(standby_gid);
     standby_epochs.erase(standby_gid);
-  }
-
-  if (!filesystem.mds_map.compat.writeable(info.compat)) {
-    ceph_assert(filesystem.is_upgradeable());
-    filesystem.mds_map.compat.merge(info.compat);
   }
 
   // Indicate that Filesystem has been modified
@@ -1054,10 +1054,22 @@ bool FSMap::undamaged(const fs_cluster_id_t fscid, const mds_rank_t rank)
 
 void FSMap::insert(const MDSMap::mds_info_t &new_info)
 {
+  static const CompatSet empty;
+
   ceph_assert(new_info.state == MDSMap::STATE_STANDBY);
   ceph_assert(new_info.rank == MDS_RANK_NONE);
   mds_roles[new_info.global_id] = FS_CLUSTER_ID_NONE;
-  standby_daemons[new_info.global_id] = new_info;
+  auto& info = standby_daemons[new_info.global_id];
+  info = new_info;
+  if (empty.compare(info.compat) == 0) {
+    // bootstrap old compat: boot beacon contains empty compat on old (v16.2.4
+    // or older) MDS.
+    info.compat = MDSMap::get_compat_set_v16_2_4();
+  }
+  /* TODO remove after R is released
+   * Insert INLINE; see comment in MDSMap::decode.
+   */
+  info.compat.incompat.insert(MDS_FEATURE_INCOMPAT_INLINE);
   standby_epochs[new_info.global_id] = epoch;
 }
 

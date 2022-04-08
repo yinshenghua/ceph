@@ -1592,17 +1592,11 @@ public:
             tn->log(0, SSTR("ERROR: cannot start syncing " << iter->first << ". Duplicate entry?"));
           } else {
             // fetch remote and write locally
-            spawn(sync_single_entry(source_bs, iter->first, iter->first,
-                                    entry_timestamp, false), false);
+            yield_spawn_window(sync_single_entry(source_bs, iter->first, iter->first,
+                                                 entry_timestamp, false),
+                               spawn_window, std::nullopt);
           }
           sync_marker.marker = iter->first;
-
-          drain_all_but_stack_cb(lease_stack.get(),
-                                 [&](uint64_t stack_id, int ret) {
-                                   if (ret < 0) {
-                                     tn->log(10, "a sync operation returned error");
-                                   }
-                                 });
         }
       } while (omapvals->more);
       omapvals.reset();
@@ -1625,6 +1619,12 @@ public:
         lease_cr->go_down();
         drain_all();
         return set_cr_error(retcode);
+      }
+      // clean up full sync index
+      yield {
+        const auto& pool = sync_env->svc->zone->get_zone_params().log_pool;
+        auto oid = full_data_sync_index_shard_oid(sc->source_zone.id, shard_id);
+        call(new RGWRadosRemoveCR(sync_env->store, {pool, oid}));
       }
       // keep lease and transition to incremental_sync()
     }
@@ -1741,16 +1741,10 @@ public:
           if (!marker_tracker->start(log_iter->log_id, 0, log_iter->log_timestamp)) {
             tn->log(0, SSTR("ERROR: cannot start syncing " << log_iter->log_id << ". Duplicate entry?"));
           } else {
-            spawn(sync_single_entry(source_bs, log_iter->entry.key, log_iter->log_id,
-                                    log_iter->log_timestamp, false), false);
+            yield_spawn_window(sync_single_entry(source_bs, log_iter->entry.key, log_iter->log_id,
+                                                 log_iter->log_timestamp, false),
+                               spawn_window, std::nullopt);
           }
-
-          drain_all_but_stack_cb(lease_stack.get(),
-                                 [&](uint64_t stack_id, int ret) {
-                                   if (ret < 0) {
-                                     tn->log(10, "a sync operation returned error");
-                                   }
-                                 });
         }
 
         tn->log(20, SSTR("shard_id=" << shard_id << " sync_marker=" << sync_marker.marker
@@ -4707,7 +4701,7 @@ int RGWRunBucketSyncCoroutine::operate(const DoutPrefixProvider *dpp)
     yield call(new RGWSyncGetBucketInfoCR(sync_env, sync_pair.dest_bs.bucket, &sync_pipe.dest_bucket_info, 
                                           &sync_pipe.dest_bucket_attrs, tn));
     if (retcode < 0) {
-      tn->log(0, SSTR("ERROR: failed to retrieve bucket info for bucket=" << bucket_str{sync_pair.source_bs.bucket}));
+      tn->log(0, SSTR("ERROR: failed to retrieve bucket info for bucket=" << bucket_str{sync_pair.dest_bs.bucket}));
       drain_all();
       return set_cr_error(retcode);
     }
@@ -5061,3 +5055,94 @@ int rgw_bucket_sync_status(const DoutPrefixProvider *dpp,
                                                   dest_bucket_info,
                                                   status));
 }
+
+void rgw_data_sync_info::generate_test_instances(list<rgw_data_sync_info*>& o)
+{
+  auto info = new rgw_data_sync_info;
+  info->state = rgw_data_sync_info::StateBuildingFullSyncMaps;
+  info->num_shards = 8;
+  o.push_back(info);
+  o.push_back(new rgw_data_sync_info);
+}
+
+void rgw_data_sync_marker::generate_test_instances(list<rgw_data_sync_marker*>& o)
+{
+  auto marker = new rgw_data_sync_marker;
+  marker->state = rgw_data_sync_marker::IncrementalSync;
+  marker->marker = "01234";
+  marker->pos = 5;
+  o.push_back(marker);
+  o.push_back(new rgw_data_sync_marker);
+}
+
+void rgw_data_sync_status::generate_test_instances(list<rgw_data_sync_status*>& o)
+{
+  o.push_back(new rgw_data_sync_status);
+}
+
+void rgw_bucket_shard_full_sync_marker::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("position", position, obj);
+  JSONDecoder::decode_json("count", count, obj);
+}
+
+void rgw_bucket_shard_full_sync_marker::dump(Formatter *f) const
+{
+  encode_json("position", position, f);
+  encode_json("count", count, f);
+}
+
+void rgw_bucket_shard_inc_sync_marker::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("position", position, obj);
+  JSONDecoder::decode_json("timestamp", timestamp, obj);
+}
+
+void rgw_bucket_shard_inc_sync_marker::dump(Formatter *f) const
+{
+  encode_json("position", position, f);
+  encode_json("timestamp", timestamp, f);
+}
+
+void rgw_bucket_shard_sync_info::decode_json(JSONObj *obj)
+{
+  std::string s;
+  JSONDecoder::decode_json("status", s, obj);
+  if (s == "full-sync") {
+    state = StateFullSync;
+  } else if (s == "incremental-sync") {
+    state = StateIncrementalSync;
+  } else if (s == "stopped") {
+    state = StateStopped;
+  } else {
+    state = StateInit;
+  }
+  JSONDecoder::decode_json("full_marker", full_marker, obj);
+  JSONDecoder::decode_json("inc_marker", inc_marker, obj);
+}
+
+void rgw_bucket_shard_sync_info::dump(Formatter *f) const
+{
+  const char *s{nullptr};
+  switch ((SyncState)state) {
+    case StateInit:
+    s = "init";
+    break;
+  case StateFullSync:
+    s = "full-sync";
+    break;
+  case StateIncrementalSync:
+    s = "incremental-sync";
+    break;
+  case StateStopped:
+    s = "stopped";
+    break;
+  default:
+    s = "unknown";
+    break;
+  }
+  encode_json("status", s, f);
+  encode_json("full_marker", full_marker, f);
+  encode_json("inc_marker", inc_marker, f);
+}
+

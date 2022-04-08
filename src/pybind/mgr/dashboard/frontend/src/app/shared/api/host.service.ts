@@ -21,6 +21,8 @@ export class HostService extends ApiClient {
   baseURL = 'api/host';
   baseUIURL = 'ui-api/host';
 
+  predefinedLabels = ['mon', 'mgr', 'osd', 'mds', 'rgw', 'nfs', 'iscsi', 'rbd', 'grafana'];
+
   constructor(private http: HttpClient, private deviceService: DeviceService) {
     super();
   }
@@ -67,7 +69,8 @@ export class HostService extends ApiClient {
     updateLabels = false,
     labels: string[] = [],
     maintenance = false,
-    force = false
+    force = false,
+    drain = false
   ) {
     return this.http.put(
       `${this.baseURL}/${hostname}`,
@@ -75,7 +78,8 @@ export class HostService extends ApiClient {
         update_labels: updateLabels,
         labels: labels,
         maintenance: maintenance,
-        force: force
+        force: force,
+        drain: drain
       },
       { headers: { Accept: this.getVersionHeaderValue(0, 1) } }
     );

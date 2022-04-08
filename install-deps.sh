@@ -19,9 +19,13 @@ mkdir -p $DIR
 if test $(id -u) != 0 ; then
     SUDO=sudo
 fi
-export LC_ALL=C # the following is vulnerable to i18n
+export LC_ALL=en_US.UTF-8 # the following is vulnerable to i18n
 
 ARCH=$(uname -m)
+
+function in_jenkins() {
+    test -n "$JENKINS_HOME"
+}
 
 function munge_ceph_spec_in {
     local with_seastar=$1
@@ -67,6 +71,7 @@ function munge_debian_control {
 }
 
 function ensure_decent_gcc_on_ubuntu {
+    in_jenkins && echo "CI_DEBUG: Start ensure_decent_gcc_on_ubuntu() in install-deps.sh"
     # point gcc to the one offered by g++-7 if the used one is not
     # new enough
     local old=$(gcc -dumpfullversion -dumpversion)
@@ -125,9 +130,12 @@ ENDOFKEY
     # cmake uses the latter by default
     $SUDO ln -nsf /usr/bin/gcc /usr/bin/${ARCH}-linux-gnu-gcc
     $SUDO ln -nsf /usr/bin/g++ /usr/bin/${ARCH}-linux-gnu-g++
+
+    in_jenkins && echo "CI_DEBUG: End ensure_decent_gcc_on_ubuntu() in install-deps.sh"
 }
 
 function ensure_python3_sphinx_on_ubuntu {
+    in_jenkins && echo "CI_DEBUG: Running ensure_python3_sphinx_on_ubuntu() in install-deps.sh"
     local sphinx_command=/usr/bin/sphinx-build
     # python-sphinx points $sphinx_command to
     # ../share/sphinx/scripts/python2/sphinx-build when it's installed
@@ -138,6 +146,7 @@ function ensure_python3_sphinx_on_ubuntu {
 }
 
 function install_pkg_on_ubuntu {
+    in_jenkins && echo "CI_DEBUG: Running install_pkg_on_ubuntu() in install-deps.sh"
     local project=$1
     shift
     local sha1=$1
@@ -154,6 +163,7 @@ function install_pkg_on_ubuntu {
 	for pkg in $pkgs; do
 	    if ! apt -qq list $pkg 2>/dev/null | grep -q installed; then
 		missing_pkgs+=" $pkg"
+                in_jenkins && echo "CI_DEBUG: missing_pkgs=$missing_pkgs"
 	    fi
 	done
     fi
@@ -166,6 +176,7 @@ function install_pkg_on_ubuntu {
 }
 
 function install_boost_on_ubuntu {
+    in_jenkins && echo "CI_DEBUG: Running install_boost_on_ubuntu() in install-deps.sh"
     local ver=1.75
     local installed_ver=$(apt -qq list --installed ceph-libboost*-dev 2>/dev/null |
                               grep -e 'libboost[0-9].[0-9]\+-dev' |
@@ -206,6 +217,7 @@ function install_boost_on_ubuntu {
 }
 
 function install_libzbd_on_ubuntu {
+    in_jenkins && echo "CI_DEBUG: Running install_libzbd_on_ubuntu() in install-deps.sh"
     local codename=$1
     local project=libzbd
     local sha1=1fadde94b08fab574b17637c2bebd2b1e7f9127b
@@ -218,6 +230,7 @@ function install_libzbd_on_ubuntu {
 }
 
 function install_libpmem_on_ubuntu {
+    in_jenkins && echo "CI_DEBUG: Running install_libpmem_on_ubuntu() in install-deps.sh"
     local codename=$1
     local project=pmem
     local sha1=7c18b4b1413ae965ea8bcbfc69eb9784f9212319
@@ -306,6 +319,8 @@ else
     [ $WITH_JAEGER ] && with_jaeger=true || with_jaeger=false
     [ $WITH_ZBD ] && with_zbd=true || with_zbd=false
     [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
+    [ $WITH_RADOSGW_MOTR ] && with_rgw_motr=true || with_rgw_motr=false
+    motr_pkgs_url='https://github.com/Seagate/cortx-motr/releases/download/2.0.0-rgw'
     source /etc/os-release
     case "$ID" in
     debian|ubuntu|devuan|elementary|softiron)
@@ -334,6 +349,7 @@ else
         fi
         touch $DIR/status
 
+        in_jenkins && echo "CI_DEBUG: Running munge_debian_control() in install-deps.sh"
 	backports=""
 	control=$(munge_debian_control "$VERSION" "debian/control")
         case "$VERSION" in
@@ -355,21 +371,51 @@ else
 	if $with_jaeger; then
 	    build_profiles+=",pkg.ceph.jaeger"
 	fi
+
+        in_jenkins && cat <<EOF
+CI_DEBUG: for_make_check=$for_make_check
+CI_DEBUG: with_seastar=$with_seastar
+CI_DEBUG: with_jaeger=$with_jaeger
+CI_DEBUG: build_profiles=$build_profiles
+CI_DEBUG: Now running 'mk-build-deps' and installing ceph-build-deps package
+EOF
+
 	$SUDO env DEBIAN_FRONTEND=noninteractive mk-build-deps \
 	      --build-profiles "${build_profiles#,}" \
 	      --install --remove \
 	      --tool="apt-get -y --no-install-recommends $backports" $control || exit 1
+        in_jenkins && echo "CI_DEBUG: Removing ceph-build-deps"
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove ceph-build-deps
 	if [ "$control" != "debian/control" ] ; then rm $control; fi
+
+        # for rgw motr backend build checks
+        if ! dpkg -l cortx-motr-dev &> /dev/null &&
+            { [[ $FOR_MAKE_CHECK ]] || $with_rgw_motr; }; then
+            deb_arch=$(dpkg --print-architecture)
+            motr_pkg="cortx-motr_2.0.0.git3252d623_$deb_arch.deb"
+            motr_dev_pkg="cortx-motr-dev_2.0.0.git3252d623_$deb_arch.deb"
+            $SUDO curl -sL -o/var/cache/apt/archives/$motr_pkg $motr_pkgs_url/$motr_pkg
+            $SUDO curl -sL -o/var/cache/apt/archives/$motr_dev_pkg $motr_pkgs_url/$motr_dev_pkg
+            # For some reason libfabric pkg is not available in arm64 version
+            # of Ubuntu 20.04 (Focal Fossa), so we borrow it from more recent
+            # versions for now.
+            if [[ "$deb_arch" == 'arm64' ]]; then
+                lf_pkg='libfabric1_1.11.0-2_arm64.deb'
+                $SUDO curl -sL -o/var/cache/apt/archives/$lf_pkg http://ports.ubuntu.com/pool/universe/libf/libfabric/$lf_pkg
+                $SUDO apt-get install -y /var/cache/apt/archives/$lf_pkg
+            fi
+            $SUDO apt-get install -y /var/cache/apt/archives/{$motr_pkg,$motr_dev_pkg}
+            $SUDO apt-get install -y libisal-dev
+        fi
         ;;
-    centos|fedora|rhel|ol|virtuozzo)
+    rocky|centos|fedora|rhel|ol|virtuozzo)
         builddepcmd="dnf -y builddep --allowerasing"
         echo "Using dnf to install dependencies"
         case "$ID" in
             fedora)
                 $SUDO dnf install -y dnf-utils
                 ;;
-            centos|rhel|ol|virtuozzo)
+            rocky|centos|rhel|ol|virtuozzo)
                 MAJOR_VERSION="$(echo $VERSION_ID | cut -d. -f1)"
                 $SUDO dnf install -y dnf-utils
                 rpm --quiet --query epel-release || \
@@ -396,6 +442,14 @@ else
         [ ${PIPESTATUS[0]} -ne 0 ] && exit 1
         IGNORE_YUM_BUILDEP_ERRORS="ValueError: SELinux policy is not managed or store cannot be accessed."
         sed "/$IGNORE_YUM_BUILDEP_ERRORS/d" $DIR/yum-builddep.out | grep -qi "error:" && exit 1
+        # for rgw motr backend build checks
+        if ! rpm --quiet -q cortx-motr-devel &&
+              { [[ $FOR_MAKE_CHECK ]] || $with_rgw_motr; }; then
+            $SUDO dnf install -y \
+                  "$motr_pkgs_url/isa-l-2.30.0-1.el7.${ARCH}.rpm" \
+                  "$motr_pkgs_url/cortx-motr-2.0.0-1_git3252d623_any.el8.${ARCH}.rpm" \
+                  "$motr_pkgs_url/cortx-motr-devel-2.0.0-1_git3252d623_any.el8.${ARCH}.rpm"
+        fi
         ;;
     opensuse*|suse|sles)
         echo "Using zypper to install dependencies"
@@ -412,6 +466,7 @@ else
 fi
 
 function populate_wheelhouse() {
+    in_jenkins && echo "CI_DEBUG: Running populate_wheelhouse() in install-deps.sh"
     local install=$1
     shift
 
@@ -429,6 +484,7 @@ function populate_wheelhouse() {
 }
 
 function activate_virtualenv() {
+    in_jenkins && echo "CI_DEBUG: Running activate_virtualenv() in install-deps.sh"
     local top_srcdir=$1
     local env_dir=$top_srcdir/install-deps-python3
 
@@ -444,6 +500,7 @@ function activate_virtualenv() {
 }
 
 function preload_wheels_for_tox() {
+    in_jenkins && echo "CI_DEBUG: Running preload_wheels_for_tox() in install-deps.sh"
     local ini=$1
     shift
     pushd . > /dev/null
@@ -486,3 +543,5 @@ if $for_make_check; then
     rm -rf $XDG_CACHE_HOME
     type git > /dev/null || (echo "Dashboard uses git to pull dependencies." ; false)
 fi
+
+in_jenkins && echo "CI_DEBUG: End install-deps.sh"

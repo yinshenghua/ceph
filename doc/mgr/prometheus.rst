@@ -37,6 +37,8 @@ Configuration
 .. confval:: stale_cache_strategy
 .. confval:: rbd_stats_pools
 .. confval:: rbd_stats_pools_refresh_interval
+.. confval:: standby_behaviour
+.. confval:: standby_error_status_code
 
 By default the module will accept HTTP requests on port ``9283`` on all IPv4
 and IPv6 addresses on the host.  The port and listen address are both
@@ -95,6 +97,24 @@ To tell the module to respond with "service unavailable", set it to ``fail``::
 If you are confident that you don't require the cache, you can disable it::
 
     ceph config set mgr mgr/prometheus/cache false
+
+If you are using the prometheus module behind some kind of reverse proxy or
+loadbalancer, you can simplify discovering the active instance by switching
+to ``error``-mode::
+
+    ceph config set mgr mgr/prometheus/standby_behaviour error
+
+If set, the prometheus module will respond with a HTTP error when requesting ``/``
+from the standby instance. The default error code is 500, but you can configure
+the HTTP response code with::
+
+    ceph config set mgr mgr/prometheus/standby_error_status_code 503
+
+Valid error codes are between 400-599.
+
+To switch back to the default behaviour, simply set the config key to ``default``::
+
+    ceph config set mgr mgr/prometheus/standby_behaviour default
 
 .. _prometheus-rbd-io-statistics:
 
@@ -216,11 +236,11 @@ drive statistics, special series are output like this:
 
 ::
 
-    ceph_disk_occupation{ceph_daemon="osd.0",device="sdd", exported_instance="myhost"}
+    ceph_disk_occupation_human{ceph_daemon="osd.0", device="sdd", exported_instance="myhost"}
 
 To use this to get disk statistics by OSD ID, use either the ``and`` operator or
 the ``*`` operator in your prometheus query. All metadata metrics (like ``
-ceph_disk_occupation`` have the value 1 so they act neutral with ``*``. Using ``*``
+ceph_disk_occupation_human`` have the value 1 so they act neutral with ``*``. Using ``*``
 allows to use ``group_left`` and ``group_right`` grouping modifiers, so that
 the resulting metric has additional labels from one side of the query.
 
@@ -233,13 +253,24 @@ The goal is to run a query like
 
 ::
 
-    rate(node_disk_bytes_written[30s]) and on (device,instance) ceph_disk_occupation{ceph_daemon="osd.0"}
+    rate(node_disk_written_bytes_total[30s]) and
+    on (device,instance) ceph_disk_occupation_human{ceph_daemon="osd.0"}
 
 Out of the box the above query will not return any metrics since the ``instance`` labels of
-both metrics don't match. The ``instance`` label of ``ceph_disk_occupation``
+both metrics don't match. The ``instance`` label of ``ceph_disk_occupation_human``
 will be the currently active MGR node.
 
- The following two section outline two approaches to remedy this.
+The following two section outline two approaches to remedy this.
+
+.. note::
+
+    If you need to group on the `ceph_daemon` label instead of `device` and
+    `instance` labels, using `ceph_disk_occupation_human` may not work reliably.
+    It is advised that you use `ceph_disk_occupation` instead.
+
+    The difference is that `ceph_disk_occupation_human` may group several OSDs
+    into the value of a single `ceph_daemon` label in cases where multiple OSDs
+    share a disk.
 
 Use label_replace
 =================
@@ -252,7 +283,13 @@ To correlate an OSD and its disks write rate, the following query can be used:
 
 ::
 
-    label_replace(rate(node_disk_bytes_written[30s]), "exported_instance", "$1", "instance", "(.*):.*") and on (device,exported_instance) ceph_disk_occupation{ceph_daemon="osd.0"}
+    label_replace(
+        rate(node_disk_written_bytes_total[30s]),
+        "exported_instance",
+        "$1",
+        "instance",
+        "(.*):.*"
+    ) and on (device, exported_instance) ceph_disk_occupation_human{ceph_daemon="osd.0"}
 
 Configuring Prometheus server
 =============================

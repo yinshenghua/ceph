@@ -466,6 +466,8 @@ class LocalRemote(object):
                 subproc.stdin.write(stdin.encode())
             elif stdin == subprocess.PIPE or stdin == PIPE:
                 pass
+            elif isinstance(stdin, StringIO):
+                subproc.stdin.write(bytes(stdin.getvalue(),encoding='utf8'))
             else:
                 subproc.stdin.write(stdin)
 
@@ -711,9 +713,8 @@ class LocalFuseMount(LocalCephFSMount, FuseMount):
     def __init__(self, ctx, test_dir, client_id, client_keyring_path=None,
                  client_remote=None, hostfs_mntpt=None, cephfs_name=None,
                  cephfs_mntpt=None, brxnet=None):
-        super(LocalFuseMount, self).__init__(ctx=ctx, client_config=None,
-            test_dir=test_dir, client_id=client_id,
-            client_keyring_path=client_keyring_path,
+        super(LocalFuseMount, self).__init__(ctx=ctx, test_dir=test_dir,
+            client_id=client_id, client_keyring_path=client_keyring_path,
             client_remote=LocalRemote(), hostfs_mntpt=hostfs_mntpt,
             cephfs_name=cephfs_name, cephfs_mntpt=cephfs_mntpt, brxnet=brxnet)
 
@@ -996,10 +997,13 @@ class LocalCluster(object):
 
 class LocalContext(object):
     def __init__(self):
-        self.config = {}
+        self.config = {'cluster': 'ceph'}
         self.teuthology_config = teuth_config
         self.cluster = LocalCluster()
         self.daemons = DaemonGroup()
+        if not hasattr(self, 'managers'):
+            self.managers = {}
+        self.managers[self.config['cluster']] = LocalCephManager()
 
         # Shove some LocalDaemons into the ctx.daemons DaemonGroup instance so that any
         # tests that want to look these up via ctx can do so.
@@ -1056,7 +1060,6 @@ def load_tests(modules, loader):
 
 def scan_tests(modules):
     overall_suite = load_tests(modules, loader.TestLoader())
-
     max_required_mds = 0
     max_required_clients = 0
     max_required_mgr = 0
@@ -1327,6 +1330,8 @@ def exec_test():
     # tools that the tests might want to use (add more here if needed)
     require_binaries = ["ceph-dencoder", "cephfs-journal-tool", "cephfs-data-scan",
                         "cephfs-table-tool", "ceph-fuse", "rados", "cephfs-meta-injection"]
+    # What binaries may be required is task specific
+    require_binaries = ["ceph-dencoder",  "rados"]
     missing_binaries = [b for b in require_binaries if not os.path.exists(os.path.join(BIN_PREFIX, b))]
     if missing_binaries and not opt_ignore_missing_binaries:
         log.error("Some ceph binaries missing, please build them: {0}".format(" ".join(missing_binaries)))

@@ -5,10 +5,10 @@ import os
 from textwrap import dedent
 from ceph_volume.util import system, disk, merge_dict
 from ceph_volume.util.device import Device
+from ceph_volume.util.arg_validators import valid_osd_id
 from ceph_volume import decorators, terminal, process
 from ceph_volume.api import lvm as api
 from ceph_volume.systemd import systemctl
-from ceph_volume.devices.lvm.common import valid_osd_id
 
 
 logger = logging.getLogger(__name__)
@@ -414,7 +414,7 @@ class Migrate(object):
         target_lv = api.get_lv_by_fullname(self.args.target)
         if not target_lv:
             mlogger.error(
-                'Target path "{}" is not a Logical Volume'.formaat(
+                'Target path "{}" is not a Logical Volume'.format(
                     self.args.target))
             raise SystemExit(
                 'Unable to migrate to : {}'.format(self.args.target))

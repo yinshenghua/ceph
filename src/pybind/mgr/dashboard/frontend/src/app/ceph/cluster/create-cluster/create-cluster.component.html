@@ -16,9 +16,11 @@
           <button class="btn btn-accent m-2"
                   name="expand-cluster"
                   (click)="createCluster()"
+                  aria-label="Expand Cluster"
                   i18n>Expand Cluster</button>
           <button class="btn btn-light"
                   name="skip-cluster-creation"
+                  aria-label="Skip"
                   (click)="skipClusterCreation()"
                   i18n>Skip</button>
         </div>
@@ -65,7 +67,7 @@
           <cd-services [hasDetails]="false"
                        [hiddenServices]="['mon', 'mgr', 'crash', 'agent']"
                        [hiddenColumns]="['status.running', 'status.size', 'status.last_refresh']"
-                       [modal]="false"></cd-services>
+                       [routedModal]="false"></cd-services>
         </div>
         <div *ngSwitchCase="'4'"
              class="ml-5">

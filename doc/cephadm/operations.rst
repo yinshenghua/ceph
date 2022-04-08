@@ -323,7 +323,7 @@ To list all the configuration checks and their current states, run the following
     NAME             HEALTHCHECK                      STATUS   DESCRIPTION
   kernel_security  CEPHADM_CHECK_KERNEL_LSM         enabled  checks SELINUX/Apparmor profiles are consistent across cluster hosts
   os_subscription  CEPHADM_CHECK_SUBSCRIPTION       enabled  checks subscription states are consistent for all cluster hosts
-  public_network   CEPHADM_CHECK_PUBLIC_MEMBERSHIP  enabled  check that all hosts have a NIC on the Ceph public_netork
+  public_network   CEPHADM_CHECK_PUBLIC_MEMBERSHIP  enabled  check that all hosts have a NIC on the Ceph public_network
   osd_mtu_size     CEPHADM_CHECK_MTU                enabled  check that OSD hosts share a common MTU setting
   osd_linkspeed    CEPHADM_CHECK_LINKSPEED          enabled  check that OSD hosts share a common linkspeed
   network_missing  CEPHADM_CHECK_NETWORK_MISSING    enabled  checks that the cluster/public networks defined exist on the Ceph hosts
@@ -518,3 +518,28 @@ For example, to distribute configs to hosts with the ``bare_config`` label, run 
   ceph config set mgr mgr/cephadm/manage_etc_ceph_ceph_conf_hosts label:bare_config
 
 (See :ref:`orchestrator-cli-placement-spec` for more information about placement specs.)
+
+Purging a cluster
+=================
+
+.. danger:: THIS OPERATION WILL DESTROY ALL DATA STORED IN THIS CLUSTER
+
+In order to destroy a cluster and delete all data stored in this cluster, disable
+cephadm to stop all orchestration operations (so we avoid deploying new daemons).
+
+.. prompt:: bash #
+
+  ceph mgr module disable cephadm
+
+Then verify the FSID of the cluster:
+
+.. prompt:: bash #
+
+  ceph fsid
+
+Purge ceph daemons from all hosts in the cluster
+
+.. prompt:: bash #
+
+  # For each host:
+  cephadm rm-cluster --force --zap-osds --fsid <fsid>

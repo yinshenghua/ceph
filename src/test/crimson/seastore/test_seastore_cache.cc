@@ -22,6 +22,7 @@ namespace {
 struct cache_test_t : public seastar_test_suite_t {
   segment_manager::EphemeralSegmentManagerRef segment_manager;
   ExtentReaderRef reader;
+  ExtentPlacementManagerRef epm;
   CacheRef cache;
   paddr_t current;
   journal_seq_t seq;
@@ -30,25 +31,27 @@ struct cache_test_t : public seastar_test_suite_t {
 
   seastar::future<paddr_t> submit_transaction(
     TransactionRef t) {
-    auto record = cache->prepare_record(*t);
+    auto record = cache->prepare_record(*t, nullptr);
 
     bufferlist bl;
     for (auto &&block : record.extents) {
       bl.append(block.bl);
     }
 
-    ceph_assert((segment_off_t)bl.length() <
+    ceph_assert((seastore_off_t)bl.length() <
 		segment_manager->get_segment_size());
-    if (current.offset + (segment_off_t)bl.length() >
+    if (current.as_seg_paddr().get_segment_off() + (seastore_off_t)bl.length() >
 	segment_manager->get_segment_size())
-      current = paddr_t{
+      current = paddr_t::make_seg_paddr(
 	segment_id_t(
-	  current.segment.device_id(),
-	  current.segment.device_segment_id() + 1),
-	0};
+	  current.as_seg_paddr().get_segment_id().device_id(),
+	  current.as_seg_paddr().get_segment_id().device_segment_id() + 1),
+	0);
 
     auto prev = current;
-    current.offset += bl.length();
+    current.as_seg_paddr().set_segment_off(
+      current.as_seg_paddr().get_segment_off()
+      + bl.length());
     return segment_manager->segment_write(
       prev,
       std::move(bl),
@@ -65,7 +68,8 @@ struct cache_test_t : public seastar_test_suite_t {
   }
 
   auto get_transaction() {
-    return cache->create_transaction(Transaction::src_t::MUTATE);
+    return cache->create_transaction(
+        Transaction::src_t::MUTATE, "test_cache", false);
   }
 
   template <typename T, typename... Args>
@@ -81,8 +85,9 @@ struct cache_test_t : public seastar_test_suite_t {
   seastar::future<> set_up_fut() final {
     segment_manager = segment_manager::create_test_ephemeral();
     reader.reset(new ExtentReader());
-    cache.reset(new Cache(*reader));
-    current = paddr_t(segment_id_t(segment_manager->get_device_id(), 0), 0);
+    epm.reset(new ExtentPlacementManager());
+    cache.reset(new Cache(*reader, *epm));
+    current = paddr_t::make_seg_paddr(segment_id_t(segment_manager->get_device_id(), 0), 0);
     reader->add_segment_manager(segment_manager.get());
     return segment_manager->init(
     ).safe_then([this] {
@@ -109,6 +114,7 @@ struct cache_test_t : public seastar_test_suite_t {
     ).safe_then([this] {
       segment_manager.reset();
       reader.reset();
+      epm.reset();
       cache.reset();
     }).handle_error(
       Cache::close_ertr::assert_all{}

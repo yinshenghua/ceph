@@ -478,6 +478,17 @@ class MDSCluster(CephCluster):
         for fs in self.status().get_filesystems():
             Filesystem(ctx=self._ctx, fscid=fs['id']).destroy()
 
+    @property
+    def beacon_timeout(self):
+        """
+        Generate an acceptable timeout for the mons to drive some MDSMap change
+        because of missed beacons from some MDS. This involves looking up the
+        grace period in use by the mons and adding an acceptable buffer.
+        """
+
+        grace = float(self.get_config("mds_beacon_grace", service_type="mon"))
+        return grace*2+15
+
 
 class Filesystem(MDSCluster):
     """
@@ -709,7 +720,7 @@ class Filesystem(MDSCluster):
         # avoid circular dep by importing here:
         from tasks.cephfs.fuse_mount import FuseMount
         d = misc.get_testdir(self._ctx)
-        m = FuseMount(self._ctx, {}, d, "admin", self.client_remote, cephfs_name=self.name)
+        m = FuseMount(self._ctx, d, "admin", self.client_remote, cephfs_name=self.name)
         m.mount_wait()
         m.run_shell_payload(cmd)
         m.umount_wait(require_clean=True)
@@ -1152,7 +1163,12 @@ class Filesystem(MDSCluster):
         return self.json_asok(command, 'mds', info['name'], timeout=timeout)
 
     def rank_tell(self, command, rank=0, status=None):
-        return json.loads(self.mon_manager.raw_cluster_cmd("tell", f"mds.{self.id}:{rank}", *command))
+        try:
+            out = self.mon_manager.raw_cluster_cmd("tell", f"mds.{self.id}:{rank}", *command)
+            return json.loads(out)
+        except json.decoder.JSONDecodeError:
+            log.error("could not decode: {}".format(out))
+            raise
 
     def ranks_tell(self, command, status=None):
         if status is None:
@@ -1273,6 +1289,9 @@ class Filesystem(MDSCluster):
         obj_name = "{0:x}.00000000".format(ino_no)
         args = ["setxattr", obj_name, xattr_name, data]
         self.rados(args, pool=pool)
+
+    def read_symlink(self, ino_no, pool=None):
+        return self._read_data_xattr(ino_no, "symlink", "string_wrapper", pool)
 
     def read_backtrace(self, ino_no, pool=None):
         """

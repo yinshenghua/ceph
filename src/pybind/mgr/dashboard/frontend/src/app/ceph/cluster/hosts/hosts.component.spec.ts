@@ -175,7 +175,7 @@ describe('HostsComponent', () => {
     const spans = fixture.debugElement.nativeElement.querySelectorAll(
       '.datatable-body-cell-label span'
     );
-    expect(spans[7].textContent).toBe('Unavailable');
+    expect(spans[7].textContent).toBe('N/A');
   });
 
   it('should test if host facts are unavailable if get_fatcs orch feature is not available', () => {
@@ -200,7 +200,38 @@ describe('HostsComponent', () => {
     const spans = fixture.debugElement.nativeElement.querySelectorAll(
       '.datatable-body-cell-label span'
     );
-    expect(spans[7].textContent).toBe('Unavailable');
+    expect(spans[7].textContent).toBe('N/A');
+  });
+
+  it('should test if memory/raw capacity columns shows N/A if facts are available but in fetching state', () => {
+    const features = [OrchestratorFeature.HOST_FACTS];
+    let hostPayload: any[];
+    hostPayload = [
+      {
+        hostname: 'host_test',
+        services: [
+          {
+            type: 'osd',
+            id: '0'
+          }
+        ],
+        cpu_count: 2,
+        cpu_cores: 1,
+        memory_total_kb: undefined,
+        hdd_count: 4,
+        hdd_capacity_bytes: undefined,
+        flash_count: 4,
+        flash_capacity_bytes: undefined,
+        nic_count: 1
+      }
+    ];
+    OrchestratorHelper.mockStatus(true, features);
+    hostListSpy.and.callFake(() => of(hostPayload));
+    fixture.detectChanges();
+
+    component.getHosts(new CdTableFetchDataContext(() => undefined));
+    expect(component.hosts[0]['memory_total_bytes']).toEqual('N/A');
+    expect(component.hosts[0]['raw_capacity']).toEqual('N/A');
   });
 
   it('should show force maintenance modal when it is safe to stop host', () => {
@@ -294,7 +325,8 @@ describe('HostsComponent', () => {
         OrchestratorFeature.HOST_ADD,
         OrchestratorFeature.HOST_LABEL_ADD,
         OrchestratorFeature.HOST_REMOVE,
-        OrchestratorFeature.HOST_LABEL_REMOVE
+        OrchestratorFeature.HOST_LABEL_REMOVE,
+        OrchestratorFeature.HOST_DRAIN
       ];
       await testTableActions(true, features, tests);
     });

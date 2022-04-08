@@ -23,6 +23,7 @@
 #include "rgw_rest_s3.h"
 #include "rgw_rest_swift.h"
 #include "rgw_rest_admin.h"
+#include "rgw_rest_info.h"
 #include "rgw_rest_usage.h"
 #include "rgw_rest_user.h"
 #include "rgw_rest_bucket.h"
@@ -31,6 +32,7 @@
 #include "rgw_rest_config.h"
 #include "rgw_rest_realm.h"
 #include "rgw_rest_sts.h"
+#include "rgw_rest_ratelimit.h"
 #include "rgw_swift_auth.h"
 #include "rgw_log.h"
 #include "rgw_tools.h"
@@ -127,6 +129,15 @@ static void handle_sigterm(int signum)
     dout(1) << __func__ << " set alarm for " << secs << dendl;
   }
 
+}
+
+static OpsLogFile* ops_log_file = nullptr;
+
+static void rgw_sighup_handler(int signum) {
+    if (ops_log_file != nullptr) {
+        ops_log_file->reopen();
+    }
+    sighup_handler(signum);
 }
 
 static void godown_alarm(int signum)
@@ -313,7 +324,6 @@ int radosgw_Main(int argc, const char **argv)
   common_init_finish(g_ceph_context);
 
   init_async_signal_handler();
-  register_async_signal_handler(SIGHUP, sighup_handler);
 
   TracepointProvider::initialize<rgw_rados_tracepoint_traits>(g_ceph_context);
   TracepointProvider::initialize<rgw_op_tracepoint_traits>(g_ceph_context);
@@ -355,6 +365,12 @@ int radosgw_Main(int argc, const char **argv)
 #ifdef WITH_RADOSGW_DBSTORE
   if (config_store == "dbstore") {
     rgw_store = "dbstore";
+  }
+#endif
+
+#ifdef WITH_RADOSGW_MOTR
+  if (config_store == "motr") {
+    rgw_store = "motr";
   }
 #endif
 
@@ -499,6 +515,7 @@ int radosgw_Main(int argc, const char **argv)
 
   if (apis_map.count("admin") > 0) {
     RGWRESTMgr_Admin *admin_resource = new RGWRESTMgr_Admin;
+    admin_resource->register_resource("info", new RGWRESTMgr_Info);
     admin_resource->register_resource("usage", new RGWRESTMgr_Usage);
     admin_resource->register_resource("user", new RGWRESTMgr_User);
     /* XXX dang part of this is RADOS specific */
@@ -510,6 +527,7 @@ int radosgw_Main(int argc, const char **argv)
     admin_resource->register_resource("log", new RGWRESTMgr_Log);
     admin_resource->register_resource("config", new RGWRESTMgr_Config);
     admin_resource->register_resource("realm", new RGWRESTMgr_Realm);
+    admin_resource->register_resource("ratelimit", new RGWRESTMgr_Ratelimit);
     rest.register_resource(g_conf()->rgw_admin_entry, admin_resource);
   }
 
@@ -534,17 +552,20 @@ int radosgw_Main(int argc, const char **argv)
   rgw::dmclock::SchedulerCtx sched_ctx{cct.get()};
 
   OpsLogManifold *olog = new OpsLogManifold();
+  ActiveRateLimiter ratelimiting{cct.get()};
+  ratelimiting.start();
+
   if (!g_conf()->rgw_ops_log_socket_path.empty()) {
     OpsLogSocket* olog_socket = new OpsLogSocket(g_ceph_context, g_conf()->rgw_ops_log_data_backlog);
     olog_socket->init(g_conf()->rgw_ops_log_socket_path);
     olog->add_sink(olog_socket);
   }
-  OpsLogFile* ops_log_file;
   if (!g_conf()->rgw_ops_log_file_path.empty()) {
     ops_log_file = new OpsLogFile(g_ceph_context, g_conf()->rgw_ops_log_file_path, g_conf()->rgw_ops_log_data_backlog);
     ops_log_file->start();
     olog->add_sink(ops_log_file);
   }
+  register_async_signal_handler(SIGHUP, rgw_sighup_handler);
   olog->add_sink(new OpsLogRados(store));
 
   r = signal_fd_init();
@@ -601,7 +622,7 @@ int radosgw_Main(int argc, const char **argv)
       std::string uri_prefix;
       config->get_val("prefix", "", &uri_prefix);
 
-      RGWProcessEnv env = { store, &rest, olog, port, uri_prefix, auth_registry };
+      RGWProcessEnv env = { store, &rest, olog, port, uri_prefix, auth_registry, &ratelimiting };
 
       fe = new RGWLoadGenFrontend(env, config);
     }
@@ -610,7 +631,7 @@ int radosgw_Main(int argc, const char **argv)
       config->get_val("port", 80, &port);
       std::string uri_prefix;
       config->get_val("prefix", "", &uri_prefix);
-      RGWProcessEnv env{ store, &rest, olog, port, uri_prefix, auth_registry };
+      RGWProcessEnv env{ store, &rest, olog, port, uri_prefix, auth_registry, &ratelimiting };
       fe = new RGWAsioFrontend(env, config, sched_ctx);
     }
 
@@ -686,7 +707,7 @@ int radosgw_Main(int argc, const char **argv)
     delete fec;
   }
 
-  unregister_async_signal_handler(SIGHUP, sighup_handler);
+  unregister_async_signal_handler(SIGHUP, rgw_sighup_handler);
   unregister_async_signal_handler(SIGTERM, handle_sigterm);
   unregister_async_signal_handler(SIGINT, handle_sigterm);
   unregister_async_signal_handler(SIGUSR1, handle_sigterm);

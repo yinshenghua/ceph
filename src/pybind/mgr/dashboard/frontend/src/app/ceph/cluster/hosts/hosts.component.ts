@@ -27,6 +27,7 @@ import { OrchestratorFeature } from '~/app/shared/models/orchestrator.enum';
 import { OrchestratorStatus } from '~/app/shared/models/orchestrator.interface';
 import { Permissions } from '~/app/shared/models/permissions';
 import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
+import { EmptyPipe } from '~/app/shared/pipes/empty.pipe';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { ModalService } from '~/app/shared/services/modal.service';
 import { NotificationService } from '~/app/shared/services/notification.service';
@@ -84,7 +85,8 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   modalRef: NgbModalRef;
   isExecuting = false;
   errorMessage: string;
-  enableButton: boolean;
+  enableMaintenanceBtn: boolean;
+  enableDrainBtn: boolean;
   bsModalRef: NgbModalRef;
 
   icons = Icons;
@@ -101,12 +103,14 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
     maintenance: [
       OrchestratorFeature.HOST_MAINTENANCE_ENTER,
       OrchestratorFeature.HOST_MAINTENANCE_EXIT
-    ]
+    ],
+    drain: [OrchestratorFeature.HOST_DRAIN]
   };
 
   constructor(
     private authStorageService: AuthStorageService,
     private dimlessBinary: DimlessBinaryPipe,
+    private emptyPipe: EmptyPipe,
     private hostService: HostService,
     private actionLabels: ActionLabelsI18n,
     private modalService: ModalService,
@@ -136,6 +140,24 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         disable: (selection: CdTableSelection) => this.getDisable('edit', selection)
       },
       {
+        name: this.actionLabels.START_DRAIN,
+        permission: 'update',
+        icon: Icons.exit,
+        click: () => this.hostDrain(),
+        disable: (selection: CdTableSelection) =>
+          this.getDisable('drain', selection) || !this.enableDrainBtn,
+        visible: () => !this.showGeneralActionsOnly && this.enableDrainBtn
+      },
+      {
+        name: this.actionLabels.STOP_DRAIN,
+        permission: 'update',
+        icon: Icons.exit,
+        click: () => this.hostDrain(true),
+        disable: (selection: CdTableSelection) =>
+          this.getDisable('drain', selection) || this.enableDrainBtn,
+        visible: () => !this.showGeneralActionsOnly && !this.enableDrainBtn
+      },
+      {
         name: this.actionLabels.REMOVE,
         permission: 'delete',
         icon: Icons.destroy,
@@ -148,8 +170,10 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         icon: Icons.enter,
         click: () => this.hostMaintenance(),
         disable: (selection: CdTableSelection) =>
-          this.getDisable('maintenance', selection) || this.isExecuting || this.enableButton,
-        visible: () => !this.showGeneralActionsOnly
+          this.getDisable('maintenance', selection) ||
+          this.isExecuting ||
+          this.enableMaintenanceBtn,
+        visible: () => !this.showGeneralActionsOnly && !this.enableMaintenanceBtn
       },
       {
         name: this.actionLabels.EXIT_MAINTENANCE,
@@ -157,8 +181,10 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         icon: Icons.exit,
         click: () => this.hostMaintenance(),
         disable: (selection: CdTableSelection) =>
-          this.getDisable('maintenance', selection) || this.isExecuting || !this.enableButton,
-        visible: () => !this.showGeneralActionsOnly
+          this.getDisable('maintenance', selection) ||
+          this.isExecuting ||
+          !this.enableMaintenanceBtn,
+        visible: () => !this.showGeneralActionsOnly && this.enableMaintenanceBtn
       }
     ];
   }
@@ -252,10 +278,15 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
 
   updateSelection(selection: CdTableSelection) {
     this.selection = selection;
-    this.enableButton = false;
+    this.enableMaintenanceBtn = false;
+    this.enableDrainBtn = false;
     if (this.selection.hasSelection) {
       if (this.selection.first().status === 'maintenance') {
-        this.enableButton = true;
+        this.enableMaintenanceBtn = true;
+      }
+
+      if (!this.selection.first().labels.includes('_no_schedule')) {
+        this.enableDrainBtn = true;
       }
     }
   }
@@ -263,7 +294,8 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   editAction() {
     this.hostService.getLabels().subscribe((resp: string[]) => {
       const host = this.selection.first();
-      const allLabels = resp.map((label) => {
+      const labels = new Set(resp.concat(this.hostService.predefinedLabels));
+      const allLabels = Array.from(labels).map((label) => {
         return { enabled: true, name: label };
       });
       this.modalService.show(FormModalComponent, {
@@ -360,11 +392,39 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
     }
   }
 
+  hostDrain(stop = false) {
+    const host = this.selection.first();
+    if (stop) {
+      const index = host['labels'].indexOf('_no_schedule', 0);
+      host['labels'].splice(index, 1);
+      this.hostService.update(host['hostname'], true, host['labels']).subscribe(() => {
+        this.notificationService.show(
+          NotificationType.info,
+          $localize`"${host['hostname']}" stopped draining`
+        );
+        this.table.refreshBtn();
+      });
+    } else {
+      this.hostService.update(host['hostname'], false, [], false, false, true).subscribe(() => {
+        this.notificationService.show(
+          NotificationType.info,
+          $localize`"${host['hostname']}" started draining`
+        );
+        this.table.refreshBtn();
+      });
+    }
+  }
+
   getDisable(
-    action: 'add' | 'edit' | 'remove' | 'maintenance',
+    action: 'add' | 'edit' | 'remove' | 'maintenance' | 'drain',
     selection: CdTableSelection
   ): boolean | string {
-    if (action === 'remove' || action === 'edit' || action === 'maintenance') {
+    if (
+      action === 'remove' ||
+      action === 'edit' ||
+      action === 'maintenance' ||
+      action === 'drain'
+    ) {
       if (!selection?.hasSingleSelection) {
         return true;
       }
@@ -406,8 +466,10 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   transformHostsData() {
     if (this.checkHostsFactsAvailable()) {
       _.forEach(this.hosts, (hostKey) => {
-        hostKey['memory_total_bytes'] = hostKey['memory_total_kb'] * 1024;
-        hostKey['raw_capacity'] = hostKey['hdd_capacity_bytes'] + hostKey['flash_capacity_bytes'];
+        hostKey['memory_total_bytes'] = this.emptyPipe.transform(hostKey['memory_total_kb'] * 1024);
+        hostKey['raw_capacity'] = this.emptyPipe.transform(
+          hostKey['hdd_capacity_bytes'] + hostKey['flash_capacity_bytes']
+        );
       });
     } else {
       // mark host facts columns unavailable

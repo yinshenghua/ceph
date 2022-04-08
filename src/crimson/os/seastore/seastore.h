@@ -11,6 +11,7 @@
 
 #include <optional>
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_types.hh>
 
 #include "include/uuid.h"
 
@@ -22,6 +23,7 @@
 #include "crimson/os/seastore/onode_manager.h"
 #include "crimson/os/seastore/omap_manager.h"
 #include "crimson/os/seastore/collection_manager.h"
+#include "crimson/os/seastore/object_data_handler.h"
 
 namespace crimson::os::seastore {
 
@@ -139,10 +141,14 @@ public:
     CollectionRef ch,
     ceph::os::Transaction&& txn) final;
 
+  /* Note, flush() machinery must go through the same pipeline
+   * stages and locks as do_transaction. */
+  seastar::future<> flush(CollectionRef ch) final;
+
   seastar::future<OmapIteratorRef> get_omap_iterator(
     CollectionRef ch,
     const ghobject_t& oid) final;
-  seastar::future<std::map<uint64_t, uint64_t>> fiemap(
+  read_errorator::future<std::map<uint64_t, uint64_t>> fiemap(
     CollectionRef ch,
     const ghobject_t& oid,
     uint64_t off,
@@ -182,14 +188,12 @@ private:
 	iter(ext_transaction.begin()) {}
 
     TransactionRef transaction;
-    std::vector<OnodeRef> onodes;
 
     ceph::os::Transaction::iterator iter;
     std::chrono::steady_clock::time_point begin_timestamp = std::chrono::steady_clock::now();
 
     void reset_preserve_handle(TransactionManager &tm) {
       tm.reset_transaction_preserve_handle(*transaction);
-      onodes.clear();
       iter = ext_transaction.begin();
     }
   };
@@ -201,12 +205,13 @@ private:
     CollectionRef ch,
     ceph::os::Transaction &&t,
     Transaction::src_t src,
+    const char* tname,
     op_type_t op_type,
     F &&f) {
     return seastar::do_with(
       internal_context_t(
 	ch, std::move(t),
-	transaction_manager->create_transaction(src)),
+	transaction_manager->create_transaction(src, tname)),
       std::forward<F>(f),
       [this, op_type](auto &ctx, auto &f) {
 	return ctx.transaction->get_handle().take_collection_lock(
@@ -234,19 +239,26 @@ private:
     CollectionRef ch,
     const ghobject_t &oid,
     Transaction::src_t src,
+    const char* tname,
     op_type_t op_type,
     F &&f) const {
     auto begin_time = std::chrono::steady_clock::now();
     return seastar::do_with(
-        oid, Ret{}, OnodeRef(), std::forward<F>(f),
-        [this, src, op_type, begin_time](auto &oid, auto &ret, auto &onode, auto &f) {
-      return repeat_eagain([&, this, src] {
+      oid, Ret{}, std::forward<F>(f),
+      [this, src, op_type, begin_time, tname
+      ](auto &oid, auto &ret, auto &f)
+    {
+      return repeat_eagain([&, this, src, tname] {
         return transaction_manager->with_transaction_intr(
-            src, [&, this](auto& t) {
+          src,
+          tname,
+          [&, this](auto& t)
+        {
           return onode_manager->get_onode(t, oid
-          ).si_then([&](auto onode_ret) {
-            onode = std::move(onode_ret);
-            return f(t, *onode);
+          ).si_then([&](auto onode) {
+            return seastar::do_with(std::move(onode), [&](auto& onode) {
+              return f(t, *onode);
+            });
           }).si_then([&ret](auto _ret) {
             ret = _ret;
           });
@@ -258,6 +270,13 @@ private:
       });
     });
   }
+
+  using _fiemap_ret = ObjectDataHandler::fiemap_ret;
+  _fiemap_ret _fiemap(
+    Transaction &t,
+    Onode &onode,
+    uint64_t off,
+    uint64_t len) const;
 
   using _omap_get_value_iertr = OMapManager::base_iertr::extend<
     crimson::ct_error::enodata
@@ -298,6 +317,7 @@ private:
   TransactionManagerRef transaction_manager;
   CollectionManagerRef collection_manager;
   OnodeManagerRef onode_manager;
+  const uint32_t max_object_size = 0;
 
   using tm_iertr = TransactionManager::base_iertr;
   using tm_ret = tm_iertr::future<>;
@@ -327,6 +347,9 @@ private:
     internal_context_t &ctx,
     OnodeRef &onode,
     ceph::bufferlist &&header);
+  tm_ret _omap_clear(
+    internal_context_t &ctx,
+    OnodeRef &onode);
   tm_ret _omap_rmkeys(
     internal_context_t &ctx,
     OnodeRef &onode,
@@ -343,6 +366,20 @@ private:
     internal_context_t &ctx,
     OnodeRef &onode,
     std::map<std::string,bufferlist>&& aset);
+  tm_ret _rmattr(
+    internal_context_t &ctx,
+    OnodeRef &onode,
+    std::string name);
+  tm_ret _rmattrs(
+    internal_context_t &ctx,
+    OnodeRef &onode);
+  tm_ret _xattr_rmattr(
+    internal_context_t &ctx,
+    OnodeRef &onode,
+    std::string &&name);
+  tm_ret _xattr_clear(
+    internal_context_t &ctx,
+    OnodeRef &onode);
   tm_ret _create_collection(
     internal_context_t &ctx,
     const coll_t& cid, int bits);
@@ -381,7 +418,7 @@ private:
   seastar::future<> write_fsid(uuid_d new_osd_fsid);
 };
 
-std::unique_ptr<SeaStore> make_seastore(
+seastar::future<std::unique_ptr<SeaStore>> make_seastore(
   const std::string &device,
   const ConfigValues &config);
 }
