@@ -52,6 +52,8 @@ def mock_lv_device_generator():
         dev.used_by_ceph = False
         dev.vg_size = [size]
         dev.vg_free = dev.vg_size
+        dev.available_lvm = True
+        dev.is_device = False
         dev.lvs = [lvm.Volume(vg_name=dev.vg_name, lv_name=dev.lv_name, lv_size=size, lv_tags='')]
         return dev
     return mock_lv
@@ -61,6 +63,9 @@ def mock_lv_device_generator():
 def mock_devices_available():
     dev = create_autospec(device.Device)
     dev.path = '/dev/foo'
+    dev.vg_name = 'vg_foo'
+    dev.lv_name = 'lv_foo'
+    dev.vgs = [lvm.VolumeGroup(vg_name=dev.vg_name, lv_name=dev.lv_name)]
     dev.available_lvm = True
     dev.vg_size = [21474836480]
     dev.vg_free = dev.vg_size
@@ -71,6 +76,9 @@ def mock_device_generator():
     def mock_device():
         dev = create_autospec(device.Device)
         dev.path = '/dev/foo'
+        dev.vg_name = 'vg_foo'
+        dev.lv_name = 'lv_foo'
+        dev.vgs = [lvm.VolumeGroup(vg_name=dev.vg_name, lv_name=dev.lv_name)]
         dev.available_lvm = True
         dev.vg_size = [21474836480]
         dev.vg_free = dev.vg_size
@@ -285,7 +293,7 @@ def device_info(monkeypatch, patch_bluestore_label):
         monkeypatch.setattr("ceph_volume.sys_info.devices", {})
         monkeypatch.setattr("ceph_volume.util.device.disk.get_devices", lambda: devices)
         if not devices:
-            monkeypatch.setattr("ceph_volume.util.device.lvm.get_first_lv", lambda filters: lv)
+            monkeypatch.setattr("ceph_volume.util.device.lvm.get_single_lv", lambda filters: lv)
         else:
             monkeypatch.setattr("ceph_volume.util.device.lvm.get_device_lvs",
                                 lambda path: [lv])

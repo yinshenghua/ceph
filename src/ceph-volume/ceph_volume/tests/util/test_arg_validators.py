@@ -3,6 +3,7 @@ import pytest
 import os
 from ceph_volume import exceptions
 from ceph_volume.util import arg_validators
+from mock.mock import patch, PropertyMock
 
 
 class TestOSDPath(object):
@@ -80,10 +81,18 @@ class TestValidDevice(object):
     def setup(self):
         self.validator = arg_validators.ValidDevice()
 
-    def test_path_is_valid(self, fake_call):
+    def test_path_is_valid(self, fake_call, patch_bluestore_label):
         result = self.validator('/')
         assert result.abspath == '/'
 
-    def test_path_is_invalid(self, fake_call):
+    def test_path_is_invalid(self, fake_call, patch_bluestore_label):
         with pytest.raises(argparse.ArgumentError):
             self.validator('/device/does/not/exist')
+
+    @patch('ceph_volume.util.arg_validators.Device.has_partitions', new_callable=PropertyMock, return_value=True)
+    @patch('ceph_volume.util.arg_validators.Device.exists', new_callable=PropertyMock, return_value=True)
+    @patch('ceph_volume.api.lvm.get_single_lv', return_value=None)
+    def test_dev_has_partitions(self, m_get_single_lv, m_exists, m_has_partitions, fake_call):
+        with pytest.raises(RuntimeError):
+            self.validator('/dev/foo')
+

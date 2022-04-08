@@ -5228,6 +5228,8 @@ static void generate_fake_tag(RGWRados *store, map<string, bufferlist>& attrset,
   unsigned char md5[CEPH_CRYPTO_MD5_DIGESTSIZE];
   char md5_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
   MD5 hash;
+  // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+  hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
   hash.Update((const unsigned char *)manifest_bl.c_str(), manifest_bl.length());
 
   map<string, bufferlist>::iterator iter = attrset.find(RGW_ATTR_ETAG);
@@ -7025,9 +7027,14 @@ static int decode_olh_info(CephContext* cct, const bufferlist& bl, RGWOLHInfo *o
   }
 }
 
-int RGWRados::apply_olh_log(RGWObjectCtx& obj_ctx, RGWObjState& state, const RGWBucketInfo& bucket_info, const rgw_obj& obj,
-                            bufferlist& olh_tag, map<uint64_t, vector<rgw_bucket_olh_log_entry> >& log,
-                            uint64_t *plast_ver, rgw_zone_set* zones_trace)
+int RGWRados::apply_olh_log(RGWObjectCtx& obj_ctx,
+			    RGWObjState& state,
+			    const RGWBucketInfo& bucket_info,
+			    const rgw_obj& obj,
+			    bufferlist& olh_tag,
+			    std::map<uint64_t, std::vector<rgw_bucket_olh_log_entry> >& log,
+			    uint64_t *plast_ver,
+			    rgw_zone_set* zones_trace)
 {
   if (log.empty()) {
     return 0;
@@ -8028,7 +8035,14 @@ int RGWRados::bi_put(BucketShard& bs, rgw_cls_bi_entry& entry)
 
 int RGWRados::bi_put(rgw_bucket& bucket, rgw_obj& obj, rgw_cls_bi_entry& entry)
 {
+  // make sure incomplete multipart uploads are hashed correctly
+  if (obj.key.ns == RGW_OBJ_NS_MULTIPART) {
+    RGWMPObj mp;
+    mp.from_meta(obj.key.name);
+    obj.index_hash_source = mp.get_key();
+  }
   BucketShard bs(this);
+
   int ret = bs.init(bucket, obj, nullptr /* no RGWBucketInfo */);
   if (ret < 0) {
     ldout(cct, 5) << "bs.init() returned ret=" << ret << dendl;
@@ -8535,6 +8549,22 @@ int RGWRados::cls_bucket_list_ordered(RGWBucketInfo& bucket_info,
 }
 
 
+// A helper function to retrieve the hash source from an incomplete multipart entry
+// by removing everything from the second last dot to the end.
+static int parse_index_hash_source(const std::string& oid_wo_ns, std::string *index_hash_source) {
+  std::size_t found = oid_wo_ns.rfind('.');
+  if (found == std::string::npos || found < 1) {
+    return -EINVAL;
+  }
+  found = oid_wo_ns.rfind('.', found - 1);
+  if (found == std::string::npos || found < 1) {
+    return -EINVAL;
+  }
+  *index_hash_source = oid_wo_ns.substr(0, found);
+  return 0;
+}
+
+
 int RGWRados::cls_bucket_list_unordered(RGWBucketInfo& bucket_info,
 					int shard_id,
 					const rgw_obj_index_key& start_after,
@@ -8576,18 +8606,11 @@ int RGWRados::cls_bucket_list_unordered(RGWBucketInfo& bucket_info,
     // in it, so we need to get to the bucket shard index, so we can
     // start reading from there
 
-    std::string key;
-    // test whether object name is a multipart meta name
-    if(! multipart_meta_filter.filter(start_after.name, key)) {
-      // if multipart_meta_filter fails, must be "regular" (i.e.,
-      // unadorned) and the name is the key
-      key = start_after.name;
-    }
 
     // now convert the key (oid) to an rgw_obj_key since that will
     // separate out the namespace, name, and instance
     rgw_obj_key obj_key;
-    bool parsed = rgw_obj_key::parse_raw_oid(key, &obj_key);
+    bool parsed = rgw_obj_key::parse_raw_oid(start_after.name, &obj_key);
     if (!parsed) {
       ldout(cct, 0) <<
 	"ERROR: RGWRados::cls_bucket_list_unordered received an invalid "
@@ -8601,7 +8624,21 @@ int RGWRados::cls_bucket_list_unordered(RGWBucketInfo& bucket_info,
     } else {
       // so now we have the key used to compute the bucket index shard
       // and can extract the specific shard from it
-      current_shard = svc.bi_rados->bucket_shard_index(obj_key.name, num_shards);
+      if (obj_key.ns == RGW_OBJ_NS_MULTIPART) {
+        // Use obj_key.ns == RGW_OBJ_NS_MULTIPART instead of
+        // the implementation relying on MultipartMetaFilter
+        // because MultipartMetaFilter only checks .meta suffix, which may
+        // exclude data multiparts but include some regular objects with .meta suffix
+        // by mistake.
+        string index_hash_source;
+        r = parse_index_hash_source(obj_key.name, &index_hash_source);
+        if (r < 0) {
+          return r;
+        }
+        current_shard = svc.bi_rados->bucket_shard_index(index_hash_source, num_shards);
+      } else {
+        current_shard = svc.bi_rados->bucket_shard_index(obj_key.name, num_shards);
+      }
     }
   }
 

@@ -1135,6 +1135,11 @@ std::vector<Option> get_global_options() {
     .set_description("Maximum threadpool size of AsyncMessenger")
     .add_see_also("ms_async_op_threads"),
 
+    Option("ms_async_reap_threshold", Option::TYPE_UINT, Option::LEVEL_DEV)
+    .set_default(5)
+    .set_min(1)
+    .set_description("number of deleted connections before we reap"),
+
     Option("ms_async_rdma_device_name", Option::TYPE_STR, Option::LEVEL_ADVANCED)
     .set_default("")
     .set_description(""),
@@ -2569,7 +2574,7 @@ std::vector<Option> get_global_options() {
     .set_long_description("If this value is exceeded, the OSD will not read any new client data off of the network until memory is freed."),
 
     Option("osd_client_message_cap", Option::TYPE_UINT, Option::LEVEL_ADVANCED)
-    .set_default(0)
+    .set_default(256)
     .set_description("maximum number of in-flight client requests"),
 
     Option("osd_crush_update_weight_set", Option::TYPE_BOOL, Option::LEVEL_ADVANCED)
@@ -4533,14 +4538,20 @@ std::vector<Option> get_global_options() {
     .set_default(false)
     .set_description("Try to submit metadata transaction to rocksdb in queuing thread context"),
 
+    Option("bluestore_fsck_quick_fix_threads", Option::TYPE_INT, Option::LEVEL_ADVANCED)
+      .set_default(2)
+      .set_description("Number of additional threads to perform quick-fix (shallow fsck) command"),
+
     Option("bluestore_fsck_read_bytes_cap", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
     .set_default(64_M)
     .set_flag(Option::FLAG_RUNTIME)
     .set_description("Maximum bytes read at once by deep fsck"),
 
-    Option("bluestore_fsck_quick_fix_threads", Option::TYPE_INT, Option::LEVEL_ADVANCED)
-      .set_default(2)
-      .set_description("Number of additional threads to perform quick-fix (shallow fsck) command"),
+    Option("bluestore_fsck_shared_blob_tracker_size", Option::TYPE_FLOAT, Option::LEVEL_DEV)
+    .set_default(0.03125)
+    .set_flag(Option::FLAG_RUNTIME)
+    .set_description("Size(a fraction of osd_memory_target, defaults to 128MB) of a hash table to track shared blobs ref counts. Higher the size, more precise is the tracker -> less overhead during the repair.")
+    .add_see_also("osd_memory_target"),
 
     Option("bluestore_throttle_bytes", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
     .set_default(64_M)
@@ -4710,6 +4721,14 @@ std::vector<Option> get_global_options() {
     .set_enum_allowed({"default", "hdd", "ssd"})
     .set_description("Enforces specific hw profile settings")
     .set_long_description("'hdd' enforces settings intended for BlueStore above a rotational drive. 'ssd' enforces settings intended for BlueStore above a solid drive. 'default' - using settings for the actual hardware."),
+
+    Option("bluestore_avl_alloc_ff_max_search_count", Option::TYPE_UINT, Option::LEVEL_DEV)
+    .set_default(100)
+    .set_description("Search for this many ranges in first-fit mode before switching over to to best-fit mode. 0 to iterate through all ranges for required chunk."),
+
+    Option("bluestore_avl_alloc_ff_max_search_bytes", Option::TYPE_SIZE, Option::LEVEL_DEV)
+    .set_default(16_M)
+    .set_description("Maximum distance to search in first-fit mode before switching over to to best-fit mode. 0 to iterate through all ranges for required chunk."),
 
     Option("bluestore_avl_alloc_bf_threshold", Option::TYPE_UINT, Option::LEVEL_DEV)
     .set_default(131072)
@@ -6509,16 +6528,6 @@ std::vector<Option> get_rgw_options() {
     .set_description("Bucket quota stats cache TTL")
     .set_long_description(
         "Length of time for bucket stats to be cached within RGW instance."),
-
-    Option("rgw_bucket_quota_soft_threshold", Option::TYPE_FLOAT, Option::LEVEL_BASIC)
-    .set_default(0.95)
-    .set_description("RGW quota soft threshold")
-    .set_long_description(
-        "Threshold from which RGW doesn't rely on cached info for quota "
-        "decisions. This is done for higher accuracy of the quota mechanism at "
-        "cost of performance, when getting close to the quota limit. The value "
-        "configured here is the ratio between the data usage to the max usage "
-        "as specified by the quota."),
 
     Option("rgw_bucket_quota_cache_size", Option::TYPE_INT, Option::LEVEL_ADVANCED)
     .set_default(10000)

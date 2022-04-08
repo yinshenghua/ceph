@@ -386,7 +386,8 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
         try {
           decode(retention, iter->second);
           dump_header(s, "x-amz-object-lock-mode", retention.get_mode());
-          dump_time_header(s, "x-amz-object-lock-retain-until-date", retention.get_retain_until_date());
+          string date = ceph::to_iso_8601(retention.get_retain_until_date());
+          dump_header(s, "x-amz-object-lock-retain-until-date", date.c_str());
         } catch (buffer::error& err) {
           ldpp_dout(this, 0) << "ERROR: failed to decode RGWObjectRetention" << dendl;
         }
@@ -5839,7 +5840,7 @@ rgw::auth::s3::STSEngine::get_session_token(const DoutPrefixProvider* dpp, const
     return -EINVAL;
   }
   string error;
-  auto* keyhandler = cryptohandler->get_key_handler(secret, error);
+  std::unique_ptr<CryptoKeyHandler> keyhandler(cryptohandler->get_key_handler(secret, error));
   if (! keyhandler) {
     return -EINVAL;
   }

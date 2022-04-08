@@ -184,13 +184,20 @@ Note:
   permissions.
 
 run-cephadm-e2e-tests.sh
-........................
+.........................
 
 ``run-cephadm-e2e-tests.sh`` runs a subset of E2E tests to verify that the Dashboard and cephadm as
 Orchestrator backend behave correctly.
 
 Prerequisites: you need to install `KCLI
-<https://kcli.readthedocs.io/en/latest/>`_ in your local machine.
+<https://kcli.readthedocs.io/en/latest/>`_ and Node.js in your local machine.
+
+Configure KCLI plan requirements::
+
+  $ sudo chown -R $(id -un) /var/lib/libvirt/images
+  $ mkdir -p /var/lib/libvirt/images/ceph-dashboard dashboard
+  $ kcli create pool -p /var/lib/libvirt/images/ceph-dashboard dashboard
+  $ kcli create network -c 192.168.100.0/24 dashboard
 
 Note:
   This script is aimed to be run as jenkins job so the cleanup is triggered only in a jenkins
@@ -199,9 +206,26 @@ Note:
 Start E2E tests by running::
 
   $ cd <your/ceph/repo/dir>
-  $ sudo chown -R $(id -un) src/pybind/mgr/dashboard/frontend/dist src/pybind/mgr/dashboard/frontend/node_modules
+  $ sudo chown -R $(id -un) src/pybind/mgr/dashboard/frontend/{dist,node_modules,src/environments}
   $ ./src/pybind/mgr/dashboard/ci/cephadm/run-cephadm-e2e-tests.sh
-  $ kcli delete plan -y ceph  # After tests finish.
+
+You can also start a cluster in development mode (so the frontend build starts in watch mode and you
+only have to reload the page for the changes to be reflected) by running::
+
+  $ ./src/pybind/mgr/dashboard/ci/cephadm/start-cluster.sh --dev-mode
+
+Note:
+  Add ``--expanded`` if you need a cluster ready to deploy services (one with enough monitor
+  daemons spread across different hosts and enough OSDs).
+
+Test your changes by running:
+
+  $ ./src/pybind/mgr/dashboard/ci/cephadm/run-cephadm-e2e-tests.sh
+
+Shutdown the cluster by running:
+
+  $ kcli delete plan -y ceph
+  $ # In development mode, also kill the npm build watch process (e.g., pkill -f "ng build")
 
 Other running options
 .....................

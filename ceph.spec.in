@@ -414,6 +414,12 @@ Requires:      gperftools-libs >= 2.6.1
 %endif
 %if 0%{?weak_deps}
 Recommends:    chrony
+Recommends:    nvme-cli
+%if 0%{?suse_version}
+Requires:      smartmontools
+%else
+Recommends:    smartmontools
+%endif
 %endif
 %description base
 Base is the package that includes all the files shared amongst ceph servers
@@ -479,14 +485,7 @@ Group:		System/Filesystems
 %endif
 Provides:	ceph-test:/usr/bin/ceph-monstore-tool
 Requires:	ceph-base = %{_epoch_prefix}%{version}-%{release}
-%if 0%{?weak_deps}
-Recommends:	nvme-cli
-%if 0%{?suse_version}
-Requires:       smartmontools
-%else
-Recommends:	smartmontools
-%endif
-%endif
+
 %description mon
 ceph-mon is the cluster monitor daemon for the Ceph distributed file
 system. One or more instances of ceph-mon form a Paxos part-time
@@ -767,14 +766,6 @@ Requires:	lvm2
 Requires:	sudo
 Requires:	libstoragemgmt
 Requires:	python%{python3_pkgversion}-ceph-common = %{_epoch_prefix}%{version}-%{release}
-%if 0%{?weak_deps}
-Recommends:	nvme-cli
-%if 0%{?suse_version}
-Requires:       smartmontools
-%else
-Recommends:	smartmontools
-%endif
-%endif
 %description osd
 ceph-osd is the object storage daemon for the Ceph distributed file
 system.  It is responsible for storing objects on a local file system
@@ -1325,7 +1316,7 @@ ln -sf %{_sbindir}/mount.ceph %{buildroot}/sbin/mount.ceph
 install -m 0644 -D udev/50-rbd.rules %{buildroot}%{_udevrulesdir}/50-rbd.rules
 
 # sudoers.d
-install -m 0440 -D sudoers.d/ceph-osd-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-osd-smartctl
+install -m 0440 -D sudoers.d/ceph-smartctl %{buildroot}%{_sysconfdir}/sudoers.d/ceph-smartctl
 
 %if 0%{?rhel} >= 8
 pathfix.py -pni "%{__python3} %{py3_shbang_opts}" %{buildroot}%{_bindir}/*
@@ -1426,6 +1417,7 @@ rm -rf %{buildroot}
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/bootstrap-mgr
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/bootstrap-rbd
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/bootstrap-rbd-mirror
+%{_sysconfdir}/sudoers.d/ceph-smartctl
 
 %post base
 /sbin/ldconfig
@@ -1452,21 +1444,7 @@ fi
 
 %postun base
 /sbin/ldconfig
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph.target
-%endif
-if [ $1 -ge 1 ] ; then
-  # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
-  # "yes". In any case: if units are not running, do not touch them.
-  SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
-  if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
-    source $SYSCONF_CEPH
-  fi
-fi
 
 %pre -n cephadm
 getent group cephadm >/dev/null || groupadd -r cephadm
@@ -1612,13 +1590,7 @@ fi
 %endif
 
 %postun mds
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-mds@\*.service ceph-mds.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-mds@\*.service ceph-mds.target
-%endif
 if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
@@ -1665,13 +1637,7 @@ fi
 %endif
 
 %postun mgr
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-mgr@\*.service ceph-mgr.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-mgr@\*.service ceph-mgr.target
-%endif
 if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
@@ -1818,13 +1784,7 @@ fi
 %endif
 
 %postun mon
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-mon@\*.service ceph-mon.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-mon@\*.service ceph-mon.target
-%endif
 if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
@@ -1876,13 +1836,7 @@ fi
 %endif
 
 %postun -n rbd-mirror
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-rbd-mirror@\*.service ceph-rbd-mirror.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-rbd-mirror@\*.service ceph-rbd-mirror.target
-%endif
 if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
@@ -1923,15 +1877,8 @@ fi
 %endif
 
 %postun immutable-object-cache
-test -n "$FIRST_ARG" || FIRST_ARG=$1
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-immutable-object-cache@\*.service ceph-immutable-object-cache.target
-%endif
-if [ $FIRST_ARG -ge 1 ] ; then
+if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
   SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
@@ -1986,13 +1933,7 @@ fi
 
 %postun radosgw
 /sbin/ldconfig
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-radosgw@\*.service ceph-radosgw.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-radosgw@\*.service ceph-radosgw.target
-%endif
 if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
@@ -2008,6 +1949,7 @@ fi
 %files osd
 %{_bindir}/ceph-clsinfo
 %{_bindir}/ceph-bluestore-tool
+%{_bindir}/ceph-erasure-code-tool
 %{_bindir}/ceph-objectstore-tool
 %{_bindir}/ceph-osdomap-tool
 %{_bindir}/ceph-osd
@@ -2024,7 +1966,6 @@ fi
 %{_unitdir}/ceph-volume@.service
 %attr(750,ceph,ceph) %dir %{_localstatedir}/lib/ceph/osd
 %config(noreplace) %{_sysctldir}/90-ceph-osd.conf
-%{_sysconfdir}/sudoers.d/ceph-osd-smartctl
 
 %post osd
 %if 0%{?suse_version}
@@ -2053,13 +1994,7 @@ fi
 %endif
 
 %postun osd
-%if 0%{?suse_version}
-DISABLE_RESTART_ON_UPDATE="yes"
-%service_del_postun ceph-osd@\*.service ceph-volume@\*.service ceph-osd.target
-%endif
-%if 0%{?fedora} || 0%{?rhel}
 %systemd_postun ceph-osd@\*.service ceph-volume@\*.service ceph-osd.target
-%endif
 if [ $1 -ge 1 ] ; then
   # Restart on upgrade, but only if "CEPH_AUTO_RESTART_ON_UPGRADE" is set to
   # "yes". In any case: if units are not running, do not touch them.
@@ -2232,7 +2167,6 @@ fi
 %{_bindir}/ceph_bench_log
 %{_bindir}/ceph_kvstorebench
 %{_bindir}/ceph_multi_stress_watch
-%{_bindir}/ceph_erasure_code
 %{_bindir}/ceph_erasure_code_benchmark
 %{_bindir}/ceph_omapbench
 %{_bindir}/ceph_objectstore_bench
@@ -2301,13 +2235,21 @@ if diff ${FILE_CONTEXT} ${FILE_CONTEXT}.pre > /dev/null 2>&1; then
    exit 0
 fi
 
+# Stop ceph.target while relabeling if CEPH_AUTO_RESTART_ON_UPGRADE=yes
+SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
+if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
+    source $SYSCONF_CEPH
+fi
+
 # Check whether the daemons are running
 /usr/bin/systemctl status ceph.target > /dev/null 2>&1
 STATUS=$?
 
 # Stop the daemons if they were running
 if test $STATUS -eq 0; then
-    /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+    if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+        /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+    fi
 fi
 
 # Relabel the files fix for first package install
@@ -2319,7 +2261,9 @@ rm -f ${FILE_CONTEXT}.pre
 
 # Start the daemons iff they were running before
 if test $STATUS -eq 0; then
-    /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+    if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+        /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+    fi
 fi
 exit 0
 
@@ -2339,13 +2283,21 @@ if [ $1 -eq 0 ]; then
         exit 0
     fi
 
+    # Stop ceph.target while relabeling if CEPH_AUTO_RESTART_ON_UPGRADE=yes
+    SYSCONF_CEPH=%{_sysconfdir}/sysconfig/ceph
+    if [ -f $SYSCONF_CEPH -a -r $SYSCONF_CEPH ] ; then
+        source $SYSCONF_CEPH
+    fi
+
     # Check whether the daemons are running
     /usr/bin/systemctl status ceph.target > /dev/null 2>&1
     STATUS=$?
 
     # Stop the daemons if they were running
     if test $STATUS -eq 0; then
-        /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+        if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+            /usr/bin/systemctl stop ceph.target > /dev/null 2>&1
+        fi
     fi
 
     /usr/sbin/fixfiles -C ${FILE_CONTEXT}.pre restore 2> /dev/null
@@ -2355,7 +2307,9 @@ if [ $1 -eq 0 ]; then
 
     # Start the daemons if they were running before
     if test $STATUS -eq 0; then
-	/usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+        if [ "X$CEPH_AUTO_RESTART_ON_UPGRADE" = "Xyes" ] ; then
+	    /usr/bin/systemctl start ceph.target > /dev/null 2>&1 || :
+        fi
     fi
 fi
 exit 0

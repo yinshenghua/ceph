@@ -4523,7 +4523,7 @@ int PrimaryLogPG::trim_object(
 	ctx->mtime,
 	0)
       );
-    derr << "removing snap head" << dendl;
+    dout(10) << "removing snap head" << dendl;
     object_info_t& oi = head_obc->obs.oi;
     ctx->delta_stats.num_objects--;
     if (oi.is_dirty()) {
@@ -5025,11 +5025,11 @@ struct FillInVerifyExtent : public Context {
     r(r), rval(rv), outdatap(blp), maybe_crc(mc),
     size(size), osd(osd), soid(soid), flags(flags) {}
   void finish(int len) override {
-    *r = len;
     if (len < 0) {
       *rval = len;
       return;
     }
+    *r = len;
     *rval = 0;
 
     // whole object?  can we verify the checksum?

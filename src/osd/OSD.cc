@@ -1989,6 +1989,7 @@ int OSD::mkfs(CephContext *cct, ObjectStore *store, uuid_d fsid, int whoami, str
 	   << "queue_transaction returned " << cpp_strerror(ret) << dendl;
       goto umount_store;
     }
+    ch->flush();
   }
 
   ret = write_meta(cct, store, sb.cluster_fsid, sb.osd_fsid, whoami, osdspec_affinity);
@@ -8286,6 +8287,9 @@ void OSD::_committed_osd_maps(epoch_t first, epoch_t last, MOSDMap *m)
 	reset_heartbeat_peers(true);
       }
     }
+  } else if (osdmap->get_epoch() > 0 && osdmap->is_stop(whoami)) {
+    derr << "map says i am stopped by admin. shutting down." << dendl;
+    do_shutdown = true;
   }
 
   map_lock.unlock();

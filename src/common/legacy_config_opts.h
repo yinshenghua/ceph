@@ -143,6 +143,7 @@ OPTION(ms_dump_on_send, OPT_BOOL)           // hexdump msg to log on send
 OPTION(ms_dump_corrupt_message_level, OPT_INT)  // debug level to hexdump undecodeable messages at
 OPTION(ms_async_op_threads, OPT_U64)            // number of worker processing threads for async messenger created on init
 OPTION(ms_async_max_op_threads, OPT_U64)        // max number of worker processing threads for async messenger
+OPTION(ms_async_reap_threshold, OPT_U32)        // number of deleted connections before we reap
 OPTION(ms_async_rdma_device_name, OPT_STR)
 OPTION(ms_async_rdma_enable_hugepage, OPT_BOOL)
 OPTION(ms_async_rdma_buffer_size, OPT_INT)
@@ -1461,7 +1462,6 @@ OPTION(rgw_data_log_num_shards, OPT_INT) // number of objects to keep data chang
 OPTION(rgw_data_log_obj_prefix, OPT_STR) //
 
 OPTION(rgw_bucket_quota_ttl, OPT_INT) // time for cached bucket stats to be cached within rgw instance
-OPTION(rgw_bucket_quota_soft_threshold, OPT_DOUBLE) // threshold from which we don't rely on cached info for quota decisions
 OPTION(rgw_bucket_quota_cache_size, OPT_INT) // number of entries in bucket quota cache
 OPTION(rgw_bucket_default_quota_max_objects, OPT_INT) // number of objects allowed
 OPTION(rgw_bucket_default_quota_max_size, OPT_LONGLONG) // Max size of object in bytes

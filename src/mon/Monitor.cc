@@ -378,6 +378,11 @@ int Monitor::do_admin_command(
     cmd_getval(cmdmap, "devid", want_devid);
 
     string devname = store->get_devname();
+    if (devname.empty()) {
+      err << "could not determine device name for " << store->get_path();
+      r = -ENOENT;
+      goto abort;
+    }
     set<string> devnames;
     get_raw_devices(devname, &devnames);
     json_spirit::mObject json_map;
@@ -5906,8 +5911,6 @@ int Monitor::mkfs(bufferlist& osdmapbl)
 
     r = ceph_resolve_file_search(g_conf()->keyring, keyring_filename);
     if (r) {
-      derr << "unable to find a keyring file on " << g_conf()->keyring
-	   << ": " << cpp_strerror(r) << dendl;
       if (g_conf()->key != "") {
 	string keyring_plaintext = "[mon.]\n\tkey = " + g_conf()->key +
 	  "\n\tcaps mon = \"allow *\"\n";
@@ -5923,7 +5926,9 @@ int Monitor::mkfs(bufferlist& osdmapbl)
 	  return -EINVAL;
 	}
       } else {
-	return -ENOENT;
+	derr << "unable to find a keyring on " << g_conf()->keyring
+	     << ": " << cpp_strerror(r) << dendl;
+	return r;
       }
     } else {
       r = keyring.load(g_ceph_context, keyring_filename);
@@ -6345,12 +6350,17 @@ void Monitor::ms_handle_accept(Connection *con)
     dout(10) << __func__ << " con " << con << " session " << s
 	     << " already on list" << dendl;
   } else {
+    std::lock_guard l(session_map_lock);
+    if (state == STATE_SHUTDOWN) {
+      dout(10) << __func__ << " ignoring new con " << con << " (shutdown)" << dendl;
+      con->mark_down();
+      return;
+    }
     dout(10) << __func__ << " con " << con << " session " << s
 	     << " registering session for "
 	     << con->get_peer_addrs() << dendl;
     s->_ident(entity_name_t(con->get_peer_type(), con->get_peer_id()),
 	      con->get_peer_addrs());
-    std::lock_guard l(session_map_lock);
     session_map.add_session(s);
   }
 }
